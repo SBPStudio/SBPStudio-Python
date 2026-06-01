@@ -1,0 +1,35 @@
+name: topassuite
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.11
+  - numpy>=1.24           # core numerical arrays
+  - scipy>=1.10           # FFT, filters, linalg (Wiener-Levinson)
+  - segyio>=1.9           # SEG-Y I/O (conda-forge: segyio)
+  - pyproj>=3.4           # CRS transformations (Transformer, CRS)
+  - matplotlib>=3.7       # colormaps (lazy import in core) + Agg renderer in viz
+  - pillow>=9.0           # high-quality RGBA resize + PNG/TIFF/PDF fallback
+  - img2pdf               # optimal PDF export: lossless PNG-in-PDF, zero recompression
+                          # Installs pikepdf + lxml as dependencies
+
+  # ── Optional performance libraries ─────────────────────────────────────────
+  #
+  # pyfftw — FFTW-backed FFTs: 2-5× faster Hilbert/bandpass on CPU.
+  #   Auto-activated at import: no code changes needed.
+  #   Install: conda install -c conda-forge pyfftw
+  #   Verify : python -m topassuite.cli.main accel
+  # - pyfftw>=0.13
+  #
+  # cupy — NVIDIA GPU acceleration (Hilbert, AGC, colorisation, normalisation).
+  #   Requires CUDA. Match <cudatoolkit> version to your driver:
+  #     nvidia-smi → check "CUDA Version" in top-right corner
+  #   Install: conda install -c conda-forge cupy cudatoolkit=12.6
+  #            (replace 12.6 with your CUDA version)
+  #   Verify : python -m topassuite.cli.main accel
+  # - cupy
+  # - cudatoolkit=12.6    # match your driver
+
+  # ── Testing ──────────────────────────────────────────────────────────────
+  - pytest>=7.0
+  - pytest-timeout

@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated demo data / outputs
+examples/_demo_in/
+examples/_demo_out/
+
+# Real data (never commit raw survey data)
+examples/_real_data_in/
+examples/_real_data_out/
+
+# Generated SEG-Y and images
+*.sgy
+*.segy
+*.SGY
+*.SEGY
+*_REPROY*
+*_UNIDO_REPROY*
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.venv/
+.env/
+
+# IA processing
+*.claude
+
+# OS
+.DS_Store
+Thumbs.db

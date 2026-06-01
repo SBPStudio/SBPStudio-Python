@@ -1,0 +1,164 @@
+"""
+test_reprojection.py — Regression + contract tests for reproject_one.
+
+Checks:
+- DelayRecordingTime preserved (round-trip read)
+- SourceGroupScalar / CoordinateUnits match expected values
+- bin and text[0] copied
+- Partial output deleted on failure (ReprojectionError)
+- CRSError raised on invalid CRS
+"""
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import pytest
+import segyio
+
+from topassuite.core import (
+    load_profile, load_metadata, reproject_one, reproject_chain,
+    detect_chains, CRSError, ReprojectionError,
+)
+from topassuite.core.io_segy import _ref_reproject_trace
+
+
+class TestReprojectOne:
+    def test_creates_output_file(self, simple_segy, tmp_path):
+        sd      = load_profile(simple_segy)
+        out_sgy = str(tmp_path / "out.sgy")
+        import shutil
+        shutil.copy(simple_segy, out_sgy)
+        # Use the reference segy as source; reproject into UTM 30N
+        sd2 = load_profile(out_sgy)
+        out = reproject_one(sd2, "EPSG:4326", "EPSG:32630")
+        assert os.path.exists(out)
+        os.remove(out)
+
+    def test_delay_preserved(self, delay_segy, tmp_path):
+        """DelayRecordingTime must be unchanged after reprojection."""
+        import shutil
+        src_path = str(tmp_path / "src.sgy")
+        shutil.copy(delay_segy, src_path)
+        sd     = load_profile(src_path)
+        out    = reproject_one(sd, "EPSG:4326", "EPSG:32630")
+
+        # Read the reproj file and compare delays
+        with segyio.open(out, ignore_geometry=True) as f:
+            delays_out = np.asarray(f.attributes(segyio.TraceField.DelayRecordingTime)[:])
+        np.testing.assert_array_equal(delays_out, sd.delays)
+        os.remove(out)
+
+    def test_scalar_and_unit_geographic(self, simple_segy, tmp_path):
+        """Geographic dst → new_uc=3; out_sc=-10_000_000 truncated to 16-bit in file.
+
+        SEG-Y SourceGroupScalar is a 16-bit field. -10_000_000 overflows,
+        so segyio reads back the 16-bit two's-complement truncation (27008).
+        This is the monolith's actual behaviour — preserved, NOT fixed.
+        """
+        import shutil
+        src = str(tmp_path / "src.sgy")
+        shutil.copy(simple_segy, src)
+        sd  = load_profile(src)
+        out = reproject_one(sd, "EPSG:4326", "EPSG:4258")  # to ETRS89 geographic
+        with segyio.open(out, ignore_geometry=True) as f:
+            sc = int(f.header[0][segyio.TraceField.SourceGroupScalar])
+            uc = int(f.header[0][segyio.TraceField.CoordinateUnits])
+        # CoordinateUnits = 3 (decimal degrees) is the reliable check
+        assert uc == 3
+        # Scalar: either the intended -10_000_000 (if segyio supports 32-bit) or
+        # the 16-bit truncation. Accept both since exact segyio behaviour is
+        # version-dependent.
+        _INTENDED   = -10_000_000
+        _TRUNCATED  = _INTENDED & 0xFFFF  # = 27008 (unsigned 16-bit)
+        _TRUNC_SGN  = _TRUNCATED - 65536  # = -38528 (signed 16-bit)
+        assert sc in (_INTENDED, _TRUNCATED, _TRUNC_SGN), (
+            f"Unexpected scalar {sc}; expected {_INTENDED}, {_TRUNCATED}, or {_TRUNC_SGN}")
+        os.remove(out)
+
+    def test_scalar_and_unit_projected(self, simple_segy, tmp_path):
+        """Projected dst → out_sc=-100, new_uc=1."""
+        import shutil
+        src = str(tmp_path / "src.sgy")
+        shutil.copy(simple_segy, src)
+        sd  = load_profile(src)
+        out = reproject_one(sd, "EPSG:4326", "EPSG:32630")
+        with segyio.open(out, ignore_geometry=True) as f:
+            sc = int(f.header[0][segyio.TraceField.SourceGroupScalar])
+            uc = int(f.header[0][segyio.TraceField.CoordinateUnits])
+        assert sc == -100
+        assert uc == 1
+        os.remove(out)
+
+    def test_text_header_copied(self, simple_segy, tmp_path):
+        import shutil
+        src = str(tmp_path / "src.sgy")
+        shutil.copy(simple_segy, src)
+        sd  = load_profile(src)
+        out = reproject_one(sd, "EPSG:4326", "EPSG:32630")
+        with segyio.open(simple_segy, ignore_geometry=True) as src_f, \
+             segyio.open(out,         ignore_geometry=True) as out_f:
+            assert src_f.text[0] == out_f.text[0]
+        os.remove(out)
+
+    def test_invalid_crs_raises(self, simple_segy, tmp_path):
+        import shutil
+        src = str(tmp_path / "src.sgy")
+        shutil.copy(simple_segy, src)
+        sd  = load_profile(src)
+        with pytest.raises(CRSError):
+            reproject_one(sd, "NOT_A_CRS", "EPSG:32630")
+
+    def test_partial_output_deleted_on_error(self, simple_segy, tmp_path):
+        import shutil
+        src = str(tmp_path / "src.sgy")
+        shutil.copy(simple_segy, src)
+        sd  = load_profile(src)
+        # Force ReprojectionError by patching
+        import topassuite.core.io_segy as _io
+        orig = _io._ref_reproject_trace
+        def _bad(*a, **k):
+            raise RuntimeError("forced test error")
+        _io._ref_reproject_trace = _bad
+        from pathlib import Path
+        expected_out = str(Path(src).with_name(Path(src).stem + "_REPROY" + Path(src).suffix))
+        try:
+            with pytest.raises(ReprojectionError):
+                reproject_one(sd, "EPSG:4326", "EPSG:32630")
+        finally:
+            _io._ref_reproject_trace = orig
+        assert not os.path.exists(expected_out)
+
+
+class TestReprojectChain:
+    def test_creates_joined_file(self, chain_pair, tmp_path):
+        import shutil
+        path1, path2 = chain_pair
+        src1 = str(tmp_path / "c1.sgy")
+        src2 = str(tmp_path / "c2.sgy")
+        shutil.copy(path1, src1)
+        shutil.copy(path2, src2)
+        profiles = [load_profile(src1), load_profile(src2)]
+        chains   = detect_chains(profiles, gap_km=1.0)
+        assert len(chains) == 1
+        ch  = chains[0]
+        out = reproject_chain(ch, "EPSG:4326", "EPSG:32630")
+        assert os.path.exists(out)
+        # Trace count must equal sum of source profiles
+        md = load_metadata(out)
+        assert md.n_traces == ch.n_traces
+        os.remove(out)
+
+    def test_trace_number_sequential(self, chain_pair, tmp_path):
+        import shutil
+        path1, path2 = chain_pair
+        src1, src2 = str(tmp_path / "c1.sgy"), str(tmp_path / "c2.sgy")
+        shutil.copy(path1, src1); shutil.copy(path2, src2)
+        profiles = [load_profile(src1), load_profile(src2)]
+        chains   = detect_chains(profiles, gap_km=1.0)
+        out = reproject_chain(chains[0], "EPSG:4326", "EPSG:32630")
+        with segyio.open(out, ignore_geometry=True) as f:
+            tnums = np.asarray(f.attributes(segyio.TraceField.TraceNumber)[:])
+        expected = np.arange(1, chains[0].n_traces + 1)
+        np.testing.assert_array_equal(tnums, expected)
+        os.remove(out)
