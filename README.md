@@ -4,7 +4,7 @@
 [![Python][python-shield]][python-url]
 [![Conda][conda-shield]][conda-url]
 [![Tests][tests-shield]][tests-url]
-[![MIT License][license-shield]][license-url]
+[![GPL License][license-shield]][license-url]
 
 <!-- PROJECT LOGO / TITLE -->
 <h1 align="center">TOPAS Suite — Python</h1>
