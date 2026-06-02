@@ -66,14 +66,10 @@ class TestReprojectOne:
             uc = int(f.header[0][segyio.TraceField.CoordinateUnits])
         # CoordinateUnits = 3 (decimal degrees) is the reliable check
         assert uc == 3
-        # Scalar: either the intended -10_000_000 (if segyio supports 32-bit) or
-        # the 16-bit truncation. Accept both since exact segyio behaviour is
-        # version-dependent.
-        _INTENDED   = -10_000_000
-        _TRUNCATED  = _INTENDED & 0xFFFF  # = 27008 (unsigned 16-bit)
-        _TRUNC_SGN  = _TRUNCATED - 65536  # = -38528 (signed 16-bit)
-        assert sc in (_INTENDED, _TRUNCATED, _TRUNC_SGN), (
-            f"Unexpected scalar {sc}; expected {_INTENDED}, {_TRUNCATED}, or {_TRUNC_SGN}")
+        # OQ-3 fix: out_sc = -10_000 (no longer overflows 16-bit field)
+        assert sc == -10_000, (
+            f"Expected out_sc=-10000 (OQ-3 fix applied), got {sc}. "
+            "The previous -10_000_000 overflowed the 16-bit SourceGroupScalar field.")
         os.remove(out)
 
     def test_scalar_and_unit_projected(self, simple_segy, tmp_path):
@@ -110,23 +106,25 @@ class TestReprojectOne:
             reproject_one(sd, "NOT_A_CRS", "EPSG:32630")
 
     def test_partial_output_deleted_on_error(self, simple_segy, tmp_path):
+        """Partial output must be deleted on failure.
+        Inject error via the bulk-coords function (optimised path used by default).
+        """
         import shutil
         src = str(tmp_path / "src.sgy")
         shutil.copy(simple_segy, src)
         sd  = load_profile(src)
-        # Force ReprojectionError by patching
         import topassuite.core.io_segy as _io
-        orig = _io._ref_reproject_trace
+        orig = _io._opt_reproject_coords_bulk
         def _bad(*a, **k):
             raise RuntimeError("forced test error")
-        _io._ref_reproject_trace = _bad
+        _io._opt_reproject_coords_bulk = _bad
         from pathlib import Path
         expected_out = str(Path(src).with_name(Path(src).stem + "_REPROY" + Path(src).suffix))
         try:
             with pytest.raises(ReprojectionError):
                 reproject_one(sd, "EPSG:4326", "EPSG:32630")
         finally:
-            _io._ref_reproject_trace = orig
+            _io._opt_reproject_coords_bulk = orig
         assert not os.path.exists(expected_out)
 
 

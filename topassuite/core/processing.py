@@ -496,6 +496,28 @@ def process_chain_data(ch: Any, params: Dict[str, Any]) -> np.ndarray:
     return _process_data_generic(ch, params)
 
 
+# ── Reference AGC (sequential, for regression tests) ──────────────────────────
+
+def _ref_agc(data: np.ndarray, win_ms: float, dt_us: int) -> np.ndarray:
+    """
+    Reference AGC: sequential uniform_filter1d on the FULL matrix.
+    Path: reference.  Used by regression tests as ground truth vs parallel path.
+
+    Parameters
+    ----------
+    data   : (ns, n_traces) float32
+    win_ms : AGC window length in ms
+    dt_us  : sample interval in µs
+    """
+    from scipy.ndimage import uniform_filter1d
+    win_s = max(3, int(win_ms / (dt_us / 1000.0)))
+    if win_s % 2 == 0:
+        win_s += 1
+    env  = np.abs(data)
+    rms  = uniform_filter1d(env, size=win_s, axis=0)
+    return (data / np.maximum(rms, 1e-9)).astype(np.float32)
+
+
 # ── Time window ────────────────────────────────────────────────────────────────
 
 def time_window(obj: Any, data_ns: int, align: bool) -> tuple:

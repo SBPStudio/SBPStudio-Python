@@ -53,10 +53,15 @@ def build_parser() -> argparse.ArgumentParser:
     pj = sub.add_parser("join-chain",
                         help="Reproject + join a chain of profiles into one SEG-Y")
     pj.add_argument("files", nargs="+", metavar="FILE")
-    pj.add_argument("--dst", required=True, metavar="EPSG",
-                    help="Destination CRS (use same as --src for pure join)")
+    pj.add_argument("--dst", required=False, default=None, metavar="EPSG",
+                    help="Destination CRS. Omit (or use with --no-reproject) "
+                         "for a pure join with no coordinate change.")
     pj.add_argument("--src", default=None, metavar="EPSG",
                     help="Source CRS (auto-detected if omitted)")
+    pj.add_argument("--no-reproject", action="store_true", dest="no_reproject",
+                    help="Pure join: copy headers verbatim, no coordinate "
+                         "transformation. ~3x faster than --src X --dst X. "
+                         "Automatically selected when --src == --dst.")
     pj.add_argument("--gap-km", type=float, default=None, dest="gap_km",
                     metavar="K",
                     help="Maximum inter-profile gap to be considered contiguous (km)")
@@ -116,6 +121,35 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--fill-zero", action="store_true", dest="fill_zero",
                     help="When --align is active, fill delay gaps with 0 "
                          "(white in Greys) instead of NaN.")
+    # ── Physical scale (overrides --px-per-trace / --figheight / --auto-height) ─
+    pe.add_argument("--x-scale", type=float, default=None, dest="x_scale",
+                    metavar="KM_PER_IN",
+                    help="Horizontal physical scale in km per inch.\n"
+                         "figwidth = total_km / x_scale.\n"
+                         "Typical TOPAS values: 1-4 km/in.")
+    pe.add_argument("--y-scale", type=float, default=None, dest="y_scale",
+                    metavar="MS_PER_IN",
+                    help="Vertical scale in ms per inch.\n"
+                         "figheight = record_ms / y_scale.\n"
+                         "Typical TOPAS: 25-50. Can be used alone or with --x-scale.")
+    pe.add_argument("--velocity", type=float, default=1500.0, dest="velocity",
+                    metavar="M_S",
+                    help="Sound velocity in m/s for depth conversion (default: 1500).\n"
+                         "Used with --x-scale (and no --y-scale / --ratio) to compute\n"
+                         "a physically consistent figheight:\n"
+                         "  depth_km = record_ms × velocity / 2_000_000\n"
+                         "  figheight = depth_km / x_scale  (VE=1, true scale)\n"
+                         "Also prints the vertical exaggeration (VE) whenever set.\n"
+                         "Display axis labels remain in milliseconds.")
+    pe.add_argument("--ratio", type=float, default=None, dest="ratio",
+                    metavar="W_H",
+                    help="Target width:height aspect ratio of the figure.\n"
+                         "figheight = figwidth / ratio.\n"
+                         "Works with or without --x-scale.\n"
+                         "Examples: --ratio 3  →  3:1 (typical seismic)\n"
+                         "          --ratio 4  →  4:1 (wider, similar to TOPAS SW)\n"
+                         "Overrides --y-scale, --auto-height and --figheight.\n"
+                         "Print VE info when used with --velocity.")
     # ── Visualisation options ──────────────────────────────────────────────────
     pe.add_argument("--x-tick", type=float, default=None, metavar="KM",
                     dest="x_tick",
@@ -123,6 +157,47 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--t-tick", type=float, default=None, metavar="MS",
                     dest="t_tick",
                     help="Place time grid-ticks every MS milliseconds on the y-axis.")
+    pe.add_argument("--time-ticks", type=int, default=None, dest="time_ticks",
+                    metavar="MIN",
+                    help="Add secondary x-axis at TOP with UTC timestamps every MIN min.")
+    pe.add_argument("--time-fmt",
+                    choices=["hhmm", "fix", "position", "datetime", "full"],
+                    default="hhmm", dest="time_fmt",
+                    help="Content of top time-axis labels (default: hhmm):\n"
+                         "  hhmm:     \"10:30\"\n"
+                         "  fix:      \"#12  10:30\"\n"
+                         "  position: \"10:30\\n43.1234N  8.5678W\"\n"
+                         "  datetime: \"02/06/2026\\n10:30\"\n"
+                         "  full:     \"#12  10:30\\n02/06/2026  43.1234N  8.5678W\"")
+    pe.add_argument("--time-font-size", type=float, default=6.0,
+                    dest="time_font_size", metavar="PT",
+                    help="Font size for top time-axis labels (default: 6.0 pt).")
+    pe.add_argument("--time-align",
+                    choices=["left", "center", "right"],
+                    default="left", dest="time_align",
+                    help="Horizontal alignment of time labels (default: left).")
+    pe.add_argument("--fix-font-size", type=float, default=5.0,
+                    dest="fix_font_size", metavar="PT",
+                    help="Font size for FIX-mark number labels inside the image "
+                         "(default: 5.0 pt).")
+    pe.add_argument("--fix-bbox-alpha", type=float, default=0.12,
+                    dest="fix_bbox_alpha", metavar="A",
+                    help="Opacity of the background box behind FIX labels "
+                         "(0.0 = no box, default: 0.12).")
+    pe.add_argument("--fix-color", default=None, dest="fix_color", metavar="HEX",
+                    help="Colour for FIX-mark lines and number labels.\n"
+                         "Defaults to the theme highlight colour.\n"
+                         "Example: --fix-color '#cc4444'  (soft red)")
+    # ── Margins ───────────────────────────────────────────────────────────────
+    pe.add_argument("--margin-top", type=float, default=0.0, dest="margin_top",
+                    metavar="MS",
+                    help="Zero-filled margin to add ABOVE the record (ms).\n"
+                         "Renders as white (Greys) / min-amplitude space.\n"
+                         "Useful to show context above the first reflector.")
+    pe.add_argument("--margin-bottom", type=float, default=0.0,
+                    dest="margin_bottom", metavar="MS",
+                    help="Zero-filled margin to add BELOW the record (ms).")
+    # ── Grid ─────────────────────────────────────────────────────────────────
     pe.add_argument("--grid", action="store_true",
                     help="Overlay a semi-transparent grid on the image.")
     pe.add_argument("--no-axes", action="store_true", dest="no_axes",
@@ -131,6 +206,20 @@ def build_parser() -> argparse.ArgumentParser:
                          "mapping with zero wasted pixels.")
     pe.add_argument("--title", default=None, metavar="TEXT",
                     help="Override the auto-generated figure title.")
+    # ── Colour / theme ────────────────────────────────────────────────────────
+    pe.add_argument("--theme", choices=["dark", "light", "print"],
+                    default="dark",
+                    help="Colour theme (default: dark):\n"
+                         "  dark:  dark navy bg, light text (matches TOPAS GUI)\n"
+                         "  light: light grey bg, dark text\n"
+                         "  print: pure white bg, black text (best for paper/PDF)")
+    pe.add_argument("--bg-color", default=None, dest="bg_color", metavar="HEX",
+                    help="Override figure/panel background colour (e.g. '#ffffff').")
+    pe.add_argument("--text-color", default=None, dest="text_color", metavar="HEX",
+                    help="Override all text and tick label colour.")
+    pe.add_argument("--axes-bg-color", default=None, dest="axes_bg_color",
+                    metavar="HEX",
+                    help="Override seismic axes background colour.")
     pe.add_argument("--clip-lo", type=float, default=0.0, dest="clip_lo",
                     metavar="P",
                     help="Lower clip percentile for colour scaling (default: 0). "

@@ -21,7 +21,7 @@ import numpy as np
 
 from ..core import (
     load_metadata, load_profile, SegyProfile, ProfileChain,
-    detect_chains, reproject_one, reproject_chain,
+    detect_chains, reproject_one, reproject_chain, join_profiles,
     process_profile_data, process_chain_data, time_window,
     compute_spectrum, colormapped_rgba,
     compute_fix_positions,
@@ -217,12 +217,15 @@ def cmd_reproject(args) -> None:
 
 def cmd_join_chain(args) -> None:
     """
-    join-chain FILE... --dst EPSG [--src EPSG] [--gap-km K] [--out PATH]
+    join-chain FILE... [--dst EPSG] [--src EPSG] [--no-reproject] [--gap-km K]
 
-    Joins contiguous profiles into one SEG-Y via reproject_chain.
-    When --src == --dst, coordinates are reprojected through an identity
-    transform (pure join with no coordinate change).
+    Routing logic:
+      --no-reproject          → join_profiles (fast copy, no CRS change)
+      --dst omitted           → join_profiles (fast copy, no CRS change)
+      --src X --dst X (same)  → join_profiles (fast copy, auto-detected)
+      --src X --dst Y         → reproject_chain (full reprojection)
     """
+    import shutil as _shutil
     tok      = _make_cancel_token()
     profiles = _load_profiles(args.files)
     valid    = [p for p in profiles if not p.error]
@@ -236,25 +239,41 @@ def cmd_join_chain(args) -> None:
     if not chains:
         _err("No chains detected.")
 
-    src = args.src or chains[0].profiles[0].detected_crs or "EPSG:4326"
-    dst = args.dst
+    # Decide fast path vs reprojection
+    no_reproj = getattr(args, "no_reproject", False)
+    src_str   = args.src or chains[0].profiles[0].detected_crs or "EPSG:4326"
+    dst_str   = getattr(args, "dst", None)
+
+    if dst_str is None or no_reproj:
+        use_fast = True
+    else:
+        # Auto-detect identity: resolve both CRS and compare
+        try:
+            from pyproj import CRS as _CRS
+            use_fast = _CRS.from_user_input(src_str) == _CRS.from_user_input(dst_str)
+        except Exception:
+            use_fast = (src_str == dst_str)
 
     for ch in chains:
         print(f"\nJoining chain: {ch.label}", file=sys.stderr)
+        if use_fast:
+            print("  Mode: fast copy (no reprojection)", file=sys.stderr)
 
         def _prog(frac, msg, _ch=ch):
             _progress(frac, f"{_ch.name[:40]}: {msg}")
 
         try:
-            out = reproject_chain(ch, src, dst,
-                                  unit_hint=args.unit_hint if hasattr(args, "unit_hint") else 2,
-                                  log=_log, progress=_prog, cancel=tok)
-            if args.out:
-                dest = args.out
-                Path(dest).parent.mkdir(parents=True, exist_ok=True)
-                import shutil
-                shutil.move(out, dest)
-                out = dest
+            if use_fast:
+                out = join_profiles(ch, out_path=args.out,
+                                    log=_log, progress=_prog, cancel=tok)
+            else:
+                out = reproject_chain(ch, src_str, dst_str,
+                                      unit_hint=getattr(args, "unit_hint", 2),
+                                      log=_log, progress=_prog, cancel=tok)
+                if args.out:
+                    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+                    _shutil.move(out, args.out)
+                    out = args.out
             print(f"\n  ✔ {Path(out).name}", file=sys.stderr)
         except Cancelled:
             print("\n  Cancelled.", file=sys.stderr)
@@ -318,22 +337,26 @@ def cmd_export_image(args) -> None:
     else:
         dpi = 150  # built-in default
 
-    # ── Resolve figheight ──────────────────────────────────────────────────
-    # Priority: explicit --figheight > --auto-height > default 7.0
-    auto_height  = getattr(args, "auto_height", False)
-    raw_figheight = getattr(args, "figheight", None)  # None if not set
+    # ── Scale / proportion parameters ─────────────────────────────────────────
+    x_scale  = getattr(args, "x_scale",  None)    # km per inch  (horizontal)
+    y_scale  = getattr(args, "y_scale",  None)    # ms per inch  (vertical, legacy)
+    velocity = getattr(args, "velocity", 1500.0)  # m/s for depth conversion
+    ratio    = getattr(args, "ratio",    None)     # desired W:H display ratio
 
+    # figsize is deferred to _figsize() below; set defaults for fallback
+    auto_height   = getattr(args, "auto_height", False)
+    raw_figheight = getattr(args, "figheight", None)
+
+    # figheight for the non-scale paths (resolved upfront)
     if raw_figheight is not None:
-        figheight = raw_figheight
+        _fallback_figheight = raw_figheight
     elif auto_height:
-        # compute from data — use first valid profile's ns
-        ref_ns    = valid[0].ns
-        figheight = ref_ns / dpi
-        print(f"  auto-height: ns={ref_ns}, dpi={dpi} "
-              f"→ figheight={figheight:.2f} in "
-              f"(output height ≈ {int(figheight*dpi)} px)", file=sys.stderr)
+        _fallback_figheight = valid[0].ns / dpi
+        print(f"  auto-height: ns={valid[0].ns}, dpi={dpi} "
+              f"→ figheight={_fallback_figheight:.2f} in "
+              f"(~{int(_fallback_figheight*dpi)} px)", file=sys.stderr)
     else:
-        figheight = 7.0
+        _fallback_figheight = 7.0
 
     px_per_trace = getattr(args, "px_per_trace", 2.0)
     no_axes      = getattr(args, "no_axes", False)
@@ -365,19 +388,115 @@ def cmd_export_image(args) -> None:
 
     pdf_page = getattr(args, "pdf_page", "auto") or "auto"
 
-    # ── Render options (axes, ticks, grid, title) ──────────────────────────
+    # ── Build colour theme ─────────────────────────────────────────────────
+    from ..viz.render import build_theme as _build_theme
+    colors = _build_theme(
+        theme         = getattr(args, "theme",         "dark"),
+        bg_color      = getattr(args, "bg_color",      None),
+        text_color    = getattr(args, "text_color",    None),
+        axes_bg_color = getattr(args, "axes_bg_color", None),
+    )
+
+    # ── Render options (axes, ticks, grid, title, time axis, margins, theme) ─
     render_opts: dict = {
-        "x_tick_km":    getattr(args, "x_tick", None),
-        "t_tick_ms":    getattr(args, "t_tick", None),
-        "show_grid":    getattr(args, "grid", False),
-        "title_override": getattr(args, "title", None),
-        "clip_lo":      getattr(args, "clip_lo", 0.0),
+        "x_tick_km":        getattr(args, "x_tick",          None),
+        "t_tick_ms":        getattr(args, "t_tick",          None),
+        "show_grid":        getattr(args, "grid",            False),
+        "title_override":   getattr(args, "title",           None),
+        "clip_lo":          getattr(args, "clip_lo",         0.0),
+        "time_tick_min":    getattr(args, "time_ticks",      None),
+        # New options
+        "margin_top_ms":    getattr(args, "margin_top",      0.0),
+        "margin_bottom_ms": getattr(args, "margin_bottom",   0.0),
+        "time_fmt":         getattr(args, "time_fmt",        "hhmm"),
+        "time_font_size":   getattr(args, "time_font_size",  6.0),
+        "time_align":       getattr(args, "time_align",      "left"),
+        "fix_font_size":    getattr(args, "fix_font_size",  5.0),
+        "fix_bbox_alpha":   getattr(args, "fix_bbox_alpha", 0.12),
+        "fix_color":        getattr(args, "fix_color",      None),
+        "colors":           colors,
     }
 
     # ── Figure size helper ─────────────────────────────────────────────────
-    def _figsize(n_traces: int) -> tuple:
-        w = max(8.0, n_traces * px_per_trace / dpi)
-        return (w, figheight)
+    def _figsize(source) -> tuple:
+        """
+        Compute figure (width_in, height_in) applying this priority:
+
+        WIDTH
+          1. --x-scale X  → total_km / X
+          2. fallback     → max(8, n_traces × px_per_trace / dpi)
+
+        HEIGHT
+          1. --ratio R         → width / R                  (any width mode)
+          2. --x-scale + --velocity (no --ratio/--y-scale)
+                               → depth_km / X  (VE=1, true physical scale)
+          3. --y-scale Y       → record_ms / Y
+          4. fallback          → _fallback_figheight (from --figheight/--auto-height/default)
+        """
+        total_km  = source.total_km
+        record_ms = source.ns * source.dt_us / 1000.0
+        depth_km  = record_ms * velocity / 2_000_000   # TWT → one-way → km
+
+        # ── Width ─────────────────────────────────────────────────────────
+        if x_scale is not None:
+            w = max(2.0, total_km / x_scale)
+        else:
+            w = max(8.0, source.n_traces * px_per_trace / dpi)
+
+        # ── Height ────────────────────────────────────────────────────────
+        if ratio is not None:
+            h = max(0.5, w / ratio)
+            _mode = f"--ratio {ratio}"
+
+        elif x_scale is not None and y_scale is None:
+            # Physical scale: height uses same km/in as width → VE=1
+            h = max(0.5, depth_km / x_scale)
+            _mode = f"velocity {velocity:.0f} m/s, VE=1 (true scale)"
+
+        elif y_scale is not None:
+            h = max(0.5, record_ms / y_scale)
+            _mode = f"--y-scale {y_scale} ms/in"
+
+        else:
+            h     = _fallback_figheight
+            _mode = "default figheight"
+
+        # ── VE info ───────────────────────────────────────────────────────
+        # VE = (horizontal km/in) / (vertical km/in)
+        # vertical km/in = depth_km / h
+        h_km_per_in = depth_km / h if h > 0 else 1e-9
+        w_km_per_in = total_km / w if w > 0 else 1e-9
+        ve = h_km_per_in / w_km_per_in   # >1 means VE applied (depth stretched)
+        # Note: VE>1 means vertical is exaggerated (depth appears deeper than real)
+        # In seismic display convention: VE = (horiz_scale) / (vert_scale)
+        # We print the inverse: how many times the depth is stretched
+        ve_display = w_km_per_in / h_km_per_in  # < 1 for "squeezed depth"...
+        # Convention: VE = horizontal_scale / vertical_scale
+        # vertical_scale = depth_km / h (km/in)
+        # horizontal_scale = total_km / w (km/in)
+        # VE = vertical_scale / horizontal_scale  (>1 = depth squeezed, normal in seismic)
+        # Actually seismic VE is: 1px vertical = dt*v/2 (metres), 1px horizontal = trace_spacing
+        # Let's simplify: VE_display = (km/in horizontal) / (km/in vertical)
+        # VE=1 → same km/in both axes (true scale, would look like a thin strip)
+        # VE=50 → depth looks 50× more than reality
+        true_ve = w_km_per_in / h_km_per_in  # how much vert is exaggerated vs horiz
+
+        print(
+            f"  scale [{_mode}]: "
+            f"{total_km:.1f} km wide, {depth_km*1000:.0f} m deep → "
+            f"{w:.1f} in × {h:.1f} in  "
+            f"(ratio {w/h:.1f}:1, VE={true_ve:.0f}× "
+            f"at v={velocity:.0f} m/s)",
+            file=sys.stderr
+        )
+        return (w, h)
+
+    def _eff_px_per_trace(source, fs: tuple) -> float:
+        """Effective px/trace for no-axes path (always computed from figsize)."""
+        return fs[0] * dpi / source.n_traces
+
+    def _eff_figheight(fs: tuple) -> float:
+        return fs[1]
 
     def _px_str(w_in: float, h_in: float) -> str:
         return (f"{int(w_in*dpi)}x{int(h_in*dpi)} px, "
@@ -388,16 +507,18 @@ def cmd_export_image(args) -> None:
 
     def _export_one(source, data, out_path, is_chain: bool) -> None:
         try:
-            fs_tuple = _figsize(source.n_traces)
+            fs_tuple    = _figsize(source)
+            eff_ppt     = _eff_px_per_trace(source, fs_tuple)
+            eff_fheight = _eff_figheight(fs_tuple)
 
             if no_axes:
                 # ── Raw RGBA path: zero margins, exact px/trace mapping ──
                 save_raw_rgba(source, data, out_path, params, render_opts,
-                              px_per_trace=px_per_trace, dpi=dpi,
-                              figheight=figheight, is_chain=is_chain,
+                              px_per_trace=eff_ppt, dpi=dpi,
+                              figheight=eff_fheight, is_chain=is_chain,
                               pdf_page=pdf_page)
-                w_px = int(source.n_traces * px_per_trace)
-                h_px = int(figheight * dpi)
+                w_px = int(source.n_traces * eff_ppt)
+                h_px = int(eff_fheight * dpi)
                 ext_ = Path(out_path).suffix.lower()
                 if ext_ == ".pdf":
                     pg  = pdf_page.upper() if pdf_page else "auto"

@@ -12,7 +12,8 @@ from .tasks import (
     ProgressCallback, CancelToken,
 )
 from .model import SegyMetadata, SegyProfile, ProfileChain
-from .io_segy import load_metadata, load_profile, reproject_one, reproject_chain
+from .io_segy import (load_metadata, load_profile,
+                      reproject_one, reproject_chain, join_profiles)
 from .processing import (
     apply_predictive_decon, apply_filter_preset,
     process_profile_data, process_chain_data, time_window,
@@ -39,6 +40,7 @@ __all__ = [
     "SegyMetadata", "SegyProfile", "ProfileChain",
     # I/O
     "load_metadata", "load_profile", "reproject_one", "reproject_chain",
+    "join_profiles",
     # Processing
     "apply_predictive_decon", "apply_filter_preset",
     "process_profile_data", "process_chain_data", "time_window",

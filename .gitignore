@@ -20,6 +20,11 @@ examples/_real_data_out/
 *.SEGY
 *_REPROY*
 *_UNIDO_REPROY*
+*.tif
+*.tiff
+# Keep run_demos scripts (they are source, not generated)
+!examples/run_demos.ps1
+!examples/run_demos.sh
 
 # Build / packaging
 build/
@@ -27,6 +32,7 @@ dist/
 *.egg-info/
 .venv/
 .env/
+.idea
 
 # IA processing
 *.claude

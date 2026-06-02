@@ -9,6 +9,7 @@ from .render import (
     render_spectrum_figure,
     save_figure,
     save_raw_rgba,
+    build_theme,
 )
 
 __all__ = [

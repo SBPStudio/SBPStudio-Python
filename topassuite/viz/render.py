@@ -52,19 +52,94 @@ from ..core.spectrum import SpectrumResult
 from ..core.processing import time_window
 from ..core.geometry_export import compute_fix_positions
 
-# Theme colours (match the GUI monolith)
-_C = {
-    "bg":       "#12141a",
-    "panel":    "#1a1d26",
-    "accent":   "#1e2535",
-    "highlight":"#2a3a5c",
-    "bright":   "#4d9de0",
-    "warn":     "#e94560",
-    "ok":       "#3ddc97",
-    "text":     "#dce3ee",
-    "sub":      "#6a7a96",
-    "entry":    "#0e1118",
+# ── Colour themes ─────────────────────────────────────────────────────────────
+#
+# Three built-in themes.  Pass one as --theme in the CLI; individual colours
+# can be overridden with --bg-color / --text-color / --axes-bg-color.
+#
+# Keys used throughout render.py:
+#   bg, panel    figure background
+#   entry        seismic axes background
+#   accent       spine / divider lines
+#   highlight    FIX marks
+#   text         labels and tick labels
+#   sub          colorbar labels, minor text
+#   warn         chain-join boundary lines
+#   bright       spectrum lines
+#   ok, grid     secondary colours
+
+_THEMES: dict = {
+    "dark": {                      # original dark-navy theme (matches the GUI)
+        "bg":        "#12141a",
+        "panel":     "#1a1d26",
+        "entry":     "#0e1118",
+        "accent":    "#1e2535",
+        "highlight": "#4d9de0",
+        "bright":    "#4d9de0",
+        "warn":      "#e94560",
+        "ok":        "#3ddc97",
+        "text":      "#dce3ee",
+        "sub":       "#6a7a96",
+        "grid":      "white",
+    },
+    "light": {                     # light-grey, dark text — good for screen
+        "bg":        "#f2f2f2",
+        "panel":     "#f2f2f2",
+        "entry":     "#ffffff",
+        "accent":    "#bbbbbb",
+        "highlight": "#0055cc",
+        "bright":    "#0055cc",
+        "warn":      "#cc2200",
+        "ok":        "#006600",
+        "text":      "#111111",
+        "sub":       "#444444",
+        "grid":      "#555555",
+    },
+    "print": {                     # pure white, black text — best for PDF/paper
+        "bg":        "#ffffff",
+        "panel":     "#ffffff",
+        "entry":     "#ffffff",
+        "accent":    "#cccccc",
+        "highlight": "#003399",
+        "bright":    "#003399",
+        "warn":      "#990000",
+        "ok":        "#004400",
+        "text":      "#000000",
+        "sub":       "#333333",
+        "grid":      "#666666",
+    },
 }
+
+# Default (backward-compat alias)
+_C: dict = _THEMES["dark"]
+
+
+def build_theme(
+    theme: str = "dark",
+    bg_color: Optional[str] = None,
+    text_color: Optional[str] = None,
+    axes_bg_color: Optional[str] = None,
+) -> dict:
+    """
+    Return a colour dict for use by render functions.
+
+    Parameters
+    ----------
+    theme         : 'dark' | 'light' | 'print' (default: 'dark')
+    bg_color      : hex override for figure/panel background
+    text_color    : hex override for all text and tick labels
+    axes_bg_color : hex override for the seismic axes background
+    """
+    base = dict(_THEMES.get(theme, _THEMES["dark"]))
+    if bg_color:
+        base["bg"]    = bg_color
+        base["panel"] = bg_color
+    if text_color:
+        base["text"] = text_color
+        base["sub"]  = text_color
+    if axes_bg_color:
+        base["entry"] = axes_bg_color
+    return base
 
 
 # ── PDF page size table (landscape: wider × taller) ───────────────────────────
@@ -162,22 +237,134 @@ def _save_pdf_raster(img: Any, path: str, dpi: int,
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
 def _get_colormap(name: str):
+
     try:
         return matplotlib.colormaps[name]
     except AttributeError:
         return matplotlib.cm.get_cmap(name)
 
 
-def _draw_fix_marks(ax, fixes: list, color: str = "#FFD700") -> None:
+def _pad_margins(d: np.ndarray, t0: float, t1: float,
+                  dt_us: int,
+                  margin_top_ms: float,
+                  margin_bottom_ms: float) -> tuple:
+    """
+    Zero-pad the seismic matrix above and/or below the record and extend
+    the time window accordingly.
+
+    Returns
+    -------
+    (d_padded, t0_new, t1_new)
+      d_padded : float32 array with extra zero rows at top and/or bottom
+      t0_new   : adjusted start time in ms
+      t1_new   : adjusted end time in ms
+    """
+    if margin_top_ms <= 0 and margin_bottom_ms <= 0:
+        return d, t0, t1
+
+    dt_ms  = dt_us / 1000.0
+    top_s  = max(0, int(round(margin_top_ms    / dt_ms)))
+    bot_s  = max(0, int(round(margin_bottom_ms / dt_ms)))
+    d_padded = np.pad(d, ((top_s, bot_s), (0, 0)),
+                      mode="constant", constant_values=0.0)
+    return d_padded, t0 - top_s * dt_ms, t1 + bot_s * dt_ms
+
+
+def _format_time_label(fix_tuple: tuple, timestamps: list,
+                       dist_km_arr: np.ndarray, fmt: str) -> str:
+    """
+    Build the text label for a secondary-axis time tick.
+
+    Parameters
+    ----------
+    fix_tuple     : (num, dist_km, "HH:MM", lon, lat)
+    timestamps    : full timestamps list of the source ("YYYY-DOYnnn HH:MM:SS")
+    dist_km_arr   : cumulative distance array (same length as timestamps)
+    fmt           : 'hhmm' | 'fix' | 'position' | 'datetime' | 'full'
+    """
+    num, fix_dist, hhmm, lon, lat = fix_tuple
+
+    # Nearest trace index by distance
+    idx = int(np.clip(np.searchsorted(dist_km_arr, fix_dist),
+                      0, len(dist_km_arr) - 1))
+    ts_str = timestamps[idx] if timestamps else ""
+
+    # Parse date from "YYYY-DOYnnn HH:MM:SS"  (DOY digits are at index 8:11)
+    # Format: "2024-DOY100 10:05:30"
+    #          01234567890123456789
+    #                   ^^^  ← positions 8,9,10 = DOY digits
+    date_str = ""
+    try:
+        from ..core.geometry_export import parse_timestamp as _pts
+        dt = _pts(ts_str)
+        if dt:
+            date_str = dt.strftime("%d/%m/%Y")
+    except Exception:
+        try:
+            from datetime import datetime, timedelta
+            yr  = int(ts_str[:4])
+            doy = int(ts_str[8:11])   # BUG FIX: was [6:9], DOY digits start at index 8
+            dt  = datetime(yr, 1, 1) + timedelta(days=doy - 1)
+            date_str = dt.strftime("%d/%m/%Y")
+        except Exception:
+            pass
+
+    lat_s = f"{abs(lat):.4f}{'N' if lat >= 0 else 'S'}"
+    lon_s = f"{abs(lon):.4f}{'E' if lon >= 0 else 'W'}"
+
+    if fmt == "fix":
+        return f"#{num}  {hhmm}Z"
+    if fmt == "position":
+        return f"{hhmm}Z\n{lat_s}  {lon_s}"
+    if fmt == "datetime":
+        d = f"{date_str} " if date_str else ""
+        return f"{d}{hhmm}Z"
+    if fmt == "full":
+        # Single first line with fix#, date and time; second line with coords
+        head = f"#{num} {date_str} {hhmm}Z" if date_str else f"#{num} {hhmm}Z"
+        return f"{head}\n{lat_s}  {lon_s}"
+    # Default: 'hhmm'
+    return f"{hhmm}Z"
+
+
+def _draw_fix_marks(ax, fixes: list, color: str = "#FFD700",
+                    font_size: float = 5.0,
+                    bbox_alpha: float = 0.12,
+                    axes_bg: str = "#0e1118") -> None:
+    """
+    Draw FIX-position marks: vertical dashed line + fix-number label.
+
+    Parameters
+    ----------
+    fixes      : list of (num, dist_km, "HH:MM", lon, lat)
+    color      : line and text colour (from theme highlight)
+    font_size  : label font size in pt (default: 5.0)
+    bbox_alpha : opacity of the label background (0 = no box, default: 0.12)
+    axes_bg    : fill colour for label background (should match axes entry colour)
+    """
     if not fixes:
         return
-    for num, dist, label, _lon, _lat in fixes:
-        ax.axvline(dist, color=color, lw=0.8, ls="--", alpha=0.65, zorder=3)
-        ax.text(dist, 0.98, f" {num} · {label}", color=color,
-                fontsize=5.5, fontfamily="monospace",
-                rotation=90, va="top", ha="center", zorder=5, clip_on=True,
-                transform=ax.get_xaxis_transform(),
-                bbox=dict(boxstyle="square,pad=0.1", fc=color, ec="none", alpha=0.20))
+    for num, dist, _hhmm, _lon, _lat in fixes:
+        ax.axvline(dist, color=color, lw=0.7, ls="--", alpha=0.55, zorder=3)
+        kw: dict = dict(
+            color=color, fontsize=font_size, fontfamily="monospace",
+            rotation=90, va="top",
+            # ha="right" → right edge of text at the tick line,
+            # so the number appears to the LEFT of the mark.
+            # Trailing spaces add a small gap between number and line.
+            ha="right",
+            zorder=5, clip_on=True,
+            transform=ax.get_xaxis_transform(),
+        )
+        if bbox_alpha > 0:
+            kw["bbox"] = dict(
+                boxstyle="square,pad=0.1",
+                fc=axes_bg,
+                ec=color,
+                alpha=bbox_alpha,
+                linewidth=0.4,
+            )
+        ax.text(dist, 0.97, f"{num}  ", **kw)   # trailing spaces = gap from line
 
 
 def _style_axes(ax, fig=None) -> None:
@@ -206,31 +393,107 @@ def _apply_axes_options(ax, t0: float, t1: float,
                         dist_start: float, dist_end: float,
                         x_tick_km: Optional[float],
                         t_tick_ms: Optional[float],
-                        show_grid: bool) -> None:
+                        show_grid: bool,
+                        colors: Optional[dict] = None) -> None:
     """Apply optional tick marks and grid to a seismic axes."""
+    C = colors if colors is not None else _C
+
     if x_tick_km is not None and x_tick_km > 0:
-        import numpy as _np
-        ticks = _np.arange(
-            _np.ceil(dist_start / x_tick_km) * x_tick_km,
+        ticks = np.arange(
+            np.ceil(dist_start / x_tick_km) * x_tick_km,
             dist_end + x_tick_km * 0.01,
             x_tick_km)
         ax.set_xticks(ticks)
         ax.set_xticklabels([f"{t:.1f}" for t in ticks],
-                           color=_C["text"], fontsize=7)
+                           color=C["text"], fontsize=7)
 
     if t_tick_ms is not None and t_tick_ms > 0:
-        import numpy as _np
         t_lo = min(t0, t1); t_hi = max(t0, t1)
-        ticks = _np.arange(
-            _np.ceil(t_lo / t_tick_ms) * t_tick_ms,
+        ticks = np.arange(
+            np.ceil(t_lo / t_tick_ms) * t_tick_ms,
             t_hi + t_tick_ms * 0.01,
             t_tick_ms)
         ax.set_yticks(ticks)
         ax.set_yticklabels([f"{t:.0f}" for t in ticks],
-                           color=_C["text"], fontsize=7)
+                           color=C["text"], fontsize=7)
+
+    # Ensure AUTO tick labels (when no explicit ticks set) also use the theme colour.
+    # This is needed because matplotlib may generate tick labels after tick_params
+    # has been called.
+    ax.tick_params(axis="both", labelcolor=C["text"], colors=C["text"])
 
     if show_grid:
-        ax.grid(True, color="white", alpha=0.18, lw=0.5, zorder=4)
+        ax.grid(True, color=C["grid"], alpha=0.18, lw=0.5, zorder=4)
+
+
+def _add_time_axis(ax,
+                   timestamps: list,
+                   dist_km: np.ndarray,
+                   lons: np.ndarray,
+                   lats: np.ndarray,
+                   time_tick_min: int,
+                   time_fmt: str = "hhmm",
+                   time_font_size: float = 6.0,
+                   time_align: str = "left",
+                   colors: Optional[dict] = None,
+                   boundaries_km: Optional[List[float]] = None) -> None:
+    """
+    Add a secondary x-axis at the TOP of the seismic section showing UTC
+    acquisition timestamps at regular time intervals.
+
+    Parameters
+    ----------
+    ax             : seismic axes (bottom x = km)
+    timestamps     : list of "YYYY-DOYnnn HH:MM:SS" strings, one per trace
+    dist_km        : (n_traces,) cumulative distance array
+    lons / lats    : (n_traces,) coordinates
+    time_tick_min  : label interval in minutes
+    time_fmt       : 'hhmm' | 'fix' | 'position' | 'datetime' | 'full'
+    time_font_size : font size for labels (default: 6.0)
+    time_align     : 'left' | 'center' | 'right' (horizontal alignment)
+    colors         : theme dict; uses global _C if None
+    """
+    C = colors if colors is not None else _C
+
+    fixes = compute_fix_positions(timestamps, dist_km, lons, lats, time_tick_min)
+    if not fixes:
+        return
+
+    tick_km    = [f[1] for f in fixes]
+    tick_label = [_format_time_label(f, timestamps, dist_km, time_fmt)
+                  for f in fixes]
+
+    # The user's intention when they say "left" / "right" is the POSITION of
+    # the label relative to the tick mark, not the matplotlib ha alignment.
+    # With rotation=90 (text reads bottom→top), the position semantics are:
+    #   user "left"  → ha="right"  (right edge of text box at tick → text to the LEFT)
+    #   user "right" → ha="left"   (left edge of text box at tick → text to the RIGHT)
+    #   user "center" → ha="center"
+    _ha_map = {"left": "right", "center": "center", "right": "left"}
+    ha  = _ha_map.get(time_align, "right")
+    va  = "bottom"   # bottom of text column at the axis line → text grows upward
+
+    ax_top = ax.twiny()
+    ax_top.set_xlim(ax.get_xlim())
+    ax_top.set_xticks(tick_km)
+    ax_top.set_xticklabels(
+        tick_label,
+        rotation=90,
+        va=va,
+        ha=ha,
+        color=C["text"],
+        fontsize=time_font_size,
+        fontfamily="monospace",
+    )
+    ax_top.tick_params(
+        axis="x", colors=C["text"],
+        direction="out", length=4, width=0.8,
+        labelsize=time_font_size,
+    )
+    ax_top.set_xlabel("UTC", color=C["sub"], fontsize=max(5, time_font_size - 1),
+                      labelpad=2)
+    for sp in ax_top.spines.values():
+        sp.set_edgecolor(C["accent"])
 
 
 def _resize_rgba(rgba: np.ndarray, target_px: tuple) -> np.ndarray:
@@ -295,32 +558,48 @@ def render_profile_figure(
     params: dict,
     figsize: tuple = (12, 7),
     dpi: int = 100,
-    # ── new visualisation options ──
+    # ── visualisation options ──
     x_tick_km: Optional[float] = None,
     t_tick_ms: Optional[float] = None,
     show_grid: bool = False,
     title_override: Optional[str] = None,
     clip_lo: float = 0.0,
+    time_tick_min: Optional[int] = None,
+    # ── new: margins, label config, colours ──
+    margin_top_ms: float = 0.0,
+    margin_bottom_ms: float = 0.0,
+    time_fmt: str = "hhmm",
+    time_font_size: float = 6.0,
+    time_align: str = "left",
+    fix_font_size: float = 5.0,
+    fix_bbox_alpha: float = 0.12,
+    fix_color: Optional[str] = None,
+    colors: Optional[dict] = None,
 ) -> Figure:
     """
     Render a seismic profile as a headless Matplotlib figure.
 
-    Parameters
-    ----------
-    sd, data, params : standard seismic inputs
-    figsize          : (width_in, height_in)
-    dpi              : figure resolution
-    x_tick_km        : if set, place x-axis ticks every N km
-    t_tick_ms        : if set, place y-axis ticks every N ms
-    show_grid        : overlay semi-transparent grid
-    title_override   : replace auto-generated title
-    clip_lo          : lower percentile for colour range (default 0)
+    New parameters
+    --------------
+    margin_top_ms / margin_bottom_ms : zero-filled padding above/below record (ms)
+    time_fmt       : top-axis label format ('hhmm'|'fix'|'position'|'datetime'|'full')
+    time_font_size : font size for top time-axis labels
+    time_align     : label position relative to tick — 'left' puts label to the LEFT
+    fix_font_size  : font size for FIX-mark number labels inside the image
+    fix_bbox_alpha : opacity of the FIX label background box (0 = no box)
+    fix_color      : colour for FIX lines and labels (defaults to theme highlight)
+    colors         : theme dict from build_theme(); uses dark theme if None
     """
+    C = colors if colors is not None else _C
+
     i0, i1, t0, t1 = time_window(sd, data.shape[0], params.get("align", False))
     d = data[i0:i1, :]
 
-    clip_pct  = params.get("clip", 99)
-    clip_lo_  = params.get("clip_lo", clip_lo)
+    # ── Apply margins ──────────────────────────────────────────────────────
+    d, t0, t1 = _pad_margins(d, t0, t1, sd.dt_us, margin_top_ms, margin_bottom_ms)
+
+    clip_pct   = params.get("clip", 99)
+    clip_lo_   = params.get("clip_lo", clip_lo)
     vmin, vmax = _vmin_vmax(d, clip_pct, clip_lo_)
 
     cmap_base = CMAPS.get(params.get("cmap", "Viridis"), "viridis")
@@ -329,21 +608,25 @@ def render_profile_figure(
     target  = (int(figsize[0] * dpi), int(figsize[1] * dpi))
     resized = _colorize_for_target(d, cmap_name, vmin, vmax, target)
 
-    fig = Figure(figsize=figsize, dpi=dpi, facecolor=_C["panel"])
+    fig = Figure(figsize=figsize, dpi=dpi, facecolor=C["panel"])
     ax  = fig.add_subplot(111)
-    _style_axes(ax, fig)
+    ax.set_facecolor(C["entry"])
+    ax.tick_params(colors=C["text"], labelsize=8)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(C["accent"])
 
     ax.imshow(resized, aspect="auto", interpolation="none",
               extent=[sd.dist_km[0], sd.dist_km[-1], t1, t0])
 
     _apply_axes_options(ax, t0, t1, sd.dist_km[0], sd.dist_km[-1],
-                        x_tick_km, t_tick_ms, show_grid)
+                        x_tick_km, t_tick_ms, show_grid, colors=C)
 
     sm = plt.cm.ScalarMappable(cmap=cmap_name, norm=mcolors.Normalize(vmin, vmax))
     sm.set_array([])
     cb = fig.colorbar(sm, ax=ax, pad=0.01, fraction=0.015)
-    cb.ax.yaxis.set_tick_params(color=_C["sub"], labelsize=7)
-    cb.set_label("Amplitude", color=_C["sub"], fontsize=8)
+    cb.ax.yaxis.set_tick_params(color=C["sub"], labelsize=7)
+    cb.ax.yaxis.set_tick_params(labelcolor=C["sub"])
+    cb.set_label("Amplitude", color=C["sub"], fontsize=8)
 
     if title_override:
         title_str = title_override
@@ -354,15 +637,24 @@ def render_profile_figure(
         delay_lbl   = "  ·  aligned" if params.get("align") else ""
         title_str   = (f"{sd.name}  ·  {sd.n_traces} tr  ·  "
                        f"{sd.dt_us} µs{preset_lbl}{delay_lbl}")
-    ax.set_title(title_str, color=_C["text"], fontsize=10, pad=8)
-    ax.set_xlabel("Distance (km)", color=_C["text"], fontsize=9)
-    ax.set_ylabel("Time (ms)",     color=_C["text"], fontsize=9)
+    ax.set_title(title_str, color=C["text"], fontsize=10, pad=8)
+    ax.set_xlabel("Distance (km)", color=C["text"], fontsize=9)
+    ax.set_ylabel("Time (ms)",     color=C["text"], fontsize=9)
 
     if params.get("fix"):
         fixes = compute_fix_positions(
             sd.timestamps, sd.dist_km, sd.lons, sd.lats,
             int(params.get("fix_iv", 5)))
-        _draw_fix_marks(ax, fixes, color=_C["highlight"])
+        _draw_fix_marks(ax, fixes,
+                        color=fix_color or C["highlight"],
+                        font_size=fix_font_size, bbox_alpha=fix_bbox_alpha,
+                        axes_bg=C["entry"])
+
+    if time_tick_min:
+        _add_time_axis(ax, sd.timestamps, sd.dist_km, sd.lons, sd.lats,
+                       time_tick_min, time_fmt=time_fmt,
+                       time_font_size=time_font_size, time_align=time_align,
+                       colors=C)
 
     fig.tight_layout(pad=1.2)
     return fig
@@ -376,20 +668,36 @@ def render_chain_figure(
     params: dict,
     figsize: tuple = (14, 7),
     dpi: int = 100,
-    # ── new visualisation options ──
+    # ── visualisation options ──
     x_tick_km: Optional[float] = None,
     t_tick_ms: Optional[float] = None,
     show_grid: bool = False,
     title_override: Optional[str] = None,
     clip_lo: float = 0.0,
+    time_tick_min: Optional[int] = None,
+    # ── new: margins, label config, colours ──
+    margin_top_ms: float = 0.0,
+    margin_bottom_ms: float = 0.0,
+    time_fmt: str = "hhmm",
+    time_font_size: float = 6.0,
+    time_align: str = "left",
+    fix_font_size: float = 5.0,
+    fix_bbox_alpha: float = 0.12,
+    fix_color: Optional[str] = None,
+    colors: Optional[dict] = None,
 ) -> Figure:
     """
     Render a ProfileChain as a headless Matplotlib figure.
 
     Per-segment vmax normalisation, boundary vlines, colorbar = median vmax.
     """
+    C = colors if colors is not None else _C
+
     i0, i1, t0, t1 = time_window(ch, data.shape[0], params.get("align", False))
     d = data[i0:i1, :]
+
+    # ── Apply margins ──────────────────────────────────────────────────────
+    d, t0, t1 = _pad_margins(d, t0, t1, ch.dt_us, margin_top_ms, margin_bottom_ms)
 
     cmap_base = CMAPS.get(params.get("cmap", "Viridis"), "viridis")
     cmap_name = cmap_base + "_r" if params.get("inv_cmap", False) else cmap_base
@@ -421,38 +729,51 @@ def render_chain_figure(
     resized = np.concatenate(rgba_segs, axis=1)
     target  = (int(figsize[0] * dpi), int(figsize[1] * dpi))
 
-    fig = Figure(figsize=figsize, dpi=dpi, facecolor=_C["panel"])
+    fig = Figure(figsize=figsize, dpi=dpi, facecolor=C["panel"])
     ax  = fig.add_subplot(111)
-    _style_axes(ax, fig)
+    ax.set_facecolor(C["entry"])
+    ax.tick_params(colors=C["text"], labelsize=8)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(C["accent"])
 
     ax.imshow(resized, aspect="auto", interpolation="none",
               extent=[ch.dist_km[0], ch.dist_km[-1], t1, t0])
 
     for bk in ch.boundaries_km:
-        ax.axvline(bk, color=_C["warn"], lw=1.0, ls="--", alpha=0.7, zorder=5)
+        ax.axvline(bk, color=C["warn"], lw=1.0, ls="--", alpha=0.7, zorder=5)
 
     _apply_axes_options(ax, t0, t1, ch.dist_km[0], ch.dist_km[-1],
-                        x_tick_km, t_tick_ms, show_grid)
+                        x_tick_km, t_tick_ms, show_grid, colors=C)
 
     sm = plt.cm.ScalarMappable(cmap=cmap_name,
                                 norm=mcolors.Normalize(vmin_cb, vmax_cb))
     sm.set_array([])
     cb = fig.colorbar(sm, ax=ax, pad=0.01, fraction=0.015)
-    cb.ax.yaxis.set_tick_params(color=_C["sub"], labelsize=7)
-    cb.set_label("Amplitude (median vmax)", color=_C["sub"], fontsize=8)
+    cb.ax.yaxis.set_tick_params(color=C["sub"], labelsize=7)
+    cb.ax.yaxis.set_tick_params(labelcolor=C["sub"])
+    cb.set_label("Amplitude (median vmax)", color=C["sub"], fontsize=8)
 
     title_str = title_override or (
         f"{ch.label}  ·  {ch.n_traces} tr  ·  {ch.dt_us} µs  ·  "
         f"{ch.total_km:.1f} km")
-    ax.set_title(title_str, color=_C["text"], fontsize=10, pad=8)
-    ax.set_xlabel("Distance (km)", color=_C["text"], fontsize=9)
-    ax.set_ylabel("Time (ms)",     color=_C["text"], fontsize=9)
+    ax.set_title(title_str, color=C["text"], fontsize=10, pad=8)
+    ax.set_xlabel("Distance (km)", color=C["text"], fontsize=9)
+    ax.set_ylabel("Time (ms)",     color=C["text"], fontsize=9)
 
     if params.get("fix"):
         fixes = compute_fix_positions(
             ch.timestamps, ch.dist_km, ch.lons, ch.lats,
             int(params.get("fix_iv", 5)))
-        _draw_fix_marks(ax, fixes, color=_C["highlight"])
+        _draw_fix_marks(ax, fixes,
+                        color=fix_color or C["highlight"],
+                        font_size=fix_font_size, bbox_alpha=fix_bbox_alpha,
+                        axes_bg=C["entry"])
+
+    if time_tick_min:
+        _add_time_axis(ax, ch.timestamps, ch.dist_km, ch.lons, ch.lats,
+                       time_tick_min, time_fmt=time_fmt,
+                       time_font_size=time_font_size, time_align=time_align,
+                       colors=C, boundaries_km=ch.boundaries_km)
 
     fig.tight_layout(pad=1.2)
     return fig
