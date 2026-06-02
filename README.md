@@ -458,5 +458,5 @@ This license applies to the source code, scripts and documentation in this repos
 [conda-url]: https://conda-forge.org/
 [tests-shield]: https://img.shields.io/badge/tests-115%20passed-brightgreen?style=for-the-badge&logo=pytest&logoColor=white
 [tests-url]: https://docs.pytest.org/
-[license-shield]: https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge
+[license-shield]: https://img.shields.io/badge/License-GPL%203.0-yellow.svg?style=for-the-badge
 [license-url]: https://opensource.org/licenses/gpl-3.0
