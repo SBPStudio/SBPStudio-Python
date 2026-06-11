@@ -739,8 +739,13 @@ def render_chain_figure(
     ax.imshow(resized, aspect="auto", interpolation="none",
               extent=[ch.dist_km[0], ch.dist_km[-1], t1, t0])
 
-    for bk in ch.boundaries_km:
-        ax.axvline(bk, color=C["warn"], lw=1.0, ls="--", alpha=0.7, zorder=5)
+    # File-seam (chain-join) boundary lines — drawn ONLY when explicitly
+    # requested via params["draw_file_boundaries"]. The GUI export dialog
+    # defaults this OFF (independent of the interactive viewer's own toggle);
+    # the CLI sets it True to preserve its historical always-on behaviour.
+    if params.get("draw_file_boundaries", False):
+        for bk in ch.boundaries_km:
+            ax.axvline(bk, color=C["warn"], lw=1.0, ls="--", alpha=0.7, zorder=5)
 
     _apply_axes_options(ax, t0, t1, ch.dist_km[0], ch.dist_km[-1],
                         x_tick_km, t_tick_ms, show_grid, colors=C)
