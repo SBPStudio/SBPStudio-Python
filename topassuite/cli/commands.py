@@ -384,6 +384,9 @@ def cmd_export_image(args) -> None:
         "inv_cmap":   args.invert,
         "fix":        args.fix is not None,
         "fix_iv":     args.fix if args.fix is not None else 5,
+        # Preserve the CLI's historical behaviour: chain exports always draw
+        # the file-seam boundary lines. (The GUI export dialog defaults OFF.)
+        "draw_file_boundaries": True,
     }
 
     pdf_page = getattr(args, "pdf_page", "auto") or "auto"
