@@ -381,6 +381,327 @@ def apply_filter_preset(data: np.ndarray, key: str, dt_us: int) -> np.ndarray:
     return _ref_apply_filter_preset(data, key, dt_us)
 
 
+# ── AGC (Automatic Gain Control) ───────────────────────────────────────────────
+
+def apply_agc(data: np.ndarray, win_ms: float, dt_us: int) -> np.ndarray:
+    """
+    Automatic Gain Control: divide each sample by the local sliding RMS.
+
+    This is the standalone, composable form of the AGC stage previously
+    inlined in :func:`_process_data_generic`. Behaviour is identical
+    (GPU path when available, else parallel-CPU uniform_filter1d over the
+    time axis). Exposed so the GUI node pipeline can call it directly
+    instead of re-implementing the math.
+
+    Parameters
+    ----------
+    data   : (ns, n_traces) float32 — input NOT mutated
+    win_ms : AGC window length in ms
+    dt_us  : sample interval in microseconds
+
+    Returns
+    -------
+    (ns, n_traces) float32 — new array
+
+    Path: reference math (matches _ref_agc); dispatches GPU/parallel-CPU.
+    """
+    win_s = max(3, int(win_ms / (dt_us / 1000.0)))
+    if win_s % 2 == 0:
+        win_s += 1
+
+    if _GPU:
+        import cupy as cp
+        try:
+            from cupyx.scipy.ndimage import uniform_filter1d as cu_uf
+            g   = cp.asarray(np.abs(data))
+            rms = cu_uf(g, size=win_s, axis=0)
+            rms = cp.maximum(rms, 1e-9)
+            return cp.asnumpy(cp.asarray(data) / rms).astype(np.float32)
+        except Exception:
+            pass  # fall through to parallel CPU
+
+    from scipy.ndimage import uniform_filter1d as _uf
+
+    def _agc_block(blk: np.ndarray, _w=win_s) -> np.ndarray:
+        env = np.abs(blk)
+        rms = _uf(env, size=_w, axis=0)
+        return (blk / np.maximum(rms, 1e-9)).astype(np.float32)
+
+    return _parallel_apply(_agc_block, data)
+
+
+# ── Bandpass filter ─────────────────────────────────────────────────────────────
+
+def apply_bandpass(data: np.ndarray, flo: float, fhi: float, dt_us: int) -> np.ndarray:
+    """
+    Zero-distortion-band Butterworth (4th order SOS) bandpass along time.
+
+    Standalone, composable form of the bandpass stage inlined in
+    ``_process_data_generic``. ``flo`` is clamped to ≥10 Hz and ``fhi`` to just
+    below Nyquist; if the band collapses (flo ≥ fhi) the input is returned
+    unchanged (a copy).
+
+    Parameters
+    ----------
+    data  : (ns, n_traces) float32 — input NOT mutated
+    flo   : low cut frequency (Hz)
+    fhi   : high cut frequency (Hz)
+    dt_us : sample interval in microseconds
+
+    Returns
+    -------
+    (ns, n_traces) float32 — new array
+    """
+    fs  = 1e6 / dt_us
+    flo = max(10, flo)
+    fhi = min(fs / 2 - 1, fhi)
+    if flo >= fhi:
+        return data.copy()
+    sos = sp_signal.butter(4, [flo, fhi], btype="bandpass", fs=fs, output="sos")
+
+    def _sosfilt_block(block: np.ndarray, _sos=sos) -> np.ndarray:
+        return sp_signal.sosfilt(_sos, block, axis=0).astype(np.float32)
+
+    return _parallel_apply(_sosfilt_block, data)
+
+
+# ── TVG (time-variant exponential gain) ─────────────────────────────────────────
+
+def apply_tvg(data: np.ndarray, alpha: float, dt_us: int) -> np.ndarray:
+    """
+    Time-variant gain: multiply each sample by ``exp(alpha · t)`` (t in seconds).
+
+    Standalone, composable form of the TVG stage inlined in
+    ``_process_data_generic`` (gain clipped to [0, 1e9]).
+
+    Parameters
+    ----------
+    data  : (ns, n_traces) float32 — input NOT mutated
+    alpha : exponential attenuation-compensation coefficient
+    dt_us : sample interval in microseconds
+
+    Returns
+    -------
+    (ns, n_traces) float32 — new array
+    """
+    t_sec = np.arange(data.shape[0], dtype=np.float32) * (dt_us / 1e6)
+    gain_curve = np.clip(np.exp(alpha * t_sec), 0.0, 1e9)
+    return (data * gain_curve[:, np.newaxis]).astype(np.float32)
+
+
+# ── Delay alignment (geometry) ──────────────────────────────────────────────────
+
+def apply_delay_alignment(data: np.ndarray, delays: np.ndarray,
+                          min_delay: float, dt_us: int,
+                          fill_value: float = 0.0) -> np.ndarray:
+    """
+    Compensate per-trace recording delays so events line up in two-way-time.
+
+    Each trace is shifted DOWN by ``round((delay − min_delay) / dt_ms)`` samples;
+    the matrix grows by the largest shift and the exposed gaps are filled with
+    ``fill_value`` (0.0 for white, NaN for transparent). Standalone, composable
+    form of the align stage inlined in ``_process_data_generic``.
+
+    Parameters
+    ----------
+    data       : (ns, n_traces) float32 — input NOT mutated
+    delays     : (n_traces,) per-trace DelayRecordingTime (ms)
+    min_delay  : reference delay (ms) — the alignment origin
+    dt_us      : sample interval in microseconds
+    fill_value : value for the exposed delay gaps (default 0.0)
+
+    Returns
+    -------
+    (ns + extra, n_traces) float32 — new, taller array
+    """
+    ns, n_traces = data.shape
+    dt_ms   = dt_us / 1000.0
+    offsets = np.round((np.asarray(delays) - min_delay) / dt_ms).astype(int)
+    extra   = int(offsets.max()) if offsets.size else 0
+    aligned = np.full((ns + extra, n_traces), fill_value, dtype=np.float32)
+    row_idx = np.arange(ns)[:, None] + offsets[None, :]
+    col_idx = np.arange(n_traces)[None, :]
+    aligned[row_idx, col_idx] = data
+    return aligned
+
+
+# ── Water-column mute ───────────────────────────────────────────────────────────
+
+def apply_water_mute(data: np.ndarray, threshold_pct: float,
+                     margin_ms: float, dt_us: int) -> np.ndarray:
+    """
+    Mute the water column above the seabed, trace by trace (fully vectorised).
+
+    For each trace the seabed is picked as the FIRST sample whose |amplitude|
+    reaches ``threshold_pct`` % of that trace's peak |amplitude|. Everything from
+    t=0 down to ``pick − margin_ms`` is zeroed (the margin keeps a little signal
+    above the seabed so the reflector itself is never clipped).
+
+    Parameters
+    ----------
+    data          : (ns, n_traces) float32 — input NOT mutated
+    threshold_pct : seabed pick threshold, % of per-trace peak (e.g. 30)
+    margin_ms     : protect this many ms above the pick (mute stops there)
+    dt_us         : sample interval in microseconds
+
+    Returns
+    -------
+    (ns, n_traces) float32 — new array
+
+    Notes
+    -----
+    Vectorised: per-trace peak via ``max(axis=0)``, first-crossing via
+    ``argmax`` on the boolean threshold mask, mute via a broadcast row<limit
+    mask. All-zero traces (peak=0 ⇒ threshold=0 ⇒ pick=0) mute nothing.
+    """
+    ns, n_traces = data.shape
+    dt_ms  = dt_us / 1000.0
+    abs_d  = np.abs(data)
+    peak   = abs_d.max(axis=0)                         # (n_traces,)
+    thresh = (threshold_pct / 100.0) * peak            # (n_traces,)
+
+    # First sample per trace reaching the threshold (the peak always qualifies,
+    # so argmax always finds a real crossing; ties resolve to the earliest).
+    exceed = abs_d >= thresh[None, :]                  # (ns, n_traces) bool
+    pick   = np.argmax(exceed, axis=0)                 # (n_traces,)
+
+    margin_s   = int(round(margin_ms / dt_ms))
+    mute_until = np.maximum(pick - margin_s, 0)        # (n_traces,) — exclusive
+    rows       = np.arange(ns)[:, None]                # (ns, 1)
+    mute_mask  = rows < mute_until[None, :]            # (ns, n_traces)
+
+    out = data.copy()
+    out[mute_mask] = 0.0
+    return out.astype(np.float32)
+
+
+# ── Swell filter (algorithmic heave correction) ─────────────────────────────────
+
+def apply_swell_filter(data: np.ndarray, window_traces: int,
+                       max_shift_ms: float, dt_us: int) -> np.ndarray:
+    """
+    Remove wave-induced heave by flattening each trace to a smooth spatial
+    reference via cross-correlation static shifts (vectorised over traces).
+
+    For each trace a reference is built from the rolling mean of its
+    ``window_traces`` neighbours (a smooth, heave-free seabed estimate). The
+    per-trace vertical static is the lag in [−max_shift, +max_shift] samples
+    that maximises the (unit-normalised) cross-correlation with that reference;
+    the trace is then rolled by that lag to align it, cancelling the heave.
+
+    Parameters
+    ----------
+    data          : (ns, n_traces) float32 — input NOT mutated
+    window_traces : neighbourhood width for the smooth reference (traces)
+    max_shift_ms  : maximum |static shift| searched/applied (ms)
+    dt_us         : sample interval in microseconds
+
+    Returns
+    -------
+    (ns, n_traces) float32 — new array
+
+    Notes
+    -----
+    Reference: ``uniform_filter1d`` across traces (axis=1). Cross-correlation is
+    a loop over the (small) lag range, each step a vectorised multiply+sum over
+    all traces. Zero-lag is the baseline so ties bias to *no* shift (minimal
+    heave). The final shift uses ``take_along_axis`` with zero-fill at the edges.
+    """
+    from scipy.ndimage import uniform_filter1d
+
+    ns, n_traces = data.shape
+    dt_ms     = dt_us / 1000.0
+    max_shift = max(1, int(round(max_shift_ms / dt_ms)))
+    win       = max(3, int(window_traces))
+    if n_traces < 3:
+        return data.copy().astype(np.float32)
+
+    # Smooth spatial reference (heave-free seabed estimate).
+    ref = uniform_filter1d(data, size=win, axis=1, mode="nearest").astype(np.float32)
+
+    # Unit-normalise per trace → cosine cross-correlation (robust peak picking).
+    eps = 1e-12
+    dn = data / (np.linalg.norm(data, axis=0, keepdims=True) + eps)
+    rn = ref  / (np.linalg.norm(ref,  axis=0, keepdims=True) + eps)
+
+    # Baseline = zero lag; only strictly better lags override (ties → no shift).
+    best_corr = np.sum(dn * rn, axis=0)                # (n_traces,)
+    best_lag  = np.zeros(n_traces, dtype=int)
+    for lag in range(-max_shift, max_shift + 1):
+        if lag == 0:
+            continue
+        rr = np.roll(rn, lag, axis=0)
+        if lag > 0:
+            rr[:lag, :] = 0.0
+        else:
+            rr[lag:, :] = 0.0
+        corr = np.sum(dn * rr, axis=0)
+        upd = corr > best_corr
+        best_corr[upd] = corr[upd]
+        best_lag[upd] = lag
+
+    # Align each trace to the reference: out[i] = data[i + lag] (zero-filled).
+    rows  = np.arange(ns)[:, None]
+    src   = rows + best_lag[None, :]                   # (ns, n_traces)
+    valid = (src >= 0) & (src < ns)
+    out   = np.take_along_axis(data, np.clip(src, 0, ns - 1), axis=0)
+    out[~valid] = 0.0
+    return out.astype(np.float32)
+
+
+# ── Amplitude spectrum (FFT) ────────────────────────────────────────────────────
+
+def compute_amplitude_spectrum(data: np.ndarray, dt_us: int) -> tuple:
+    """
+    Mean-trace amplitude spectrum of a seismic section (for filter tuning).
+
+    The traces are averaged into a single mean 1-D trace (stacking improves the
+    SNR of the estimate), Hann-tapered to limit spectral leakage, transformed
+    with a real FFT, and the magnitude is lightly smoothed so the spectral
+    envelope is readable.
+
+    Parameters
+    ----------
+    data  : (ns, n_traces) float32, or a 1-D (ns,) trace
+    dt_us : sample interval in microseconds
+
+    Returns
+    -------
+    (freqs_hz, amplitude_db) : both 1-D float32 arrays of length ns//2 + 1.
+        ``freqs_hz`` spans 0 … Nyquist (1e6 / dt_us / 2). ``amplitude_db`` is the
+        power magnitude in decibels, NORMALISED so the peak is 0 dB; the 0 Hz
+        (DC) bin is forced to the floor so it never compresses the plot.
+    """
+    arr = np.asarray(data)
+    trace = arr.mean(axis=1) if arr.ndim == 2 else arr
+    trace = np.nan_to_num(trace, nan=0.0).astype(np.float64)
+    n = trace.size
+    if n < 4:
+        return np.zeros(1, np.float32), np.zeros(1, np.float32)
+
+    trace = trace - trace.mean()                       # coarse DC removal
+    spec  = np.fft.rfft(trace * np.hanning(n))         # Hann taper → less leakage
+    freqs = np.fft.rfftfreq(n, d=dt_us / 1e6)          # Hz
+    amp   = np.abs(spec)
+    amp[0] = 0.0                                        # kill DC BEFORE smoothing
+                                                       # so the spike can't smear
+
+    # Light moving-average smoothing for a readable envelope (~1 % of the band).
+    if amp.size > 8:
+        from scipy.ndimage import uniform_filter1d
+        amp = uniform_filter1d(amp, size=max(3, amp.size // 100))
+    amp[0] = 0.0                                        # STRICT: 0 Hz forced to 0
+
+    # Decibel (power) scale — essential for the huge dynamic range of seismic
+    # spectra — normalised so the spectral peak sits at 0 dB. The DC bin → very
+    # negative; clamp the floor so the plot/auto-range stays sane.
+    amp_db = 20.0 * np.log10(amp + 1e-12)
+    amp_db -= amp_db.max()
+    amp_db = np.maximum(amp_db, -120.0)
+
+    return freqs.astype(np.float32), amp_db.astype(np.float32)
+
+
 # ── Pipeline ───────────────────────────────────────────────────────────────────
 
 def _process_data_generic(obj: Any, params: Dict[str, Any]) -> np.ndarray:
@@ -413,14 +734,8 @@ def _process_data_generic(obj: Any, params: Dict[str, Any]) -> np.ndarray:
                                       params["decon_wn"])
 
     if params.get("filt"):
-        fs  = 1e6 / obj.dt_us
-        flo = max(10, params["flo"])
-        fhi = min(fs / 2 - 1, params["fhi"])
-        if flo < fhi:
-            sos = sp_signal.butter(4, [flo, fhi], btype="bandpass", fs=fs, output="sos")
-            def _sosfilt_block(block: np.ndarray, _sos=sos) -> np.ndarray:
-                return sp_signal.sosfilt(_sos, block, axis=0).astype(np.float32)
-            data = _parallel_apply(_sosfilt_block, data)
+        # Single source of truth — the standalone apply_bandpass.
+        data = apply_bandpass(data, params["flo"], params["fhi"], obj.dt_us)
 
     # Resolve preset: accept either the display name (GUI path) or the
     # direct key (CLI path, e.g. "envelope" instead of "Envelope (amplitud...)")
@@ -432,56 +747,17 @@ def _process_data_generic(obj: Any, params: Dict[str, Any]) -> np.ndarray:
         data = apply_filter_preset(data, preset_key, obj.dt_us)
 
     if params.get("tvg"):
-        alpha = params["tvg_alpha"]
-        t_sec = np.arange(data.shape[0], dtype=np.float32) * (obj.dt_us / 1e6)
-        gain_curve = np.clip(np.exp(alpha * t_sec), 0.0, 1e9)
-        data *= gain_curve[:, np.newaxis]
+        data = apply_tvg(data, params["tvg_alpha"], obj.dt_us)
 
     if params.get("agc"):
-        win_s = max(3, int(params["agc_win"] / (obj.dt_us / 1000.0)))
-        if win_s % 2 == 0:
-            win_s += 1
-        if _GPU:
-            import cupy as cp
-            try:
-                from cupyx.scipy.ndimage import uniform_filter1d as cu_uf
-                g    = cp.asarray(np.abs(data))
-                rms  = cu_uf(g, size=win_s, axis=0)
-                rms  = cp.maximum(rms, 1e-9)
-                data = cp.asnumpy(cp.asarray(data) / rms).astype(np.float32)
-            except Exception:
-                # GPU failed → fall through to parallel CPU
-                _GPU_fallback = True
-            else:
-                _GPU_fallback = False
-        else:
-            _GPU_fallback = True
-
-        if not _GPU or _GPU_fallback:
-            # Parallel CPU: split across trace blocks.
-            # uniform_filter1d operates along axis=0 (time) for each trace
-            # independently → perfect for _parallel_apply.
-            from scipy.ndimage import uniform_filter1d as _uf
-
-            def _agc_block(blk: np.ndarray, _w=win_s) -> np.ndarray:
-                env = np.abs(blk)
-                rms = _uf(env, size=_w, axis=0)
-                return (blk / np.maximum(rms, 1e-9)).astype(np.float32)
-
-            data = _parallel_apply(_agc_block, data)
+        # Single source of truth — the standalone apply_agc (same GPU/parallel
+        # dispatch as before; the GUI node pipeline calls the same function).
+        data = apply_agc(data, params["agc_win"], obj.dt_us)
 
     if params.get("align"):
-        dt_ms      = obj.dt_us / 1000.0
-        offsets    = np.round((obj.delays - obj.min_delay) / dt_ms).astype(int)
-        extra      = int(offsets.max())
-        new_ns     = obj.ns + extra
         fill_value = float(params.get("fill_value", np.nan))
-
-        aligned = np.full((new_ns, obj.n_traces), fill_value, dtype=np.float32)
-        row_idx = np.arange(obj.ns)[:, None] + offsets[None, :]
-        col_idx = np.arange(obj.n_traces)[None, :]
-        aligned[row_idx, col_idx] = data
-        data = aligned
+        data = apply_delay_alignment(data, obj.delays, obj.min_delay,
+                                     obj.dt_us, fill_value=fill_value)
 
     return data
 

@@ -28,22 +28,28 @@ def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Writing demo data to {OUT_DIR}/")
 
+    # Smooth curved trackline. A fine coordinate scalar (1e-4° grid — the finest
+    # that still fits the 2-byte SourceGroupScalar field, |s| ≤ 32767) keeps every
+    # trace on a DISTINCT position. Coarse scalars quantise small steps onto the
+    # same stored integer, collapsing traces into overlapping plateaus that make
+    # the map's click-to-jump ambiguous.
     make_synthetic_segy(
         str(OUT_DIR / "demo_single.sgy"),
         n_traces=80, ns=512, dt_us=250,
-        scalar_coord=-100, coord_unit=3,
+        scalar_coord=-10000, coord_unit=3,
         base_lon=-8.5, base_lat=43.2,
-        lon_step=0.001, water_depth=150.0,
+        arc_deg=60.0, arc_radius_deg=0.08, water_depth=150.0,
         delay_ms=5,
     )
     print("  ✔ demo_single.sgy")
 
+    # Diagonal (both lon AND lat advance) so the track isn't a degenerate line.
     make_synthetic_segy(
         str(OUT_DIR / "demo_arcsec.sgy"),
         n_traces=60, ns=256, dt_us=500,
         scalar_coord=-100, coord_unit=2,
         base_lon=-8.3, base_lat=43.1,
-        lon_step=0.001,
+        lon_step=0.001, lat_step=0.0006,
     )
     print("  ✔ demo_arcsec.sgy")
 

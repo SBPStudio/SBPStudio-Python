@@ -37,6 +37,8 @@ from topassuite.core.constants import (
 class LabeledSlider(QWidget):
     """Horizontal slider with arbitrary float resolution and a value label."""
 
+    valueChanged = pyqtSignal(float)
+
     def __init__(self, lo: float, hi: float, res: float = 1.0,
                  init: Optional[float] = None, fmt: str = "{:.0f}",
                  parent: Optional[QWidget] = None) -> None:
@@ -68,6 +70,7 @@ class LabeledSlider(QWidget):
 
     def _update_label(self, *_) -> None:
         self._lbl.setText(self._fmt.format(self.value()))
+        self.valueChanged.emit(self.value())
 
     def value(self) -> float:
         return self._lo + self._slider.value() * self._res
@@ -81,6 +84,8 @@ class ProcessingControls(QWidget):
     export_fix_requested = pyqtSignal()
     scale_changed = pyqtSignal()  # aspect ratio changed (live)
     boundaries_toggled = pyqtSignal(bool)  # show/hide file-seam lines (live)
+    align_toggled = pyqtSignal(bool)  # delay-alignment geometry toggled (rebuild base)
+    display_changed = pyqtSignal()  # cmap / clip / FIX changed → recolour preview
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -137,9 +142,6 @@ class ProcessingControls(QWidget):
         self.cap_agc_win = self._caption()
         self.agc_win = LabeledSlider(5, 100, 5, 20, "{:.0f}")
         v.addWidget(self.agc_win)
-        self.align_delays = QCheckBox()
-        self.align_delays.setChecked(True)
-        v.addWidget(self.align_delays)
 
         # ── Preset filters ──
         self.sec_preset = self._section()
@@ -167,11 +169,15 @@ class ProcessingControls(QWidget):
         fix_row.addStretch(1)
         v.addLayout(fix_row)
 
-        # ── File boundaries (chain seams) ──
-        # Interactive-only toggle: shows/hides the red dashed file-seam lines
-        # live in the PyQtGraph view. ON by default. Completely independent of
-        # the export dialog's own boundary checkbox.
-        self.sec_boundaries = self._section()
+        # ── Geometry & Presentation (STATIC controls — NOT pipeline nodes) ──
+        # Delay alignment is a static geometry correction (applied to the base
+        # array before the dynamic DSP nodes), not a movable filter. File-seam
+        # boundaries are a presentation overlay toggled live in the view.
+        self.sec_geometry = self._section()
+        self.align_delays = QCheckBox()
+        self.align_delays.setChecked(True)
+        self.align_delays.toggled.connect(self.align_toggled.emit)
+        v.addWidget(self.align_delays)
         self.show_boundaries = QCheckBox()
         self.show_boundaries.setChecked(True)
         self.show_boundaries.toggled.connect(self.boundaries_toggled.emit)
@@ -205,6 +211,14 @@ class ProcessingControls(QWidget):
         v.addWidget(self.btn_export_fix)
 
         v.addStretch(1)
+
+        # Presentation changes drive a live recolour of the preview (debounced
+        # downstream by the controller's own work being cheap).
+        self.cmap_cb.currentTextChanged.connect(lambda *_: self.display_changed.emit())
+        self.inv_cmap.toggled.connect(lambda *_: self.display_changed.emit())
+        self.clip.valueChanged.connect(lambda *_: self.display_changed.emit())
+        self.fix.toggled.connect(lambda *_: self.display_changed.emit())
+        self.fix_interval.valueChanged.connect(lambda *_: self.display_changed.emit())
 
         language_manager.language_changed.connect(self.retranslate_ui)
         self.retranslate_ui()
@@ -242,6 +256,52 @@ class ProcessingControls(QWidget):
             inv_cmap=self.inv_cmap.isChecked(),
             fix=self.fix.isChecked(), fix_iv=int(self.fix_interval.value()),
         )
+
+    def display_params(self) -> dict:
+        """Presentation + static-geometry params for the live preview.
+
+        ``align`` is the STATIC delay-alignment toggle (a geometry correction,
+        not a pipeline node): the controller applies it to the base array before
+        the dynamic nodes. ``boundaries`` is the file-seam overlay toggle.
+        """
+        return dict(
+            cmap=self.cmap_cb.currentText(),
+            inv_cmap=self.inv_cmap.isChecked(),
+            clip=int(self.clip.value()),
+            fix=self.fix.isChecked(),
+            fix_iv=int(self.fix_interval.value()),
+            align=self.align_delays.isChecked(),
+            boundaries=self.show_boundaries.isChecked(),
+        )
+
+    def align_enabled(self) -> bool:
+        """Whether the static delay-alignment correction is on."""
+        return self.align_delays.isChecked()
+
+    def set_dsp_sections_visible(self, visible: bool) -> None:
+        """Hide the static DSP FILTER sections (superseded by the node pipeline).
+
+        The DSP chain (decon/bandpass/preset/TVG/AGC) now comes from the
+        PipelinePanel, so those controls are hidden. The palette, clip, FIX,
+        the static Geometry & Presentation controls (delay alignment + file
+        boundaries), scale and export remain. Hidden DSP checkboxes are also
+        unchecked so any residual ``params()`` read is a safe no-op. NOTE:
+        ``align_delays`` is NOT hidden — it is a static geometry control now.
+        """
+        dsp_widgets = [
+            self.sec_decon, self.decon, self.cap_decon_op, self.decon_op,
+            self.cap_decon_gap, self.decon_gap, self.cap_decon_wn, self.decon_wn,
+            self.sec_filter, self.filt, self.cap_flo, self.flo,
+            self.cap_fhi, self.fhi,
+            self.sec_preset, self.preset_cb, self.lbl_preset_desc,
+            self.tvg, self.cap_tvg_alpha, self.tvg_alpha,
+            self.agc, self.cap_agc_win, self.agc_win,
+        ]
+        for w in dsp_widgets:
+            w.setVisible(visible)
+        if not visible:
+            for cb in (self.decon, self.filt, self.tvg, self.agc):
+                cb.setChecked(False)
 
     # ── i18n ────────────────────────────────────────────────────────────────
 
@@ -282,9 +342,9 @@ class ProcessingControls(QWidget):
         self.filt.setText(self.tr("Enable filter"))
         self.tvg.setText(self.tr("Adaptive TVG (compensate α)"))
         self.agc.setText(self.tr("Apply AGC"))
-        self.align_delays.setText(self.tr("Compensate delays (align groups)"))
         self.fix.setText(self.tr("Show FIX marks"))
-        self.sec_boundaries.setText(self.tr("FILE BOUNDARIES"))
+        self.sec_geometry.setText(self.tr("GEOMETRY & PRESENTATION"))
+        self.align_delays.setText(self.tr("Compensate delays (align groups)"))
         self.show_boundaries.setText(self.tr("Show file boundaries (red lines)"))
         self.show_boundaries.setToolTip(self.tr("Show file boundaries (red lines)"))
         self.sec_scale.setText(self.tr("SCALE"))

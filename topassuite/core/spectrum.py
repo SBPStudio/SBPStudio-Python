@@ -18,10 +18,23 @@ Array contract
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 import numpy as np
+
+# TOPAS bands of interest for the per-band energy distribution (Hz). The last
+# band's upper edge is replaced with Nyquist at runtime; bands above Nyquist are
+# dropped. Mirrors TopasSUITE._draw_spectrum_figure.
+TOPAS_BANDS: Tuple[Tuple[str, float, float], ...] = (
+    ("< 1 kHz",   0.0,     1000.0),
+    ("1–2 kHz",   1000.0,  2000.0),
+    ("2–4 kHz",   2000.0,  4000.0),
+    ("4–7 kHz",   4000.0,  7000.0),
+    ("7–10 kHz",  7000.0,  10000.0),
+    ("10–15 kHz", 10000.0, 15000.0),
+    ("> 15 kHz",  15000.0, np.inf),
+)
 
 
 @dataclass
@@ -49,6 +62,8 @@ class SpectrumResult:
     bw_6db_hi:    float        # -6 dB bandwidth upper edge (Hz)
     roll_off_hz:  float        # frequency where 85% of cumulative energy reached (Hz)
     snr_db:       float        # estimated SNR: 0.5–15 kHz vs >15 kHz (dB)
+    band_labels:  List[str]    = field(default_factory=list)   # TOPAS energy bands
+    band_pcts:    List[float]  = field(default_factory=list)   # % of total energy per band
 
 
 def _ref_compute_spectrum(data: np.ndarray, fs: float) -> SpectrumResult:
@@ -125,6 +140,20 @@ def _ref_compute_spectrum(data: np.ndarray, fs: float) -> SpectrumResult:
     noise_pwr  = pwr_mean[noise_mask].mean() if noise_mask.any() else 1e-30
     snr_db     = float(10 * np.log10(sig_pwr / (noise_pwr + 1e-30)))
 
+    # Per-band energy distribution (% of total) over the TOPAS bands of interest.
+    nyq          = fs / 2.0
+    pwr_mean_lin = 10.0 ** (spec_mean_db / 10.0)
+    band_labels: list = []
+    band_powers: list = []
+    for label, flo, fhi in TOPAS_BANDS:
+        fhi_eff = min(fhi, nyq)
+        mask = (freqs >= flo) & (freqs < fhi_eff)
+        if mask.any() and flo < nyq:
+            band_labels.append(label)
+            band_powers.append(float(pwr_mean_lin[mask].sum()))
+    total_bp  = sum(band_powers) + 1e-30
+    band_pcts = [100.0 * p / total_bp for p in band_powers]
+
     return SpectrumResult(
         freqs=freqs, nfft=nfft, n_frames=n_frames, low_res=low_res,
         spec_mean_db=spec_mean_db,
@@ -138,6 +167,8 @@ def _ref_compute_spectrum(data: np.ndarray, fs: float) -> SpectrumResult:
         bw_6db_lo=bw6_lo, bw_6db_hi=bw6_hi,
         roll_off_hz=roll_off_hz,
         snr_db=snr_db,
+        band_labels=band_labels,
+        band_pcts=band_pcts,
     )
 
 
