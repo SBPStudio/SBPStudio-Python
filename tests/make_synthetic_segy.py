@@ -28,6 +28,8 @@ def make_synthetic_segy(
     base_lat: float = 43.0,
     lon_step: float = 0.001,
     lat_step: float = 0.0,
+    arc_deg: float = 0.0,
+    arc_radius_deg: float = 0.05,
     water_depth: float = 120.0,
     delay_ms: int = 0,
     delay_variable: bool = False,
@@ -49,7 +51,14 @@ def make_synthetic_segy(
     scalar_coord  : SourceGroupScalar value (negative → divide, positive → multiply)
     coord_unit    : CoordinateUnits (1=m/ft, 2=arc-sec, 3=decimal degrees)
     base_lon/lat  : starting position in degrees
-    lon/lat_step  : step between traces (degrees)
+    lon/lat_step  : step between traces (degrees) — straight-line trajectory
+    arc_deg       : if > 0, lay the track out as a smooth parametric quarter-arc
+                    sweeping ``arc_deg`` degrees instead of a straight line. lon
+                    and lat are then strictly monotonic (lon ∝ sin θ, lat ∝
+                    1−cos θ for θ ∈ [0, arc_deg]) with NO jitter, so the cruise
+                    track curves cleanly without ever doubling back. Overrides
+                    lon_step / lat_step when set.
+    arc_radius_deg: radius (degrees) of the arc when ``arc_deg`` > 0
     water_depth   : constant water depth in metres
     delay_ms      : base delay recording time in ms
     delay_variable: if True, delay increases by 1 ms per trace (test align)
@@ -79,9 +88,29 @@ def make_synthetic_segy(
 
         rng = np.random.default_rng(42)
 
+        # ── Per-trace trajectory (deterministic, strictly monotonic, NO jitter) ─
+        # Precomputed once as arrays so the path is a clean curve/line. There is
+        # deliberately no random component on the coordinates: a tangled track
+        # would make the map's nearest-vertex click-to-jump ambiguous.
+        idx = np.arange(n_traces, dtype=float)
+        if arc_deg > 0.0 and n_traces > 1:
+            # Smooth arc: lon ∝ sin θ, lat ∝ (1 − cos θ). Both strictly increase
+            # for θ ∈ (0, 90°] → a gently curved, never-overlapping trackline.
+            # Sweep θ over a band that STARTS away from 0: near θ=0 the latitude
+            # slope (∝ sin θ) is ~0, so the first lat steps would otherwise round
+            # onto the same coordinate grid value. Starting at 0.2·arc_deg keeps
+            # BOTH axes strictly increasing on the stored integer grid.
+            phase = np.radians(arc_deg) * np.linspace(0.2, 1.0, n_traces)
+            lon_arr = base_lon + arc_radius_deg * np.sin(phase)
+            lat_arr = base_lat + arc_radius_deg * (1.0 - np.cos(phase))
+        else:
+            # Straight diagonal (horizontal when lat_step == 0).
+            lon_arr = base_lon + idx * lon_step
+            lat_arr = base_lat + idx * lat_step
+
         for i in range(n_traces):
-            lon_deg = base_lon + i * lon_step
-            lat_deg = base_lat + i * lat_step
+            lon_deg = float(lon_arr[i])
+            lat_deg = float(lat_arr[i])
 
             if coord_unit == 2:
                 # Arc-seconds: stored as lon_deg * 3600 / fac

@@ -146,6 +146,24 @@ def build_qss(palette: Dict[str, str]) -> str:
     }}
     QCheckBox::indicator:checked {{ background: {c['bright']}; border: 1px solid {c['bright']}; }}
 
+    /* Indicator-less "segmented control": the whole option is a clickable pill
+       that lights up cyan when selected (no radio circle at all). */
+    QRadioButton::indicator {{ width: 0px; height: 0px; border: none; background: none; }}
+    QRadioButton {{
+        color: {c['text']};
+        padding: 5px 12px;
+        border: 1px solid {c['sub']};
+        border-radius: 4px;
+        background: {c['entry']};
+    }}
+    QRadioButton:hover {{ border-color: #00e5ff; }}
+    QRadioButton:checked {{
+        background-color: #00e5ff;
+        color: #000000;
+        font-weight: bold;
+        border: 1px solid #00e5ff;
+    }}
+
     QTabWidget::pane {{ border: 1px solid {c['accent']}; background: {c['bg']}; }}
     QTabBar::tab {{
         background: {c['accent']};

@@ -165,8 +165,10 @@ class SegyProfile:
         self.error: Optional[str]  = None
         # These are set by io_segy.load_profile after construction.
         self.data:        Optional[np.ndarray] = None
-        self.lons:        Optional[np.ndarray] = None
-        self.lats:        Optional[np.ndarray] = None
+        self.lons:        Optional[np.ndarray] = None   # raw recorded (exports)
+        self.lats:        Optional[np.ndarray] = None   # raw recorded (exports)
+        self.track_lons:  Optional[np.ndarray] = None   # cleaned display track
+        self.track_lats:  Optional[np.ndarray] = None   # cleaned display track
         self.dist_km:     Optional[np.ndarray] = None
         self.total_km:    float = 0.0
         self.amp_max:     Optional[np.ndarray] = None
@@ -174,6 +176,8 @@ class SegyProfile:
         self.delays:      Optional[np.ndarray] = None
         self.water_depth: Optional[np.ndarray] = None
         self.timestamps:  List[str] = []
+        self.text_header:   str  = ""          # 3200-byte textual header (decoded)
+        self.trace_headers: dict = {}          # {label: (n_traces,) raw header array}
         self.n_traces:    int   = 0
         self.ns:          int   = 0
         self.dt_us:       int   = 0
@@ -245,23 +249,40 @@ class ProfileChain:
     # ── Concatenation ──────────────────────────────────────────────────────
 
     def _concat(self) -> None:
-        # Seismic data: (ns, total_traces) float32
-        self.data = np.concatenate([p.data for p in self.profiles], axis=1)
+        # Seismic data: (ns, total_traces) float32.
+        # Force C-contiguity so downstream ViewBox slicing (the GUI preview
+        # extracts column/row ranges of this stitched array) is a fast memory
+        # view rather than a fragmented strided read. np.concatenate is already
+        # contiguous, so this is a no-op guard — but it makes the layout
+        # contract explicit and survives any future change to the build above.
+        self.data = np.ascontiguousarray(
+            np.concatenate([p.data for p in self.profiles], axis=1))
 
         # Delay recording time — preserved verbatim (NEVER altered)
         self.delays    = np.concatenate([p.delays    for p in self.profiles])
         self.min_delay = float(np.min(self.delays))
         self.max_delay = float(np.max(self.delays))
 
-        # Coordinates (degrees)
+        # Coordinates (degrees) — raw recorded (exports) + cleaned display track.
         self.lons        = np.concatenate([p.lons        for p in self.profiles])
         self.lats        = np.concatenate([p.lats        for p in self.profiles])
+        self.track_lons  = np.concatenate([p.track_lons  for p in self.profiles])
+        self.track_lats  = np.concatenate([p.track_lats  for p in self.profiles])
         self.water_depth = np.concatenate([p.water_depth for p in self.profiles])
 
         # Timestamps
         self.timestamps: List[str] = []
         for p in self.profiles:
             self.timestamps.extend(p.timestamps)
+
+        # Header Inspector: keep the first profile's textual header; concatenate
+        # the per-trace raw header fields across the whole chain.
+        self.text_header = self.profiles[0].text_header if self.profiles else ""
+        labels = list(self.profiles[0].trace_headers.keys()) if self.profiles else []
+        self.trace_headers = {
+            lab: np.concatenate([p.trace_headers[lab] for p in self.profiles])
+            for lab in labels
+        }
 
         # Continuous cumulative distance including inter-profile gaps
         segments = []
@@ -271,9 +292,11 @@ class ProfileChain:
             offset += p.total_km
             if idx_p + 1 < len(self.profiles):
                 nxt = self.profiles[idx_p + 1]
+                # Cleaned-track endpoints: consistent with the smoothed per-profile
+                # dist_km being concatenated here.
                 offset += ProfileChain._haversine_km(
-                    float(p.lons[-1]),   float(p.lats[-1]),
-                    float(nxt.lons[0]),  float(nxt.lats[0]))
+                    float(p.track_lons[-1]),   float(p.track_lats[-1]),
+                    float(nxt.track_lons[0]),  float(nxt.track_lats[0]))
         self.dist_km  = np.concatenate(segments)
         self.total_km = float(self.dist_km[-1])
 

@@ -12,14 +12,19 @@ from .tasks import (
     ProgressCallback, CancelToken,
 )
 from .model import SegyMetadata, SegyProfile, ProfileChain
-from .io_segy import (load_metadata, load_profile,
+from .io_segy import (load_metadata, load_profile, smooth_track,
                       reproject_one, reproject_chain, join_profiles)
 from .processing import (
-    apply_predictive_decon, apply_filter_preset,
+    apply_predictive_decon, apply_filter_preset, apply_agc,
+    apply_bandpass, apply_tvg, apply_delay_alignment,
+    apply_water_mute, apply_swell_filter, compute_amplitude_spectrum,
     process_profile_data, process_chain_data, time_window,
 )
 from .spectrum import compute_spectrum, SpectrumResult
 from .coordinates import resolve_crs, validate_crs
+from .spatial import reproject_points, to_geographic, CRS_CATALOG, CRS_PRESETS
+from .gis_io import (read_gis_layer, read_vector, read_geotiff,
+                     VectorLayer, RasterLayer)
 from .chaining import detect_chains
 from .coloring import colormapped_rgba
 from .geometry_export import (
@@ -39,15 +44,19 @@ __all__ = [
     # Model
     "SegyMetadata", "SegyProfile", "ProfileChain",
     # I/O
-    "load_metadata", "load_profile", "reproject_one", "reproject_chain",
+    "load_metadata", "load_profile", "smooth_track", "reproject_one", "reproject_chain",
     "join_profiles",
     # Processing
-    "apply_predictive_decon", "apply_filter_preset",
+    "apply_predictive_decon", "apply_filter_preset", "apply_agc",
+    "apply_bandpass", "apply_tvg", "apply_delay_alignment",
+    "apply_water_mute", "apply_swell_filter", "compute_amplitude_spectrum",
     "process_profile_data", "process_chain_data", "time_window",
     # Spectrum
     "compute_spectrum", "SpectrumResult",
     # Coordinates
-    "resolve_crs", "validate_crs",
+    "resolve_crs", "validate_crs", "reproject_points", "to_geographic",
+    "CRS_CATALOG", "CRS_PRESETS",
+    "read_gis_layer", "read_vector", "read_geotiff", "VectorLayer", "RasterLayer",
     # Chaining
     "detect_chains",
     # Coloring

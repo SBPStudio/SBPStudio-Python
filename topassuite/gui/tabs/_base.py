@@ -18,7 +18,11 @@ from PyQt6.QtWidgets import (
     QTabWidget, QVBoxLayout, QWidget,
 )
 
-from ..components import ExportDialog, PlaceholderView, ProcessingControls
+from ..components import (
+    ExportDialog, HeaderView, MapView, PipelinePanel, PlaceholderView,
+    ProcessingControls, SeismicView, SpectrumView,
+)
+from ..dsp import DSPContext, PreviewController
 from ..i18n import language_manager
 from ..state import AppState
 from ._render import compute_figsize
@@ -57,7 +61,6 @@ class SubTabbedTab(QWidget):
         super().__init__(parent)
         self.state = state
         self.tasks = tasks  # task service (MainWindow.run_task / notify / show_error)
-        self._seismic: Optional[QWidget] = None  # SeismicView, created on first render
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -67,14 +70,55 @@ class SubTabbedTab(QWidget):
         split.addWidget(self._build_subtabs())
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
-        split.setSizes([252, 1000])
+        split.setSizes([280, 1000])
         root.addWidget(split)
 
-        self.controls.render_requested.connect(self._on_render_requested)
+        # Eager SeismicView on the Profile page, driven by the live preview
+        # controller (pan/zoom + node edits → ViewBox-limited pipeline preview).
+        self._seismic = SeismicView()
+        self._seismic.enable_preview(True)
+        self.pages[PROFILE].set_view(self._seismic)
+        # Eager advanced Spectrum QC panel on the Spectrum page — run ON DEMAND
+        # (its Generate button), decoupled from the live 300 ms preview loop.
+        self._spectrum = SpectrumView()
+        self.pages[SPECTRUM].set_view(self._spectrum)
+        # Eager navigation Map on the Map page — bi-directional sync with the
+        # seismic ViewBox (segment follows the profile; click jumps the profile).
+        self._map = MapView()
+        self.pages[MAP].set_view(self._map)
+        # Eager Header Inspector on the Headers page — textual header + NumPy-
+        # backed trace-header table (handles 50k+ traces without a QTableWidget).
+        self._headers = HeaderView()
+        self.pages[HEADERS].set_view(self._headers)
+        self.preview = PreviewController(
+            self._seismic, self.pipeline_panel,
+            get_source=self._preview_source,
+            get_display=self.controls.display_params,
+            parent=self)
+        self._spectrum.generate_requested.connect(self._on_generate_spectrum)
+        # Profile → Map: bright segment tracks the visible window, addressed by
+        # absolute trace index (lock-step with the image array; GPS-plateau-proof).
+        self._seismic.visible_traces_changed.connect(self._map.set_visible_range)
+        # Map → Profile: click-to-jump scrolls the seismic view to that trace.
+        self._map.trace_clicked.connect(self._on_map_trace_clicked)
+        # Add Layer (GIS overlay): read the file in the CORE off-thread, then hand
+        # the parsed WGS84 layer back to the map for rendering.
+        self._map.layer_file_requested.connect(self._on_map_layer_requested)
+        # Trace selection sync → Header Inspector. A click on the Map or the
+        # Seismic section scrolls+highlights that trace's header row; clicking a
+        # header row recentres the profile (which drags the map segment along).
+        self._map.trace_clicked.connect(self._headers.select_trace)
+        self._seismic.trace_clicked.connect(self._headers.select_trace)
+        self._headers.trace_selected.connect(self._on_header_trace_selected)
+
+        # Render button → re-fit the whole section (the live loop is automatic).
+        self.controls.render_requested.connect(self.preview.fit)
         self.controls.export_image_requested.connect(self._on_export_image_requested)
         self.controls.export_fix_requested.connect(self._on_export_fix_requested)
         self.controls.scale_changed.connect(self._on_scale_changed)
         self.controls.boundaries_toggled.connect(self._on_boundaries_toggled)
+        self.controls.align_toggled.connect(lambda *_: self.preview.alignment_changed())
+        self.controls.display_changed.connect(self.preview.display_changed)
         language_manager.language_changed.connect(self.retranslate_ui)
         self.retranslate_ui()
 
@@ -84,12 +128,16 @@ class SubTabbedTab(QWidget):
         """Translated message shown when nothing is selected."""
         return ""
 
-    def _on_render_requested(self) -> None:
-        """Subclasses dispatch a CoreWorker render here."""
-
     def _active_object(self):
         """The SegyProfile / ProfileChain currently driving this tab (or None)."""
         return None
+
+    def _preview_source(self):
+        """Source for the live preview: the active object only if traces loaded."""
+        obj = self._active_object()
+        if obj is None or getattr(obj, "error", None) or getattr(obj, "data", None) is None:
+            return None
+        return obj
 
     def _is_chain(self) -> bool:
         """True if the active object is a ProfileChain (Chains tab)."""
@@ -99,6 +147,33 @@ class SubTabbedTab(QWidget):
         """Apply the new display aspect to the on-screen section live."""
         if self._seismic is not None and self._seismic.has_image():
             self._seismic.set_aspect(self.controls.aspect())
+
+    def _on_map_trace_clicked(self, idx: int) -> None:
+        """Map → Profile: scroll the seismic view to the clicked trace."""
+        self._center_on_trace(idx)
+
+    def _on_header_trace_selected(self, idx: int) -> None:
+        """Header row clicked → recentre the profile on that trace (the map
+        segment follows via the seismic range change)."""
+        self._center_on_trace(idx)
+
+    def _center_on_trace(self, idx: int) -> None:
+        obj = self._active_object()
+        dist = getattr(obj, "dist_km", None) if obj is not None else None
+        if dist is not None and 0 <= idx < len(dist):
+            self._seismic.center_on_distance(float(dist[idx]))
+
+    def _on_map_layer_requested(self, path: str) -> None:
+        """Read a GIS overlay file in the core (off the GUI thread) and add the
+        parsed WGS84 layer to the map."""
+        def job(progress, cancel):
+            from topassuite.core import read_gis_layer
+            progress(float("nan"), "")
+            return read_gis_layer(path)
+
+        self.tasks.run_task(
+            job, self._map.add_layer,
+            QCoreApplication.translate("SubTabbedTab", "Loading map layer…"))
 
     def _on_boundaries_toggled(self, visible: bool) -> None:
         """Show/hide the red file-seam lines in the live view (interactive only).
@@ -112,6 +187,44 @@ class SubTabbedTab(QWidget):
     def _export_basename(self) -> str:
         """Filename stem for exports."""
         return "export"
+
+    # ── Advanced spectrum analysis (on demand, worker-backed) ────────────────
+
+    def _on_generate_spectrum(self, scope: str) -> None:
+        """Run the heavy Welch analysis for the chosen scope in a worker thread,
+        then render it into the advanced Spectrum panel. Never runs on the live
+        preview loop."""
+        import numpy as np
+        inp = self.preview.analysis_inputs(scope)
+        if inp is None:
+            self.tasks.notify(QCoreApplication.translate(
+                "SubTabbedTab", "Select an item first."))
+            return
+        arr0 = inp["arr"]
+        node_cfgs = inp["node_cfgs"]
+        dt_us = inp["dt_us"]
+        dist_km = inp["dist_km"]
+        boundaries = inp["boundaries"]
+
+        def job(progress, cancel):
+            from topassuite.core import compute_spectrum
+            from topassuite.gui.dsp import DSPContext, make_node
+            progress(float("nan"), "")
+            # Apply the dynamic per-window nodes at FULL resolution (the prepared
+            # base already has static alignment + pre-crop mute baked in).
+            arr = arr0
+            ctx = DSPContext(dt_us=dt_us, ns=arr.shape[0], n_traces=arr.shape[1])
+            for key, npar in node_cfgs:
+                cancel.check()
+                arr = make_node(key, npar).apply(arr, ctx)
+            cancel.check()
+            sp = compute_spectrum(np.nan_to_num(arr, nan=0.0), 1e6 / dt_us)
+            return sp, 1e6 / dt_us, dist_km, boundaries
+
+        self.tasks.run_task(
+            job,
+            lambda r: self._spectrum.show_result(r[0], r[1], r[2], r[3]),
+            QCoreApplication.translate("SubTabbedTab", "Computing spectrum…"))
 
     # ── Export (shared by Visualizer and Chains) ─────────────────────────────
     # NOTE: these literals live in SubTabbedTab but run on subclass instances, so
@@ -143,7 +256,7 @@ class SubTabbedTab(QWidget):
         is_chain = self._is_chain()
         dpi = int(cfg["dpi"])
         aspect = self.controls.aspect()  # scale == the visualizer's aspect ratio
-        params = dict(self.controls.params())
+        params = dict(self.controls.display_params())  # presentation only (cmap/clip/fix)
         params["clip_lo"] = 0.0
         params["fill_value"] = 0.0 if cfg["fill_zero"] else float("nan")
         # File-boundary lines in the export come from the EXPORT DIALOG's own
@@ -151,8 +264,21 @@ class SubTabbedTab(QWidget):
         # renderer reads params["draw_file_boundaries"] to gate ax.axvline.
         params["draw_file_boundaries"] = bool(cfg["draw_file_boundaries"])
 
+        # Snapshot the DSP node configuration (key + params copy) so the worker
+        # rebuilds the pipeline thread-safely. EXPORT uses the SAME node config
+        # as the preview, but runs it over the 100 % FULL array (no ViewBox /
+        # decimation) — completely decoupled from the on-screen preview.
+        node_cfg = [(n.KEY, dict(n.params)) for n in self.pipeline_panel.nodes()]
+        # Static delay-alignment (geometry) is applied to the base BEFORE the
+        # dynamic nodes — exactly as the preview does — read from the static
+        # checkbox. ``params["align"]`` drives the renderer's time axis
+        # (t0 = min_delay when aligned).
+        align_enabled = self.controls.align_enabled()
+        params["align"] = align_enabled
+
         def job(progress, cancel) -> str:
-            from topassuite.core import process_chain_data, process_profile_data
+            from topassuite.core import load_profile as _lp, apply_delay_alignment
+            from topassuite.gui.dsp import DSPContext, make_node
             from topassuite.viz.render import (
                 build_theme, render_chain_figure, render_profile_figure, save_figure,
             )
@@ -162,14 +288,23 @@ class SubTabbedTab(QWidget):
             # the traces here on the worker thread so the export never fails.
             _obj = obj
             if not is_chain and getattr(_obj, "data", None) is None:
-                from topassuite.core import load_profile as _lp
                 progress(float("nan"), "Loading traces for export…")
                 _obj = _lp(_obj.path, load_traces=True)
                 if getattr(_obj, "error", None):
                     raise RuntimeError(f"Cannot load {_obj.name}: {_obj.error}")
             progress(float("nan"), "")
-            data = (process_chain_data(_obj, params) if is_chain
-                    else process_profile_data(_obj, params))
+
+            # 1) STATIC geometry: delay alignment on the FULL array first.
+            data = _obj.data.copy()
+            if align_enabled and getattr(_obj, "delays", None) is not None:
+                data = apply_delay_alignment(
+                    data, _obj.delays, _obj.min_delay, _obj.dt_us,
+                    fill_value=params["fill_value"])
+            # 2) Dynamic DSP node pipeline over the FULL-resolution array.
+            ctx = DSPContext.from_source(_obj)
+            for key, npar in node_cfg:
+                cancel.check()
+                data = make_node(key, npar).apply(data, ctx)
             cancel.check()
             figsize = compute_figsize(_obj, dpi, None, aspect, cfg["velocity"])
             render_opts = dict(
@@ -258,12 +393,28 @@ class SubTabbedTab(QWidget):
     # ── Construction ────────────────────────────────────────────────────────
 
     def _build_controls(self) -> QWidget:
+        # Left column = the DSP node pipeline (the new processing source) on top,
+        # and the retained presentation/output controls below (palette, clip,
+        # FIX, scale, export). The static DSP filter sections are hidden — the
+        # pipeline replaces them.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(252)
+        scroll.setFixedWidth(280)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        host = QWidget()
+        col = QVBoxLayout(host)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+
+        self.pipeline_panel = PipelinePanel()
+        col.addWidget(self.pipeline_panel)
+
         self.controls = ProcessingControls()
-        scroll.setWidget(self.controls)
+        self.controls.set_dsp_sections_visible(False)
+        col.addWidget(self.controls)
+
+        scroll.setWidget(host)
         return scroll
 
     def _build_subtabs(self) -> QWidget:

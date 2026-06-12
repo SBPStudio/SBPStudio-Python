@@ -66,6 +66,13 @@ class MainWindow(QMainWindow):
         self._build_menubar()
         self._build_ui()
 
+        # Floating CLI console (hidden until toggled). Child overlay of the main
+        # window so it floats over the top-right corner of the content area.
+        from .components.cli_console import CliConsole
+        self._cli = CliConsole(self)
+        self._cli.hide()
+        self._cli_guide = None             # lazily built Command Guide dialog
+
         # Observe state → refresh the sidebar lists.
         self.state.profiles_changed.connect(self._refresh_profile_list)
         self.state.chains_changed.connect(self._refresh_chain_list)
@@ -106,6 +113,16 @@ class MainWindow(QMainWindow):
             self._menu_theme.addAction(act)
             self._theme_actions[name] = act
 
+        # ── CLI menu (EXACTLY between Theme and Help) ────────────────────────
+        # A dropdown with: Activate Console (toggle overlay) + Command Guide.
+        self._menu_cli = mb.addMenu("")
+        self._act_cli = QAction("", self, checkable=True)   # "Activate Console"
+        self._act_cli.triggered.connect(self._toggle_cli)
+        self._menu_cli.addAction(self._act_cli)
+        self._act_cli_guide = QAction("", self)             # "Command Guide"
+        self._act_cli_guide.triggered.connect(self._show_cli_guide)
+        self._menu_cli.addAction(self._act_cli_guide)
+
         # ── Help ─────────────────────────────────────────────────────────────
         self._menu_help = mb.addMenu("")
         self._act_help_module = QAction("", self)
@@ -118,6 +135,38 @@ class MainWindow(QMainWindow):
         self._menu_help.addAction(self._act_help_docs)
         self._menu_help.addSeparator()
         self._menu_help.addAction(self._act_help_about)
+
+    # ── CLI console (floating top-right overlay) ─────────────────────────────
+
+    def _toggle_cli(self, checked: bool) -> None:
+        if checked:
+            self._position_cli()
+            self._cli.show()
+            self._cli.raise_()
+            self._cli.focus_input()
+        else:
+            self._cli.hide()
+
+    def _position_cli(self) -> None:
+        """Pin the console to the top-right corner of the content area."""
+        w, h = 420, 300
+        margin = 10
+        top = self.menuBar().height() + margin
+        x = max(margin, self.width() - w - margin)
+        self._cli.setGeometry(x, top, w, h)
+
+    def _show_cli_guide(self) -> None:
+        from .components.cli_console import CliGuideDialog
+        if self._cli_guide is None:
+            self._cli_guide = CliGuideDialog(self)
+        self._cli_guide.show()
+        self._cli_guide.raise_()
+        self._cli_guide.activateWindow()
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        if getattr(self, "_cli", None) is not None and self._cli.isVisible():
+            self._position_cli()
 
     # ════════════════════════════════════════════════════════════════════════
     # Layout
@@ -247,7 +296,7 @@ class MainWindow(QMainWindow):
     def _build_tabs(self) -> QWidget:
         self.tabs = QTabWidget()
         self.tab_visualizer = VisualizerTab(self.state, self)
-        self.tab_reprojector = ReprojectorTab(self.state)
+        self.tab_reprojector = ReprojectorTab(self.state, self)
         self.tab_chains = ChainsTab(self.state, self)
         self.tabs.addTab(self.tab_visualizer, "")
         self.tabs.addTab(self.tab_reprojector, "")
@@ -502,6 +551,9 @@ class MainWindow(QMainWindow):
         # Menus
         self._menu_lang.setTitle(self.tr("Language"))
         self._menu_theme.setTitle(self.tr("Theme"))
+        self._menu_cli.setTitle(self.tr("CLI"))
+        self._act_cli.setText(self.tr("Activate Console"))
+        self._act_cli_guide.setText(self.tr("Command Guide"))
         self._menu_help.setTitle(self.tr("Help"))
         self._theme_actions["dark"].setText(self.tr("Dark"))
         self._theme_actions["light"].setText(self.tr("Light"))
