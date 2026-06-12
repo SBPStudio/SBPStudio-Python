@@ -1,31 +1,29 @@
 """
 visualizer_tab.py — Tab A · Visualizer.
 
-Single-profile inspection. The Profile sub-tab renders a real PyQtGraph
-seismic section: the DSP controls build a params dict, a CoreWorker runs
-``core.process_profile_data`` + display-buffer computation off-thread, and
-the result is shown in a :class:`SeismicView`. Map / Spectrum / Headers remain
-placeholders.
+Single-profile inspection. The Profile sub-tab hosts a live PyQtGraph seismic
+section driven by the :class:`PreviewController`: the DSP node pipeline is
+applied to the visible ViewBox window (column-decimated, rows full-res so AGC
+stays exact) every time the user pans/zooms or edits a node. Map / Spectrum /
+Headers remain placeholders.
 
 Lazy-load states
 ----------------
-* Profile stub added (data=None) → placeholder shows "Loading data…"
-  (``_load_profile_traces`` in MainWindow runs a background load).
-* Full profile loaded → placeholder shows "Press Render".
-* After Render → section shown in the Profile sub-tab.
+* No profile selected            → placeholder "Select a profile…".
+* Profile stub (data=None)        → placeholder "Loading data…".
+* Profile loaded                  → live section; add nodes to process.
 """
 from __future__ import annotations
 
 from PyQt6.QtWidgets import QWidget
 
-from ._base import PROFILE, SubTabbedTab
-from ._render import compute_section
-from ..components import SeismicView
+from ...core import to_geographic
+from ._base import HEADERS, MAP, PROFILE, SPECTRUM, SubTabbedTab
 from ..state import AppState
 
 
 class VisualizerTab(SubTabbedTab):
-    """Tab A — visualises a single selected profile."""
+    """Tab A — visualises a single selected profile with a live DSP preview."""
 
     def __init__(self, state: AppState, tasks, parent: QWidget | None = None) -> None:
         super().__init__(state, tasks, parent=parent)
@@ -41,53 +39,38 @@ class VisualizerTab(SubTabbedTab):
         sd = self.state.active_profile
         return sd.stem if sd is not None else "perfil"
 
-    # ── State ────────────────────────────────────────────────────────────────
+    # ── State → preview ──────────────────────────────────────────────────────
 
     def _on_active_profile_changed(self, profile: object) -> None:
         if profile is None:
-            msg = self.empty_message()
-        elif getattr(profile, "data", None) is None:
-            # Header-only stub; MainWindow._load_profile_traces is loading it.
-            msg = self.tr("Loading data…")
-        else:
-            msg = self.tr("Press Render to display the section.")
-        for page in self.pages:
-            page.show_placeholder(msg)
-
-    # ── Render ───────────────────────────────────────────────────────────────
-
-    def _on_render_requested(self) -> None:
-        sd = self.state.active_profile
-        if sd is None or getattr(sd, "error", None):
+            self.preview.set_source(None)
+            self._map.clear()
+            self._headers.clear()
+            for page in self.pages:
+                page.show_placeholder(self.empty_message())
             return
-        params = self.controls.params()
-        title = f"{sd.name}  ·  {sd.n_traces} trazas  ·  {sd.dt_us} µs"
-
-        def job(progress, cancel) -> dict:
-            from topassuite.core import process_profile_data, load_profile
-            # Safety load: cover the race where Render is clicked before the
-            # background lazy-load finishes (unlikely but must be safe).
-            _sd = sd
-            if getattr(_sd, "data", None) is None:
-                _sd = load_profile(_sd.path, load_traces=True)
-                if getattr(_sd, "error", None):
-                    raise RuntimeError(f"Failed to load {_sd.name}: {_sd.error}")
-            progress(float("nan"), "")
-            data = process_profile_data(_sd, params)
-            cancel.check()
-            vp = compute_section(_sd, data, params)
-            vp["title"] = title
-            return vp
-
-        self.tasks.run_task(job, self._show_profile, self.tr("Rendering profile…"))
-
-    def _show_profile(self, vp: dict) -> None:
-        if self._seismic is None:
-            self._seismic = SeismicView()
-        self._seismic.show_image(
-            vp["arr"], vp["dist0"], vp["dist1"], vp["t0"], vp["t1"],
-            cmap_name=vp["cmap_name"], vmax=vp["vmax"], title=vp["title"],
-            boundaries=vp["boundaries"], fixes=vp["fixes"],
-            aspect=self.controls.aspect(),
-            boundaries_visible=self.controls.boundaries_visible())
+        if getattr(profile, "data", None) is None:
+            # Header-only stub; MainWindow._load_profile_traces is loading it.
+            # The HEADERS are already available, so populate the inspector now.
+            self.preview.set_source(None)
+            self._map.clear()
+            self.pages[HEADERS].set_view(self._headers)
+            self._headers.set_source(profile)
+            for i in (PROFILE, SPECTRUM, MAP):
+                self.pages[i].show_placeholder(self.tr("Loading data…"))
+            return
+        # Loaded → show the live section + spectrum + map + headers, kick off preview.
         self.pages[PROFILE].set_view(self._seismic)
+        self.pages[SPECTRUM].set_view(self._spectrum)
+        self.pages[MAP].set_view(self._map)
+        self.pages[HEADERS].set_view(self._headers)
+        self._headers.set_source(profile)
+        # Cleaned display track (median-filtered in core); raw lons/lats stay
+        # export-only. Reproject to WGS84 geographic via the core (passthrough if
+        # already geographic) so projected/UTM files render on the lon/lat
+        # basemap. Set BEFORE the preview fit (the fit's render feeds the
+        # distance axis → visible_traces_changed → the map highlights it).
+        mx, my = to_geographic(profile.track_lons, profile.track_lats,
+                               getattr(profile, "detected_crs", None))
+        self._map.set_track(mx, my)
+        self.preview.set_source(profile)

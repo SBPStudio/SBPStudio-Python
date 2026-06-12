@@ -76,8 +76,64 @@ from .tasks import (
 
 _INT32_MAX = 2_147_483_647
 
+# Trace-order median-filter kernel for cleaning per-trace navigation. Large
+# enough to reject multi-sample GPS spikes (frozen/jumping fixes common in
+# high-latitude / Antarctic campaigns) yet small relative to a survey line.
+TRACK_SMOOTH_KERNEL = 11
+
 
 # ── Internal helpers ────────────────────────────────────────────────────────────
+
+def smooth_track(lons: np.ndarray, lats: np.ndarray,
+                 kernel: int = TRACK_SMOOTH_KERNEL) -> tuple:
+    """Return median-filtered (lons, lats) in trace order — a cleaned DISPLAY
+    track that rejects GPS spikes/outliers so the navigation map draws a smooth
+    path and the along-track distance axis is well-behaved.
+
+    This is a *display/geometry* track only: the caller keeps the raw recorded
+    ``lons``/``lats`` for FIX and geometry exports (the smoothed values must
+    never replace the authoritative recorded navigation).
+
+    Uses ``scipy.ndimage.median_filter`` with ``mode="nearest"`` rather than
+    ``scipy.signal.medfilt``: medfilt ZERO-pads its borders, which for absolute
+    coordinates far from the origin (e.g. lat ≈ −70°) drags the first/last
+    kernel//2 fixes toward 0 and wrecks the endpoints. Edge replication keeps the
+    Start/End-Of-Line points exactly on the real track.
+
+    Note: a median filter removes outliers; it does NOT *guarantee* strict
+    monotonicity (a genuinely stationary vessel still yields repeated points).
+    The cumulative distance built from these coordinates remains monotonically
+    non-decreasing by construction (cumsum of non-negative steps)."""
+    lons = np.asarray(lons, dtype=float)
+    lats = np.asarray(lats, dtype=float)
+    n = lons.size
+    if n < 3:
+        return lons.copy(), lats.copy()
+    # Clamp the kernel to an odd value that fits the trace count.
+    k = min(int(kernel), n if n % 2 else n - 1)
+    if k % 2 == 0:
+        k -= 1
+    if k < 3:
+        return lons.copy(), lats.copy()
+    from scipy.ndimage import median_filter
+    return (median_filter(lons, size=k, mode="nearest"),
+            median_filter(lats, size=k, mode="nearest"))
+
+
+def _to_signed(values, bits: int):
+    """Reinterpret raw SEG-Y header values as two's-complement SIGNED integers of
+    the given width. The coordinate fields are signed by the standard — the
+    Coordinate Scalar (bytes 71-72) is 16-bit signed (struct ``>h``) and Source
+    X/Y (bytes 73-76 / 77-80) are 32-bit signed (struct ``>i``). Forcing the sign
+    here guards against a writer (or reader build) that emitted them UNSIGNED,
+    which would otherwise turn large negatives — e.g. Antarctic lon/lat or a
+    negative scalar — into bogus huge positives (the "collapse to 0,0" symptom).
+
+    Widen to int64 first so any unsigned magnitude is preserved, then narrow to
+    the signed width so out-of-range values wrap via two's complement."""
+    dt = np.int16 if bits == 16 else np.int32
+    return np.asarray(values, dtype=np.int64).astype(dt)
+
 
 def _scalar_fac(sc: int) -> float:
     if sc < 0:
@@ -85,6 +141,57 @@ def _scalar_fac(sc: int) -> float:
     if sc > 0:
         return float(sc)
     return 1.0
+
+
+def _decode_text_header(raw) -> str:
+    """Decode the 3200-byte textual header to clean ASCII, wrapped to the
+    standard 40 lines × 80 chars. Auto-detects EBCDIC (cp037) vs ASCII by
+    printable-character ratio (legacy TOPAS files are often EBCDIC)."""
+    if raw is None:
+        return ""
+    data = bytes(raw)
+    if not data:
+        return ""
+
+    def _printable(s: str) -> float:
+        if not s:
+            return 0.0
+        ok = sum(1 for ch in s if ch in "\r\n\t" or 32 <= ord(ch) < 127)
+        return ok / len(s)
+
+    ascii_txt = data.decode("ascii", errors="replace")
+    try:
+        ebcdic_txt = data.decode("cp037", errors="replace")
+    except Exception:
+        ebcdic_txt = ascii_txt
+    txt = ascii_txt if _printable(ascii_txt) >= _printable(ebcdic_txt) else ebcdic_txt
+    txt = txt.replace("\x00", " ")
+    # Standard layout: 40 cards of 80 columns. Wrap accordingly and right-trim.
+    lines = [txt[i:i + 80].rstrip() for i in range(0, min(len(txt), 3200), 80)]
+    return "\n".join(lines)
+
+
+def _extract_trace_headers(f: "segyio.SegyFile") -> dict:
+    """Return an ordered ``{field_name: np.ndarray}`` of RAW values for EVERY
+    standard SEG-Y trace header word (all 91), in 240-byte header order.
+
+    Dynamic — driven by segyio's full field registry (``segyio.tracefield.keys``,
+    ``{name: byte_offset}``) rather than a hardcoded subset, so the inspector
+    exposes the complete header. This is what lets us hunt down non-standard /
+    proprietary coordinate storage: acquisition systems like TOPAS sometimes
+    write the true lat/lon into CDP_X/CDP_Y or the UnassignedInt1/2 words (bytes
+    233/237) instead of the standard Source X/Y (73-80). Values are kept RAW (as
+    stored) so byte content is visible verbatim.
+
+    Header-attribute reads are vectorised and cheap even for 50k+ traces (no
+    trace DATA is touched)."""
+    out: dict = {}
+    for name, offset in sorted(segyio.tracefield.keys.items(), key=lambda kv: kv[1]):
+        try:
+            out[name] = np.asarray(f.attributes(offset)[:])
+        except Exception:
+            continue        # skip any field segyio can't read on this file
+    return out
 
 
 def _dist_km(lons: np.ndarray, lats: np.ndarray, coord_unit: int) -> np.ndarray:
@@ -155,8 +262,10 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
     prof.dt_us    = int(f.bin[segyio.BinField.Interval])
 
     h0 = f.header[0]
-    prof.scalar_coord = int(h0[segyio.TraceField.SourceGroupScalar] or 0)
-    prof.scalar_elev  = int(h0[segyio.TraceField.ElevationScalar]   or 0)
+    # Coordinate + elevation scalars: 16-bit SIGNED (>h). Force the sign so a
+    # negative scalar (the common case, meaning "divide by |scalar|") survives.
+    prof.scalar_coord = int(_to_signed(h0[segyio.TraceField.SourceGroupScalar] or 0, 16))
+    prof.scalar_elev  = int(_to_signed(h0[segyio.TraceField.ElevationScalar]   or 0, 16))
     prof.coord_unit   = int(h0[segyio.TraceField.CoordinateUnits]   or 0)
 
     _fields = [
@@ -178,10 +287,13 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
     prof.max_delay = float(np.max(delays_raw))
     prof.delay_ms  = int(delays_raw[0])  # known limitation: trace[0] only
 
+    # Source X/Y: 32-bit SIGNED (>i), forced signed so negative Antarctic eastings
+    # /northings don't wrap to huge positives. Standard SEG-Y scaling (via
+    # _scalar_fac): val * scalar if scalar > 0, val / |scalar| if scalar < 0.
     sc  = prof.scalar_coord
     fac = _scalar_fac(sc)
-    sxs  = _hdr[segyio.TraceField.SourceX].astype(float) * fac
-    sys_ = _hdr[segyio.TraceField.SourceY].astype(float) * fac
+    sxs  = _to_signed(_hdr[segyio.TraceField.SourceX], 32).astype(float) * fac
+    sys_ = _to_signed(_hdr[segyio.TraceField.SourceY], 32).astype(float) * fac
 
     if prof.coord_unit == 2:   # arc-seconds → degrees
         prof.lons = sxs  / 3600.0
@@ -189,6 +301,12 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
     else:
         prof.lons = sxs
         prof.lats = sys_
+
+    # Cleaned DISPLAY track: median-filtered in trace order to reject GPS
+    # spikes/outliers. The raw prof.lons/prof.lats above are PRESERVED for FIX
+    # and geometry exports (authoritative recorded navigation); the smoothed
+    # pair drives the navigation map and the along-track distance axis only.
+    prof.track_lons, prof.track_lats = smooth_track(prof.lons, prof.lats)
 
     es   = prof.scalar_elev
     efac = _scalar_fac(es)
@@ -216,8 +334,15 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
 
     prof.dur_ms  = prof.ns * prof.dt_us / 1000.0
     prof.t_ms    = prof.delay_ms + np.arange(prof.ns) * prof.dt_us / 1000.0
-    prof.dist_km = _dist_km(prof.lons, prof.lats, prof.coord_unit)
+    # Distance axis from the CLEANED track so it is smooth and well-behaved for
+    # the seismic X-axis and the map↔profile sync (raw coords stay export-only).
+    prof.dist_km = _dist_km(prof.track_lons, prof.track_lats, prof.coord_unit)
     prof.total_km = float(prof.dist_km[-1])
+
+    # Header Inspector data — textual header + RAW per-trace header fields.
+    # Cheap and available even header-only (no trace DATA needed).
+    prof.text_header   = _decode_text_header(f.text[0])
+    prof.trace_headers = _extract_trace_headers(f)
     prof.detected_crs, prof.crs_notes = _detect_crs(prof.coord_unit, prof.lons)
 
     # OQ-2: warn if projected CRS axis unit is not metres
@@ -370,6 +495,7 @@ def reproject_one(
     log: LogCallback = _noop_log,
     progress: ProgressCallback = _noop_progress,
     cancel: Optional[CancelToken] = None,
+    out_path: Optional[str] = None,
 ) -> str:
     """
     Reproject a single SEG-Y profile to a new CRS.
@@ -398,7 +524,9 @@ def reproject_one(
     tf, out_sc, new_uc, _dst_geo, div = _build_transformer(src_str, dst_str)
 
     p       = Path(sd.path)
-    outpath = str(p.with_name(p.stem + "_REPROY" + p.suffix))
+    # Caller-chosen destination (GUI file dialog) wins; else the legacy default
+    # of a _REPROY-suffixed sibling beside the source file.
+    outpath = out_path or str(p.with_name(p.stem + "_REPROY" + p.suffix))
     log(f"Salida     : {Path(outpath).name}")
 
     try:
@@ -450,6 +578,7 @@ def reproject_chain(
     log: LogCallback = _noop_log,
     progress: ProgressCallback = _noop_progress,
     cancel: Optional[CancelToken] = None,
+    out_path: Optional[str] = None,
 ) -> str:
     """
     Reproject and JOIN a ProfileChain into a single SEG-Y file.
@@ -471,7 +600,8 @@ def reproject_chain(
 
     p0      = Path(ch.profiles[0].path)
     stem    = f"{p0.stem}_a_{Path(ch.profiles[-1].path).stem}_UNIDO_REPROY"
-    outpath = str(p0.with_name(stem + p0.suffix))
+    # Caller-chosen destination wins; else the legacy default beside profile[0].
+    outpath = out_path or str(p0.with_name(stem + p0.suffix))
     log(f"Salida     : {Path(outpath).name}")
 
     try:

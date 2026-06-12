@@ -29,7 +29,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QRectF, QTimer
+from PyQt6.QtCore import Qt, QRectF, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
@@ -48,6 +48,29 @@ FixMark = Tuple[int, float, str]
 
 class SeismicView(QWidget):
     """PyQtGraph seismic section fed with a pre-computed float32 amplitude array."""
+
+    # Emitted (debounced) when the user pans/zooms while in preview mode. A
+    # PreviewController listens and re-runs the DSP pipeline on the new window.
+    view_range_changed = pyqtSignal()
+
+    # Emitted IMMEDIATELY on every pan/zoom (no debounce) with the absolute
+    # trace COLUMN indices [trace0, trace1) currently on screen. Resolved with
+    # np.searchsorted against the per-trace distance axis. That axis is built in
+    # the core parser from the CLEANED (median-filtered) navigation track, so it
+    # is smooth and monotonically non-decreasing — searchsorted is exact and
+    # O(log n). Explicit side='left'/'right' makes the half-open range correct
+    # even across distance plateaus (a stationary vessel): the upper bound still
+    # reaches the true end. The map slices its coordinate arrays with these.
+    visible_traces_changed = pyqtSignal(int, int)
+
+    # Emitted when the user CLICKS (not drags) a point on the section, carrying
+    # the absolute trace index under the cursor (resolved via searchsorted on the
+    # distance axis). Drives the Header Inspector's row selection.
+    trace_clicked = pyqtSignal(int)
+
+    # Viewport-settle debounce: DSP recompute fires this long after the LAST
+    # pan/zoom event, so dragging never triggers a pipeline run mid-gesture.
+    SETTLE_MS = 300
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -69,6 +92,12 @@ class SeismicView(QWidget):
         self._boundary_lines: List[pg.InfiniteLine] = []  # toggled live
         self._boundaries_visible: bool = True
 
+        # Full per-trace distance array (km) of the active profile/chain, set by
+        # the controller. The ViewBox X-range is resolved to absolute trace
+        # indices by masking THIS array directly (plateau-proof; see
+        # _emit_visible_traces). None until a source is shown.
+        self._dist_km: Optional[np.ndarray] = None
+
         # Display buffer state (set by show_image; used by _on_range_changed).
         self._arr: Optional[np.ndarray] = None   # (rows, cols) float32
         self._lut: Optional[np.ndarray] = None   # (256, 3) uint8
@@ -77,17 +106,33 @@ class SeismicView(QWidget):
         self._rect: tuple = (0.0, 1.0, 0.0, 1.0)   # (dist0, dist1, t0, t1)
         self._aspect: Optional[float] = None
         self._last_zoom_key: Optional[tuple] = None  # (c0, c1, stride) dedup
+        # Preview mode: a PreviewController owns image updates; the internal
+        # display-buffer re-slice is bypassed and range changes are forwarded
+        # as view_range_changed instead.
+        self._preview_mode: bool = False
 
-        # Debounce zoom updates: accumulate rapid range-change events and apply
-        # 60 ms after the last one to avoid re-slicing on every mouse-wheel tick.
+        # Non-preview internal re-slice: light 60 ms throttle (fires 60 ms after
+        # the FIRST event in a burst) — fine for the cheap display-buffer slice.
         self._zoom_timer = QTimer(self)
         self._zoom_timer.setSingleShot(True)
         self._zoom_timer.setInterval(60)
         self._zoom_timer.timeout.connect(self._apply_zoom_update)
         self._pending_ranges: Optional[list] = None
 
+        # Preview-mode SETTLE debounce: restarted on EVERY range-change event so
+        # it only fires once the viewport has been still for SETTLE_MS. This
+        # decouples the (expensive) DSP recompute from the live drag — while the
+        # user pans, PyQtGraph natively moves the existing ImageItem buffer and
+        # NO pipeline runs; the DSP recomputes only after the viewport settles.
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.setInterval(self.SETTLE_MS)
+        self._settle_timer.timeout.connect(self.view_range_changed.emit)
+
         # Connect dynamic-zoom handler.
         self.plot.getViewBox().sigRangeChanged.connect(self._on_range_changed)
+        # Single-click (non-drag) → emit the trace index under the cursor.
+        self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
 
         self._restyle()
         self._retranslate()
@@ -144,7 +189,92 @@ class SeismicView(QWidget):
         self.plot.autoRange()
 
     def has_image(self) -> bool:
-        return self._arr is not None
+        # True for both paths: the static display buffer (_arr) and the
+        # controller-driven preview (which sets only the ImageItem).
+        return self._arr is not None or self.img.image is not None
+
+    # ── Preview mode (driven by a PreviewController) ─────────────────────────
+
+    def enable_preview(self, on: bool = True) -> None:
+        """Hand image updates to an external PreviewController.
+
+        In preview mode the internal display-buffer re-slice is bypassed and
+        pan/zoom is forwarded as :pyattr:`view_range_changed` so the controller
+        can re-run the DSP pipeline on the newly visible window.
+        """
+        self._preview_mode = bool(on)
+
+    def current_view_range(self) -> tuple:
+        """Return ((x0_km, x1_km), (y0_ms, y1_ms)) of the current ViewBox."""
+        (x0, x1), (y0, y1) = self.plot.getViewBox().viewRange()
+        return (float(x0), float(x1)), (float(y0), float(y1))
+
+    def center_on_distance(self, km: float) -> None:
+        """Scroll the ViewBox horizontally to centre on a distance (km), keeping
+        the current zoom width. Used by the map's click-to-jump."""
+        vb = self.plot.getViewBox()
+        (x0, x1), _ = vb.viewRange()
+        half = (x1 - x0) / 2.0
+        vb.setXRange(km - half, km + half, padding=0)
+
+    def _on_scene_click(self, ev) -> None:
+        """Map a single left-click to the trace index under the cursor and emit
+        it. pyqtgraph fires sigMouseClicked only for clicks (drags pan the view),
+        so this never interferes with panning."""
+        dist = self._dist_km
+        if dist is None or dist.size < 1:
+            return
+        try:
+            if ev.button() != Qt.MouseButton.LeftButton:
+                return
+            x = float(self.plot.getViewBox().mapSceneToView(ev.scenePos()).x())
+        except (AttributeError, TypeError):
+            return
+        idx = int(np.searchsorted(dist, x, side="left"))
+        idx = max(0, min(idx, dist.size - 1))
+        self.trace_clicked.emit(idx)
+
+    def set_colormap(self, cmap_name: str, vmax: float) -> None:
+        """Set the LUT + colorbar for preview updates (cheap; no image reset)."""
+        self._cmap_name = cmap_name
+        self._vmax = float(vmax) or 1.0
+        self._lut = self._build_lut()
+        if self._cbar is None:
+            self._cbar = pg.ColorBarItem(values=(0.0, self._vmax),
+                                         colorMap=self._colormap(),
+                                         label=self.tr("Amplitude"))
+            self.glw.addItem(self._cbar, 0, 1)
+        else:
+            self._cbar.setColorMap(self._colormap())
+            self._cbar.setLevels((0.0, self._vmax))
+
+    def show_preview(self, arr: np.ndarray, dist0: float, dist1: float,
+                     t0: float, t1: float, *, vmax: float,
+                     fit: bool = False) -> None:
+        """Lean image update for the live preview — NO autoRange unless ``fit``.
+
+        ``set_colormap`` must have been called first (LUT ready). On ``fit`` the
+        view is auto-ranged once (initial display); subsequent pan/zoom-driven
+        previews leave the user's viewport untouched.
+        """
+        self._vmax = float(vmax) or 1.0
+        self._rect = (float(dist0), float(dist1), float(t0), float(t1))
+        self.img.setImage(arr, autoLevels=False)
+        self.img.setLevels([0.0, self._vmax])
+        if self._lut is not None:
+            self.img.setLookupTable(self._lut)
+        self.img.setRect(QRectF(float(dist0), float(t0),
+                                float(dist1) - float(dist0),
+                                float(t1) - float(t0)))
+        if self._cbar is not None:
+            self._cbar.setLevels((0.0, self._vmax))
+        if fit:
+            self.set_aspect(self._aspect)   # autoRanges to fit the new section
+
+    def set_overlays(self, boundaries: Sequence[float] = (),
+                     fixes: Sequence[FixMark] = ()) -> None:
+        """Public hook so the controller can (re)draw FIX/boundary lines."""
+        self._draw_overlays(boundaries, fixes)
 
     def set_boundaries_visible(self, visible: bool) -> None:
         """Show/hide the red file-seam boundary lines live (no re-render)."""
@@ -164,8 +294,50 @@ class SeismicView(QWidget):
 
     # ── Dynamic zoom ────────────────────────────────────────────────────────
 
+    def set_distance_axis(self, dist_km) -> None:
+        """Give the view the full per-trace distance array (km) of the active
+        source (called by the controller). The ViewBox X-range is resolved to
+        absolute trace indices by masking this array directly. Re-broadcasts the
+        visible range for the present ViewBox so the map updates on new data."""
+        self._dist_km = (np.asarray(dist_km, dtype=float)
+                         if dist_km is not None else None)
+        self._emit_visible_traces(self.plot.getViewBox().viewRange())
+
+    def _emit_visible_traces(self, ranges) -> None:
+        """Resolve the ViewBox X-range to absolute trace indices and broadcast.
+
+        The distance axis (built in core from the cleaned navigation track) is
+        monotonically non-decreasing, so ``np.searchsorted`` maps the X-range to
+        the half-open trace window [t0, t1) in O(log n). ``side='left'`` for the
+        lower bound and ``side='right'`` for the upper bound make the window
+        correct across distance plateaus — the upper bound steps PAST a frozen-
+        GPS plateau rather than stopping at its start, so the far edge reaches
+        the true end."""
+        dist = self._dist_km
+        if dist is None or dist.size < 1:
+            return
+        try:
+            xv0, xv1 = float(ranges[0][0]), float(ranges[0][1])
+        except (TypeError, IndexError):
+            return
+        x_min, x_max = (xv0, xv1) if xv0 <= xv1 else (xv1, xv0)
+        n = dist.size
+        t0 = int(np.searchsorted(dist, x_min, side="left"))
+        t1 = int(np.searchsorted(dist, x_max, side="right"))
+        t0 = max(0, min(t0, n - 1))
+        t1 = max(t0 + 1, min(t1, n))
+        self.visible_traces_changed.emit(t0, t1)
+
     def _on_range_changed(self, _vb, ranges) -> None:
-        """Schedule a display-buffer re-slice when the viewport changes."""
+        """Schedule a display-buffer re-slice (or a preview refresh) on pan/zoom."""
+        # Immediate (un-debounced) trace-index broadcast for the navigation map.
+        self._emit_visible_traces(ranges)
+        if self._preview_mode:
+            # SETTLE debounce: restart on every event so the DSP recompute only
+            # fires once the viewport stops moving. During the drag PyQtGraph
+            # natively pans the existing ImageItem — no pipeline runs.
+            self._settle_timer.start()
+            return
         if self._arr is None:
             return
         self._pending_ranges = ranges
@@ -173,7 +345,8 @@ class SeismicView(QWidget):
             self._zoom_timer.start()
 
     def _apply_zoom_update(self) -> None:
-        """Slice the display buffer to the visible column window and push to GPU."""
+        """Slice the display buffer to the visible column window and push to GPU
+        (non-preview path only; preview uses the settle timer → view_range_changed)."""
         ranges = self._pending_ranges
         arr = self._arr
         if ranges is None or arr is None:
