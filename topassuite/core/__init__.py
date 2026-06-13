@@ -26,7 +26,7 @@ from .coordinates import resolve_crs, validate_crs
 from .spatial import reproject_points, to_geographic, CRS_CATALOG, CRS_PRESETS
 from .gis_io import (read_gis_layer, read_vector, read_geotiff,
                      VectorLayer, RasterLayer)
-from .chaining import detect_chains
+from .chaining import detect_chains, import_chains_from_directory
 from .coloring import colormapped_rgba
 from .geometry_export import (
     parse_timestamp, compute_fix_positions,
@@ -61,7 +61,7 @@ __all__ = [
     "CRS_CATALOG", "CRS_PRESETS",
     "read_gis_layer", "read_vector", "read_geotiff", "VectorLayer", "RasterLayer",
     # Chaining
-    "detect_chains",
+    "detect_chains", "import_chains_from_directory",
     # Coloring
     "colormapped_rgba",
     # Geometry export

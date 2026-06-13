@@ -56,7 +56,7 @@ class LabeledSlider(QWidget):
         self._slider.setRange(0, steps)
         self._lbl = QLabel()
         self._lbl.setObjectName("sub")
-        self._lbl.setFixedWidth(48)
+        self._lbl.setFixedWidth(54)   # fits 2-decimal values like "100.00"
         self._lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         if init is None:
@@ -130,7 +130,11 @@ class ProcessingControls(QWidget):
         # ── Clip / gain ──
         self.sec_clip = self._section()
         self.cap_clip = self._caption()
-        self.clip = LabeledSlider(80, 100, 1, 98, "{:.0f}")
+        # Fine-grained amplitude clip: 0.05-% resolution, 2 decimals, so the user
+        # can gently dial back "too strong" sections (e.g. 99.50 → 99.05) instead
+        # of jumping in whole percent. The fractional percentile flows untouched
+        # to np.percentile (no int rounding anywhere downstream).
+        self.clip = LabeledSlider(80.0, 100.0, 0.05, 98.0, "{:.2f}")
         v.addWidget(self.clip)
         self.tvg = QCheckBox()
         v.addWidget(self.tvg)
@@ -252,7 +256,7 @@ class ProcessingControls(QWidget):
             tvg=self.tvg.isChecked(), tvg_alpha=self.tvg_alpha.value(),
             agc=self.agc.isChecked(), agc_win=int(self.agc_win.value()),
             align=self.align_delays.isChecked(),
-            clip=int(self.clip.value()), cmap=self.cmap_cb.currentText(),
+            clip=float(self.clip.value()), cmap=self.cmap_cb.currentText(),
             inv_cmap=self.inv_cmap.isChecked(),
             fix=self.fix.isChecked(), fix_iv=int(self.fix_interval.value()),
         )
@@ -267,7 +271,7 @@ class ProcessingControls(QWidget):
         return dict(
             cmap=self.cmap_cb.currentText(),
             inv_cmap=self.inv_cmap.isChecked(),
-            clip=int(self.clip.value()),
+            clip=float(self.clip.value()),
             fix=self.fix.isChecked(),
             fix_iv=int(self.fix_interval.value()),
             align=self.align_delays.isChecked(),

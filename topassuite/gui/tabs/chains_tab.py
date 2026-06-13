@@ -71,5 +71,3 @@ class ChainsTab(SubTabbedTab):
         self._map.set_track(mx, my)
         self._headers.set_source(chain)
         self.preview.set_source(chain)
-        # Lock the view to the chosen aspect on load (see VisualizerTab note).
-        self._seismic.set_aspect(self.controls.aspect(), fit=True)

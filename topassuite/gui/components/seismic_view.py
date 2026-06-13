@@ -46,39 +46,6 @@ pg.setConfigOption("useOpenGL", True)   # hardware-accelerated pan/zoom
 FixMark = Tuple[int, float, str]
 
 
-class _SeismicViewBox(pg.ViewBox):
-    """Seismic-tuned ViewBox for a solid, predictable, Petrel/Kingdom-like feel.
-
-    * Mouse wheel → proportional zoom (both axes scaled by the SAME factor, so
-      ``setAspectLocked(True)`` is preserved exactly → no distortion).
-    * Left-drag   → pan.
-    * Right-drag  → rubber-band BOX ZOOM.
-
-    The default PanMode right-drag performed *independent* X/Y scaling, which
-    fought the aspect lock and produced the 'stretch then snap' effect the user
-    reported. We replace it with a box zoom — a deliberate gesture the aspect
-    lock keeps proportional (it sets the range to the box, then the lock expands
-    the limiting axis to honour the ratio). Faithfully mirrors pyqtgraph's own
-    RectMode box-zoom, just bound to the right button instead of the left."""
-
-    def mouseDragEvent(self, ev, axis=None):
-        if ev.button() == Qt.MouseButton.RightButton and axis is None:
-            ev.accept()
-            if ev.isFinish():
-                self.rbScaleBox.hide()
-                rect = QRectF(pg.Point(ev.buttonDownPos(ev.button())),
-                              pg.Point(ev.pos()))
-                rect = self.childGroup.mapRectFromParent(rect)
-                self.showAxRect(rect)
-                self.axHistoryPointer += 1
-                self.axHistory = self.axHistory[:self.axHistoryPointer] + [rect]
-            else:
-                self.updateScaleBox(ev.buttonDownPos(), ev.pos())
-            return
-        # Left/middle drag → default behaviour (left pans in PanMode).
-        super().mouseDragEvent(ev, axis)
-
-
 class SeismicView(QWidget):
     """PyQtGraph seismic section fed with a pre-computed float32 amplitude array."""
 
@@ -112,8 +79,7 @@ class SeismicView(QWidget):
 
         self.glw = pg.GraphicsLayoutWidget()
         lay.addWidget(self.glw)
-        # Custom ViewBox: wheel-zoom (aspect-preserving), left-pan, right-box-zoom.
-        self.plot = self.glw.addPlot(row=0, col=0, viewBox=_SeismicViewBox())
+        self.plot = self.glw.addPlot(row=0, col=0)
         self.plot.invertY(True)  # time downward
         self.img = pg.ImageItem(autoDownsample=True)
         self.plot.addItem(self.img)
@@ -137,11 +103,7 @@ class SeismicView(QWidget):
         self._lut: Optional[np.ndarray] = None   # (256, 3) uint8
         self._vmax: float = 1.0
         self._cmap_name: str = "viridis"
-        self._rect: tuple = (0.0, 1.0, 0.0, 1.0)   # transient: CURRENT image extent
-        # True geometric extent of the WHOLE profile (dist0, dist1, t0, t1), set on
-        # load/fit. The aspect-lock ratio is derived ONLY from this, never from the
-        # transient _rect — so zooming never changes the locked proportion.
-        self._full_rect: tuple = (0.0, 1.0, 0.0, 1.0)
+        self._rect: tuple = (0.0, 1.0, 0.0, 1.0)   # (dist0, dist1, t0, t1)
         self._aspect: Optional[float] = None
         self._last_zoom_key: Optional[tuple] = None  # (c0, c1, stride) dedup
         # Preview mode: a PreviewController owns image updates; the internal
@@ -200,7 +162,6 @@ class SeismicView(QWidget):
         self._vmax = float(vmax) or 1.0
         self._cmap_name = cmap_name
         self._rect = (float(dist0), float(dist1), float(t0), float(t1))
-        self._full_rect = self._rect           # static-display path: full section
         self._last_zoom_key = None  # force a zoom refresh on the new data
         self._boundaries_visible = bool(boundaries_visible)
 
@@ -213,26 +174,19 @@ class SeismicView(QWidget):
         self._draw_overlays(boundaries, fixes)
         if title:
             self.plot.setTitle(title, color=theme.color("text"), size="9pt")
-        self.set_aspect(aspect, fit=True)
+        self.set_aspect(aspect)
 
-    def set_aspect(self, aspect: Optional[float], *, fit: bool = False) -> None:
-        """Lock the data box to a W:H ratio (None = free).
-
-        The ratio is computed ONCE from the WHOLE-profile geometry
-        (``_full_rect``), so it is independent of the current zoom — changing the
-        Scale spinner or colormap re-locks the proportion in place WITHOUT
-        yanking the user's view. ``autoRange`` fires ONLY on an explicit fit
-        (initial load or the Fit/Render action), never on a routine re-lock."""
+    def set_aspect(self, aspect: Optional[float]) -> None:
+        """Lock the data box to a W:H ratio (None = free), then fit."""
         self._aspect = aspect
         vb = self.plot.getViewBox()
-        d0, d1, t0, t1 = self._full_rect
+        d0, d1, t0, t1 = self._rect
         x_ext, y_ext = (d1 - d0), (t1 - t0)
         if aspect and x_ext > 0 and y_ext > 0:
             vb.setAspectLocked(True, ratio=aspect * y_ext / x_ext)
         else:
             vb.setAspectLocked(False)
-        if fit:
-            self.plot.autoRange()
+        self.plot.autoRange()
 
     def has_image(self) -> bool:
         # True for both paths: the static display buffer (_arr) and the
@@ -315,12 +269,7 @@ class SeismicView(QWidget):
         if self._cbar is not None:
             self._cbar.setLevels((0.0, self._vmax))
         if fit:
-            # On fit the controller renders the FULL profile, so this extent IS
-            # the section geometry → capture it for the aspect-lock ratio, then
-            # lock + autoRange once. Routine zoom/pan previews (fit=False) never
-            # re-lock or re-fit, leaving the user's viewport exactly where it is.
-            self._full_rect = self._rect
-            self.set_aspect(self._aspect, fit=True)
+            self.set_aspect(self._aspect)   # autoRanges to fit the new section
 
     def set_overlays(self, boundaries: Sequence[float] = (),
                      fixes: Sequence[FixMark] = ()) -> None:

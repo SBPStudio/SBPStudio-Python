@@ -289,6 +289,9 @@ class MainWindow(QMainWindow):
         self.chain_gap.setFixedWidth(64)
         ctrl.addWidget(self.chain_gap)
         ctrl.addStretch(1)
+        self._btn_add_chains = QPushButton()
+        self._btn_add_chains.clicked.connect(self._add_chains_from_dir)
+        ctrl.addWidget(self._btn_add_chains)
         self._btn_detect = QPushButton()
         self._btn_detect.clicked.connect(self._detect_chains)
         ctrl.addWidget(self._btn_detect)
@@ -508,6 +511,31 @@ class MainWindow(QMainWindow):
             self.tr("{0} chain(s) detected.").format(len(chains)))
         if chains:
             self.chain_list.setCurrentRow(0)
+
+    def _add_chains_from_dir(self) -> None:
+        """Import pre-organised chains: each subdirectory of the chosen campaign
+        folder that holds SEG-Y files becomes a chain named after the folder. The
+        scan runs in a worker (header-only stubs → RAM-flat, no trace load)."""
+        root = QFileDialog.getExistingDirectory(
+            self, self.tr("Select campaign directory"))
+        if not root:
+            return
+        # Pass the names already present so the core skips duplicates without
+        # even reading their headers.
+        existing = [getattr(c, "label", None) for c in self.state.chains]
+        self.task_started(self.tr("Importing chains…"))
+
+        def job(progress, cancel) -> list:
+            from topassuite.core import import_chains_from_directory
+            return import_chains_from_directory(
+                root, progress=progress, cancel=cancel, existing_names=existing)
+
+        self._run_worker(job, self._on_chains_imported)
+
+    def _on_chains_imported(self, chains: list) -> None:
+        added = self.state.add_chains(chains)
+        self._lbl_chain_hint.setText(
+            self.tr("{0} chain(s) imported.").format(added))
 
     def _remove_profile(self) -> None:
         row = self.prof_list.currentRow()
@@ -732,6 +760,9 @@ class MainWindow(QMainWindow):
             self.tr("Add the selected chains' navigation tracks to the map"))
         self._hdr_chains.setText(self.tr("DETECTED CHAINS"))
         self._lbl_threshold.setText(self.tr("Threshold (km):"))
+        self._btn_add_chains.setText(self.tr("📂 Add chains"))
+        self._btn_add_chains.setToolTip(
+            self.tr("Import chains from a campaign directory (one folder per chain)"))
         self._btn_detect.setText(self.tr("🔍 Detect"))
         if not self.state.chains:
             self._lbl_chain_hint.setText(self.tr('Load profiles and click "Detect".'))

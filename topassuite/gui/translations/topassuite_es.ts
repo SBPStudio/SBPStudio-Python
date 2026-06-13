@@ -367,6 +367,26 @@ Interfaz PyQt6, desacoplada del núcleo de procesado.</translation>
         <translation>No hay trazas de navegación que añadir.</translation>
     </message>
     <message>
+        <source>📂 Add chains</source>
+        <translation>📂 Añadir cadenas</translation>
+    </message>
+    <message>
+        <source>Import chains from a campaign directory (one folder per chain)</source>
+        <translation>Importar cadenas desde un directorio de campaña (una carpeta por cadena)</translation>
+    </message>
+    <message>
+        <source>Select campaign directory</source>
+        <translation>Selecciona el directorio de la campaña</translation>
+    </message>
+    <message>
+        <source>Importing chains…</source>
+        <translation>Importando cadenas…</translation>
+    </message>
+    <message>
+        <source>{0} chain(s) imported.</source>
+        <translation>{0} cadena(s) importada(s).</translation>
+    </message>
+    <message>
         <source>CLI</source>
         <translation>CLI</translation>
     </message>
