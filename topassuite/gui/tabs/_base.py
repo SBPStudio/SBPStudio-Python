@@ -333,14 +333,36 @@ class SubTabbedTab(QWidget):
                 time_align=cfg["time_align"], fix_font_size=5.0,
                 fix_bbox_alpha=cfg["fix_bbox_alpha"], fix_color=cfg["fix_color"],
                 colors=build_theme(theme=cfg["theme"]))
-            # Publication-quality standalone render: the figure size comes purely
-            # from compute_figsize (native trace/sample dimensions + the baseline
-            # scale ratio) and the core matplotlib renderer rasterises it at the
-            # requested DPI. NO screen/viewport coupling — the export is fully
-            # decoupled from the transient on-screen ViewBox.
             render = render_chain_figure if is_chain else render_profile_figure
             fig = render(_obj, data, params, figsize=figsize, dpi=dpi, **render_opts)
-            cancel.check()        # last chance to abort before the heavy save/raster
+            # Make the seismic DATA AREA have the SAME aspect as the on-screen
+            # view (WYSIWYG scale). Matplotlib decorations (title, labels,
+            # colorbar) take a roughly fixed margin in inches, so we iterate:
+            # keep the data width, set figure height = data_w/aspect + margins,
+            # and re-run tight_layout until the data box converges to `aspect`.
+            # RESTORED bit-for-bit from gui-core-filters: this loop is what gives
+            # the export its full-resolution, publication-quality rasterisation.
+            # compute_figsize sizes the WHOLE figure to w/aspect, but the fixed
+            # title/colorbar/label margins then squeeze the DATA axes far below
+            # that — few inches → few pixels at the target DPI → blurry. The loop
+            # measures the decoration margin and re-sizes so the DATA BOX itself
+            # hits `aspect` at full size, restoring the data area's pixel count.
+            if aspect:
+                seis = next((a for a in fig.axes if a.get_images()), None)
+                if seis is not None:
+                    for _ in range(4):
+                        fig.canvas.draw()
+                        pos = seis.get_position()
+                        fw, fh = fig.get_size_inches()
+                        if pos.width <= 0 or pos.height <= 0:
+                            break
+                        data_w = pos.width * fw
+                        margin_v = fh - pos.height * fh   # absolute non-data height
+                        fig.set_size_inches(fw, data_w / aspect + margin_v)
+                        try:
+                            fig.tight_layout(pad=1.2)
+                        except Exception:
+                            pass
             try:
                 save_figure(fig, out, dpi=dpi, fmt=fmt, pdf_page=cfg["pdf_page"])
             except OSError as exc:

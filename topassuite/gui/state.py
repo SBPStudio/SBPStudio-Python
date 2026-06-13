@@ -103,6 +103,23 @@ class AppState(QObject):
         self.set_active_chain(None)
         self.chains_changed.emit()
 
+    def add_chains(self, chains: "List[ProfileChain]") -> int:
+        """Append chains (e.g. a directory import), skipping any whose name is
+        already present so re-importing a campaign never creates duplicates.
+        Does NOT touch the active chain. Returns the number actually added."""
+        existing = {getattr(c, "label", None) for c in self._chains}
+        added = 0
+        for ch in chains:
+            label = getattr(ch, "label", None)
+            if label in existing:
+                continue
+            self._chains.append(ch)
+            existing.add(label)
+            added += 1
+        if added:
+            self.chains_changed.emit()
+        return added
+
     @property
     def active_chain(self) -> "Optional[ProfileChain]":
         if self._active_chain_index is None:
