@@ -20,6 +20,11 @@ from PyQt6.QtCore import QObject, pyqtSignal
 if TYPE_CHECKING:  # avoid importing heavy core deps (segyio/pyproj) at GUI import time
     from topassuite.core.model import SegyProfile, ProfileChain
 
+# Cap on simultaneously-loaded ("hot") trace matrices. Older, non-active profiles
+# beyond this are evicted back to lazy stubs (data=None) to bound RAM when many
+# heavy Antarctic lines are browsed in one session.
+MAX_HOT_PROFILES = 3
+
 
 class AppState(QObject):
     """Observable container for the currently loaded profiles and chains."""
@@ -41,6 +46,8 @@ class AppState(QObject):
         self._chains: "List[ProfileChain]" = []
         self._active_profile_key: Optional[str] = None
         self._active_chain_index: Optional[int] = None
+        # Keys of profiles whose trace matrices are loaded, oldest → newest (LRU).
+        self._lru: List[str] = []
 
     # ── Profiles ────────────────────────────────────────────────────────────
 
@@ -56,12 +63,14 @@ class AppState(QObject):
     def remove_profile(self, key: str) -> None:
         if key in self._profiles:
             del self._profiles[key]
+            self._lru = [k for k in self._lru if k != key]
             if self._active_profile_key == key:
                 self.set_active_profile(None)
             self.profiles_changed.emit()
 
     def clear_profiles(self) -> None:
         self._profiles.clear()
+        self._lru.clear()
         self.set_active_profile(None)
         self.profiles_changed.emit()
 
@@ -76,6 +85,10 @@ class AppState(QObject):
         if key is not None and key not in self._profiles:
             key = None
         self._active_profile_key = key
+        # Selecting an already-loaded profile refreshes its recency so it isn't
+        # evicted out from under the user.
+        if key is not None and self._is_loaded(key):
+            self._touch(key)
         self.active_profile_changed.emit(self.active_profile)
 
     # ── Chains ──────────────────────────────────────────────────────────────
@@ -116,6 +129,56 @@ class AppState(QObject):
         if profile.path not in self._profiles:
             return
         self._profiles[profile.path] = profile
+        # A freshly-loaded matrix is now the hottest; cap total RAM by evicting
+        # the oldest non-active loaded profiles back to lazy stubs.
+        if getattr(profile, "data", None) is not None:
+            self._touch(profile.path)
+            self._evict_if_needed()
         self.profiles_changed.emit()
         if self._active_profile_key == profile.path:
             self.active_profile_changed.emit(profile)
+
+    def update_chain_data(self, chain: "ProfileChain") -> None:
+        """Re-emit ``active_chain_changed`` after a chain's trace matrix has been
+        lazily assembled, so the Chains tab transitions from "Loading…" to the
+        live section. The chain object is mutated in place by the loader worker,
+        so we only need to re-notify (no list replacement)."""
+        if chain is self.active_chain:
+            self.active_chain_changed.emit(chain)
+
+    # ── LRU eviction of trace matrices (RAM bound) ───────────────────────────
+
+    def _is_loaded(self, key: str) -> bool:
+        prof = self._profiles.get(key)
+        return prof is not None and getattr(prof, "data", None) is not None
+
+    def _touch(self, key: str) -> None:
+        """Mark a loaded profile as most-recently used (move to the LRU tail)."""
+        if key in self._lru:
+            self._lru.remove(key)
+        self._lru.append(key)
+
+    def _evict_if_needed(self) -> None:
+        """Drop the heavy arrays (``data``/``amp_max``) of the oldest non-active
+        loaded profiles until at most ``MAX_HOT_PROFILES`` remain hot. Each
+        evicted profile reverts to a lazy stub (``data=None``), so re-selecting it
+        transparently re-loads from disk via the existing worker path."""
+        self._lru = [k for k in self._lru if self._is_loaded(k)]   # resync
+        i = 0
+        while len(self._lru) > MAX_HOT_PROFILES and i < len(self._lru):
+            key = self._lru[i]
+            if key == self._active_profile_key:    # never evict what's on screen
+                i += 1
+                continue
+            prof = self._profiles.get(key)
+            if prof is not None:
+                name = getattr(prof, "name", key)
+                prof.data = None                   # release the (ns × n_traces) matrix
+                prof.amp_max = None
+                prof.clip_p99 = None               # → identical to a load_traces=False stub
+                # Lazy import: keeps heavy core (segyio/pyproj) off the GUI import
+                # path; by eviction time the core is long since loaded.
+                from topassuite.core.logger import get_logger
+                get_logger("state").debug(
+                    "Evicted trace matrix for %s to free RAM", name)
+            self._lru.pop(i)                       # list shrank; re-check at same index

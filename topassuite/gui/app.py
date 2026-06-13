@@ -28,6 +28,12 @@ def create_app(argv: Optional[list[str]] = None) -> QApplication:
 
 def main(argv: Optional[list[str]] = None) -> int:
     """Build the window and run the event loop. Returns the process exit code."""
+    # Configure persistent logging FIRST so any startup/runtime error (incl. a
+    # crash in a windowed .exe with no console) is captured in app.log. Done here
+    # in the entry point — NOT in MainWindow — so tests that build the window
+    # directly never write a log file.
+    from topassuite.core import configure_logging
+    configure_logging()
     app = create_app(argv)
     window = MainWindow()
     window.show()

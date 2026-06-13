@@ -6,6 +6,7 @@ matplotlib.pyplot/Figure, or PyQtGraph at module level. matplotlib colormaps
 are accessed lazily inside coloring.py only.
 """
 from .constants import CMAPS, COORD_UNITS, PRESETS_CRS, FILTER_PRESETS, FILTER_DESCRIPTIONS
+from .logger import configure_logging, get_logger
 from ._backends import gpu_available, worker_count
 from .tasks import (
     TopasCoreError, SegyLoadError, CRSError, ReprojectionError, Cancelled,
@@ -38,6 +39,8 @@ __all__ = [
     "CMAPS", "COORD_UNITS", "PRESETS_CRS", "FILTER_PRESETS", "FILTER_DESCRIPTIONS",
     # Backends
     "gpu_available", "worker_count",
+    # Logging
+    "configure_logging", "get_logger",
     # Exceptions / tasks
     "TopasCoreError", "SegyLoadError", "CRSError", "ReprojectionError", "Cancelled",
     "ProgressCallback", "CancelToken",

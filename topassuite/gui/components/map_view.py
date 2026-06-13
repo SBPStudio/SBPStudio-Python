@@ -390,6 +390,38 @@ class MapView(QWidget):
             item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self._register_layer(layer.name, [item], "vector")
 
+    def add_track_layer(self, name: str, x, y) -> None:
+        """Inject an independent navigation track as a managed GIS layer.
+
+        Used by the sidebar 'Add to map' batch loader: each selected profile /
+        chain becomes its own reorderable, checkable, opacity-controlled overlay
+        (a polyline with green SOL / red EOL anchors). This is a PINNED reference
+        layer — it does NOT touch the active SEG-Y track row, the active profile,
+        or any trace data. Coordinates are expected already in WGS84 (lon, lat),
+        reprojected off-thread by the caller's CoreWorker.
+        """
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        if x.size == 0:
+            return
+        color = _LAYER_COLORS[self._layer_count % len(_LAYER_COLORS)]
+        line = pg.PlotDataItem(x, y, pen=pg.mkPen(color, width=2))
+        line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        start = pg.ScatterPlotItem([x[0]], [y[0]], size=8,
+                                   brush=pg.mkBrush(theme.color("ok")), pen=None)
+        end = pg.ScatterPlotItem([x[-1]], [y[-1]], size=8,
+                                 brush=pg.mkBrush(theme.color("warn")), pen=None)
+        for it in (start, end):
+            it.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._register_layer(name, [line, start, end], "vector")
+        # Show the world basemap if these coordinates look geographic, then frame
+        # the newly added geometry so the user sees it land (autoRange ignores the
+        # basemap, which is added with ignoreBounds=True).
+        if (float(np.nanmin(x)) >= -180.0 and float(np.nanmax(x)) <= 180.0
+                and float(np.nanmin(y)) >= -90.0 and float(np.nanmax(y)) <= 90.0):
+            self._basemap.setVisible(True)
+        self.plot.getViewBox().autoRange()
+
     def _add_raster(self, layer) -> None:
         lon0, lon1, lat0, lat1 = layer.bbox
         item = pg.ImageItem()

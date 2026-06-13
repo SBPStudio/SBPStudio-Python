@@ -560,6 +560,10 @@ def cmd_export_image(args) -> None:
         for ch in chains:
             print(f"\nExporting chain: {ch.label}", file=sys.stderr)
             with timer.phase("processing"):
+                # Chains assemble their stitched matrix lazily (memory-flat
+                # detection). Build it now — constituents are already loaded in
+                # the CLI, so this just concatenates the in-RAM arrays.
+                ch.load_chain_traces()
                 data = process_chain_data(ch, params)
             out = args.out or str(
                 Path(ch.profiles[0].path).with_suffix(f".{fmt}"))

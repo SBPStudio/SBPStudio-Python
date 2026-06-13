@@ -26,8 +26,11 @@ from PyQt6.QtWidgets import (
     QPushButton, QTextBrowser, QVBoxLayout, QWidget,
 )
 
+from ...core.logger import get_logger
 from ..i18n import language_manager
 from ..theme import MONO, theme
+
+_LOG = get_logger("cli")
 
 # Legacy headless CLI commands surfaced inside the console (name, one-line help).
 # Dispatched through the SAME argparse logic as `python -m topassuite.cli.main`.
@@ -368,9 +371,11 @@ class CliConsole(QWidget):
             except SystemExit as exc:            # _err() in the handlers calls sys.exit
                 if exc.code not in (0, None):
                     print(f"\n[exit code {exc.code}]")
+                    _LOG.error("CLI command '%s' exited with code %s", name, exc.code)
             except Exception as exc:             # surfaced in-console, never crashes
                 import traceback
                 print(f"\nError: {exc}\n{traceback.format_exc()}")
+                _LOG.exception("CLI command '%s' failed", name)
             finally:
                 sys.stdout, sys.stderr = old_out, old_err
             return name

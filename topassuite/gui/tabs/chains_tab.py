@@ -38,12 +38,27 @@ class ChainsTab(SubTabbedTab):
     # ── State → preview ──────────────────────────────────────────────────────
 
     def _on_active_chain_changed(self, chain: object) -> None:
-        if chain is None or getattr(chain, "data", None) is None:
+        if chain is None:
             self.preview.set_source(None)
             self._map.clear()
             self._headers.clear()
             for page in self.pages:
                 page.show_placeholder(self.empty_message())
+            return
+        if getattr(chain, "data", None) is None:
+            # Lazy stub: the trace matrix is being assembled by
+            # MainWindow._load_chain_traces. The track + inspector headers are
+            # already available from the lightweight metadata, so show them now
+            # and mark the section/spectrum as loading.
+            self.preview.set_source(None)
+            mx, my = to_geographic(chain.track_lons, chain.track_lats,
+                                   getattr(chain, "detected_crs", None))
+            self.pages[MAP].set_view(self._map)
+            self._map.set_track(mx, my)
+            self.pages[HEADERS].set_view(self._headers)
+            self._headers.set_source(chain)
+            for i in (PROFILE, SPECTRUM):
+                self.pages[i].show_placeholder(self.tr("Loading data…"))
             return
         self.pages[PROFILE].set_view(self._seismic)
         self.pages[SPECTRUM].set_view(self._spectrum)
@@ -56,3 +71,5 @@ class ChainsTab(SubTabbedTab):
         self._map.set_track(mx, my)
         self._headers.set_source(chain)
         self.preview.set_source(chain)
+        # Lock the view to the chosen aspect on load (see VisualizerTab note).
+        self._seismic.set_aspect(self.controls.aspect(), fit=True)

@@ -67,12 +67,15 @@ import numpy as np
 import segyio
 from pyproj import CRS, Transformer
 
+from .logger import get_logger
 from .model import SegyMetadata, SegyProfile, ProfileChain
 from .tasks import (
     SegyLoadError, CRSError, ReprojectionError, Cancelled,
     ProgressCallback, LogCallback, CancelToken,
     _noop_progress, _noop_log,
 )
+
+_LOG = get_logger("io_segy")
 
 _INT32_MAX = 2_147_483_647
 
@@ -566,6 +569,7 @@ def reproject_one(
     except Exception as exc:
         import traceback
         log(f"✘ Error: {exc}\n{traceback.format_exc()}")
+        _LOG.exception("Reprojection failed for %s", sd.name)
         _try_delete(outpath)
         raise ReprojectionError(str(exc)) from exc
 
@@ -649,6 +653,7 @@ def reproject_chain(
     except Exception as exc:
         import traceback
         log(f"✘ Error: {exc}\n{traceback.format_exc()}")
+        _LOG.exception("Reprojection failed for chain %s", ch.label)
         _try_delete(outpath)
         raise ReprojectionError(str(exc)) from exc
 
