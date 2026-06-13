@@ -231,7 +231,14 @@ class MainWindow(QMainWindow):
         pl.addWidget(self._hdr_profiles)
 
         self.prof_list = QListWidget()
+        # Extended (multi) selection so several tracks can be batch-added to the
+        # map at once. Selecting MANY items must not load any of them; only a
+        # single-item selection drives the active seismic section (see
+        # _on_profile_row_changed's guard).
+        self.prof_list.setSelectionMode(
+            QListWidget.SelectionMode.ExtendedSelection)
         self.prof_list.currentRowChanged.connect(self._on_profile_row_changed)
+        self.prof_list.itemSelectionChanged.connect(self._update_map_buttons)
         pl.addWidget(self.prof_list, 1)
 
         row = QHBoxLayout()
@@ -247,6 +254,16 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         row.addWidget(self._btn_clear)
         pl.addLayout(row)
+
+        # Dedicated batch-to-map action: extract the navigation tracks of the
+        # selected profiles (headers only — no trace matrix load) and inject them
+        # as managed layers on the Visualizer map. Disabled until ≥1 valid
+        # profile is selected.
+        self._btn_prof_to_map = QPushButton()
+        self._btn_prof_to_map.setObjectName("addToMap")
+        self._btn_prof_to_map.setEnabled(False)
+        self._btn_prof_to_map.clicked.connect(self._add_profiles_to_map)
+        pl.addWidget(self._btn_prof_to_map)
         split.addWidget(pf)
 
         # Detected chains
@@ -278,8 +295,17 @@ class MainWindow(QMainWindow):
         cl.addLayout(ctrl)
 
         self.chain_list = QListWidget()
+        self.chain_list.setSelectionMode(
+            QListWidget.SelectionMode.ExtendedSelection)
         self.chain_list.currentRowChanged.connect(self._on_chain_row_changed)
+        self.chain_list.itemSelectionChanged.connect(self._update_map_buttons)
         cl.addWidget(self.chain_list, 1)
+
+        self._btn_chain_to_map = QPushButton()
+        self._btn_chain_to_map.setObjectName("addToMap")
+        self._btn_chain_to_map.setEnabled(False)
+        self._btn_chain_to_map.clicked.connect(self._add_chains_to_map)
+        cl.addWidget(self._btn_chain_to_map)
 
         self._lbl_chain_hint = QLabel()
         self._lbl_chain_hint.setObjectName("info")
@@ -321,6 +347,15 @@ class MainWindow(QMainWindow):
         self._progress.setVisible(False)
         sb.addPermanentWidget(self._progress)
 
+        # Cancel button — only visible while a background task is running. Wired
+        # to cancel every active CoreWorker (request_cancel is idempotent).
+        self._btn_cancel = QPushButton("✕")
+        self._btn_cancel.setObjectName("cancelBtn")
+        self._btn_cancel.setFixedWidth(28)
+        self._btn_cancel.setVisible(False)
+        self._btn_cancel.clicked.connect(self._on_cancel_clicked)
+        sb.addPermanentWidget(self._btn_cancel)
+
         self._gpu_badge = QLabel()
         sb.addPermanentWidget(self._gpu_badge)
         self._apply_dynamic_styles()
@@ -330,6 +365,13 @@ class MainWindow(QMainWindow):
         self._spinner_lbl.setStyleSheet(f"color:{theme.color('bright')}; font-weight:bold;")
         color = theme.color("ok") if self._gpu else theme.color("sub")
         self._gpu_badge.setStyleSheet(f"color:{color}; font-weight:bold; padding:0 10px;")
+        warn = theme.color("warn")
+        self._btn_cancel.setStyleSheet(
+            f"QPushButton#cancelBtn{{color:{warn}; font-weight:bold;"
+            f" border:1px solid {warn}; padding:1px 4px;}}"
+            f"QPushButton#cancelBtn:hover{{background:{warn}; color:#ffffff;}}"
+            f"QPushButton#cancelBtn:disabled{{color:{theme.color('sub')};"
+            f" border-color:{theme.color('sub')};}}")
 
     def _on_theme_changed(self, _name: str) -> None:
         self._apply_dynamic_styles()
@@ -353,6 +395,11 @@ class MainWindow(QMainWindow):
         self.chain_list.blockSignals(False)
 
     def _on_profile_row_changed(self, row: int) -> None:
+        # Multi-selection (Ctrl/Shift) is for batch 'Add to map' ONLY — it must
+        # not disturb the active section. Only a single highlighted row drives the
+        # active profile + its (lazy) trace load.
+        if len(self.prof_list.selectedItems()) > 1:
+            return
         keys = list(self.state.profiles.keys())
         key = keys[row] if 0 <= row < len(keys) else None
         self.state.set_active_profile(key)
@@ -377,6 +424,24 @@ class MainWindow(QMainWindow):
 
     def _on_chain_row_changed(self, row: int) -> None:
         self.state.set_active_chain(row if row >= 0 else None)
+        # Lazily assemble the stitched trace matrix the first time a chain is
+        # viewed (mirrors the per-profile lazy load). The tab shows "Loading…"
+        # meanwhile and transitions once update_chain_data re-emits.
+        chain = self.state.active_chain
+        if chain is not None and getattr(chain, "data", None) is None:
+            self._load_chain_traces(chain)
+
+    def _load_chain_traces(self, chain) -> None:
+        """Background worker: assemble a chain's trace matrix on demand, loading
+        any evicted constituent profiles from disk inside the core."""
+        self.task_started(self.tr("Loading chain traces…"))
+
+        def job(progress, cancel):
+            progress(float("nan"), "")
+            chain.load_chain_traces(cancel=cancel)
+            return chain
+
+        self._run_worker(job, self.state.update_chain_data)
 
     # ════════════════════════════════════════════════════════════════════════
     # Core-backed actions (run on background CoreWorker threads)
@@ -426,29 +491,18 @@ class MainWindow(QMainWindow):
         gap = float(self.chain_gap.value())
         self.task_started(self.tr("Detecting chains…"))
 
-        def job(progress, cancel) -> tuple:
-            from topassuite.core import load_profile, detect_chains
+        def job(progress, cancel) -> list:
+            from topassuite.core import detect_chains
             progress(float("nan"), "")
-            # ProfileChain._concat needs .data; load any stubs before grouping.
-            full = []
-            stubs_loaded = []
-            for p in profiles:
-                cancel.check()
-                if getattr(p, "data", None) is None and not getattr(p, "error", None):
-                    p = load_profile(p.path, load_traces=True)
-                    stubs_loaded.append(p)
-                full.append(p)
-            chains = detect_chains(full, gap_km=gap)
-            return chains, stubs_loaded
+            # Detection + chain assembly is now LIGHTWEIGHT: it groups by dt_us,
+            # geometry and timestamps — all resident on the header stubs. No trace
+            # matrix is loaded here, so detection stays fast and RAM-flat. The
+            # stitched matrix is assembled lazily when a chain is viewed.
+            return detect_chains(profiles, gap_km=gap)
 
         self._run_worker(job, self._on_chains_detected)
 
-    def _on_chains_detected(self, result: tuple) -> None:
-        chains, stubs_loaded = result
-        # Promote any stubs that were loaded during chain detection into state
-        # so the sidebar list and subsequent renders don't re-read the disk.
-        for p in stubs_loaded:
-            self.state.update_profile_data(p)
+    def _on_chains_detected(self, chains: list) -> None:
         self.state.set_chains(chains)
         self._lbl_chain_hint.setText(
             self.tr("{0} chain(s) detected.").format(len(chains)))
@@ -460,6 +514,85 @@ class MainWindow(QMainWindow):
         keys = list(self.state.profiles.keys())
         if 0 <= row < len(keys):
             self.state.remove_profile(keys[row])
+
+    # ── Batch 'Add to map' (navigation tracks → map layers) ───────────────────
+    def _selected_profiles(self) -> list:
+        """SegyProfiles for the highlighted rows, skipping errored ones."""
+        keys = list(self.state.profiles.keys())
+        out = []
+        for item in self.prof_list.selectedItems():
+            row = self.prof_list.row(item)
+            if 0 <= row < len(keys):
+                prof = self.state.profiles.get(keys[row])
+                if prof is not None and not getattr(prof, "error", None):
+                    out.append(prof)
+        return out
+
+    def _selected_chains(self) -> list:
+        out = []
+        for item in self.chain_list.selectedItems():
+            row = self.chain_list.row(item)
+            if 0 <= row < len(self.state.chains):
+                out.append(self.state.chains[row])
+        return out
+
+    def _update_map_buttons(self) -> None:
+        """Enable each 'Add to map' button only when its list has a valid
+        selection. Cheap — runs on every selection change."""
+        self._btn_prof_to_map.setEnabled(bool(self._selected_profiles()))
+        self._btn_chain_to_map.setEnabled(bool(self._selected_chains()))
+
+    def _add_profiles_to_map(self) -> None:
+        self._tracks_to_map(self._selected_profiles(), self.tab_visualizer)
+
+    def _add_chains_to_map(self) -> None:
+        self._tracks_to_map(self._selected_chains(), self.tab_chains)
+
+    def _tracks_to_map(self, objs: list, tab) -> None:
+        """Extract the navigation tracks of *objs* (profiles or chains) and add
+        them to *tab*'s map as managed layers — in ONE background pass.
+
+        Memory-safe: it reads ONLY the spatial vectors already resident on the
+        header stubs (track_lons/track_lats); it never loads a trace matrix and
+        never touches the LRU hot set. UX-safe: the active profile and the live
+        seismic section are left completely undisturbed.
+        """
+        # Snapshot lightweight geometry on the GUI thread (trivial attribute
+        # reads). Reprojection to WGS84 is the only real work → do it off-thread.
+        specs = []
+        for obj in objs:
+            lons = getattr(obj, "track_lons", None)
+            lats = getattr(obj, "track_lats", None)
+            if lons is None or lats is None or len(lons) == 0:
+                continue
+            name = getattr(obj, "label", None) or getattr(obj, "name", "track")
+            specs.append((name, lons, lats, getattr(obj, "detected_crs", None)))
+        if not specs:
+            self.status_lbl.setText(self.tr("No navigation tracks to add."))
+            return
+        self.task_started(self.tr("Extracting navigation tracks…"))
+
+        def job(progress, cancel) -> list:
+            from topassuite.core import to_geographic
+            out = []
+            n = len(specs)
+            for i, (name, lons, lats, crs) in enumerate(specs):
+                cancel.check()
+                progress(i / n, "")
+                x, y = to_geographic(lons, lats, crs)   # passthrough if geographic
+                out.append((name, x, y))
+            progress(1.0, "")
+            return out
+
+        self._run_worker(job, lambda tracks: self._on_tracks_extracted(tracks, tab))
+
+    def _on_tracks_extracted(self, tracks: list, tab) -> None:
+        tab.reveal_map()
+        for name, x, y in tracks:
+            tab.map_view.add_track_layer(name, x, y)
+        self.tabs.setCurrentWidget(tab)
+        self.status_lbl.setText(
+            self.tr("Added {0} track(s) to the map.").format(len(tracks)))
 
     # ── Task service (used by tabs to dispatch background renders) ────────────
     def run_task(self, job, on_success, message: str = "") -> None:
@@ -490,6 +623,8 @@ class MainWindow(QMainWindow):
             self.status_lbl.setText(message)
         self._progress.setValue(0)
         self._progress.setVisible(True)
+        self._btn_cancel.setEnabled(True)        # re-enable after a prior cancel
+        self._btn_cancel.setVisible(True)
         if not self._spinner_timer.isActive():
             self._spinner_idx = 0
             self._spinner_lbl.setText(self._spinner_chars[0])
@@ -507,8 +642,22 @@ class MainWindow(QMainWindow):
             self.status_lbl.setText(message)
         if self._active_tasks == 0:
             self._progress.setVisible(False)
+            self._btn_cancel.setVisible(False)
             self._spinner_timer.stop()
             self._spinner_lbl.setText("")
+
+    def _on_cancel_clicked(self) -> None:
+        """Cooperatively cancel every running CoreWorker. Each task aborts at its
+        next ``cancel.check()``; the button disables to show the request landed
+        and hides once the task actually finishes."""
+        requested = False
+        for worker in list(self._workers):
+            if worker.isRunning():
+                worker.request_cancel()
+                requested = True
+        if requested:
+            self.status_lbl.setText(self.tr("Cancelling…"))
+            self._btn_cancel.setEnabled(False)
 
     def show_error(self, title: str, message: str) -> None:
         """Slot for CoreWorker.failed — shows a clean modal dialog."""
@@ -555,6 +704,7 @@ class MainWindow(QMainWindow):
         self._act_cli.setText(self.tr("Activate Console"))
         self._act_cli_guide.setText(self.tr("Command Guide"))
         self._menu_help.setTitle(self.tr("Help"))
+        self._btn_cancel.setToolTip(self.tr("Cancel the current task"))
         self._theme_actions["dark"].setText(self.tr("Dark"))
         self._theme_actions["light"].setText(self.tr("Light"))
         self._act_help_module.setText(self.tr("How this module works"))
@@ -574,6 +724,12 @@ class MainWindow(QMainWindow):
         self._btn_add.setText(self.tr("＋ Add"))
         self._btn_remove.setText(self.tr("✖ Remove"))
         self._btn_clear.setText(self.tr("✖✖ Clear"))
+        self._btn_prof_to_map.setText(self.tr("🗺 Add to map"))
+        self._btn_prof_to_map.setToolTip(
+            self.tr("Add the selected profiles' navigation tracks to the map"))
+        self._btn_chain_to_map.setText(self.tr("🗺 Add to map"))
+        self._btn_chain_to_map.setToolTip(
+            self.tr("Add the selected chains' navigation tracks to the map"))
         self._hdr_chains.setText(self.tr("DETECTED CHAINS"))
         self._lbl_threshold.setText(self.tr("Threshold (km):"))
         self._btn_detect.setText(self.tr("🔍 Detect"))

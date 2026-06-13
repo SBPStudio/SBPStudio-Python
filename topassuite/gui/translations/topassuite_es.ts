@@ -9,6 +9,10 @@
         <translation>Detecta y selecciona una cadena</translation>
     </message>
     <message>
+        <source>Loading data…</source>
+        <translation>Cargando datos…</translation>
+    </message>
+    <message>
         <source>Press Render to display the section.</source>
         <translation type="vanished">Pulsa Renderizar para mostrar la sección.</translation>
     </message>
@@ -325,6 +329,42 @@ Interfaz PyQt6, desacoplada del núcleo de procesado.</translation>
         <location filename="..\main_window.py" line="505" />
         <source>Help</source>
         <translation>Ayuda</translation>
+    </message>
+    <message>
+        <source>Cancel the current task</source>
+        <translation>Cancelar la tarea actual</translation>
+    </message>
+    <message>
+        <source>Cancelling…</source>
+        <translation>Cancelando…</translation>
+    </message>
+    <message>
+        <source>Loading chain traces…</source>
+        <translation>Cargando trazas de la cadena…</translation>
+    </message>
+    <message>
+        <source>🗺 Add to map</source>
+        <translation>🗺 Añadir a mapa</translation>
+    </message>
+    <message>
+        <source>Add the selected profiles' navigation tracks to the map</source>
+        <translation>Añadir al mapa las trazas de navegación de los perfiles seleccionados</translation>
+    </message>
+    <message>
+        <source>Add the selected chains' navigation tracks to the map</source>
+        <translation>Añadir al mapa las trazas de navegación de las cadenas seleccionadas</translation>
+    </message>
+    <message>
+        <source>Extracting navigation tracks…</source>
+        <translation>Extrayendo trazas de navegación…</translation>
+    </message>
+    <message>
+        <source>Added {0} track(s) to the map.</source>
+        <translation>Añadida(s) {0} traza(s) al mapa.</translation>
+    </message>
+    <message>
+        <source>No navigation tracks to add.</source>
+        <translation>No hay trazas de navegación que añadir.</translation>
     </message>
     <message>
         <source>CLI</source>
@@ -1027,6 +1067,18 @@ Interfaz PyQt6, desacoplada del núcleo de procesado.</translation>
         <location filename="..\tabs\_base.py" line="317" />
         <source>Image saved: {0}</source>
         <translation>Imagen guardada: {0}</translation>
+    </message>
+    <message>
+        <source>Export failed</source>
+        <translation>Error al exportar</translation>
+    </message>
+    <message>
+        <source>Cannot save “{0}”: the file is open in another program. Close it and try again.</source>
+        <translation>No se puede guardar «{0}»: el archivo está abierto en otro programa. Ciérralo e inténtalo de nuevo.</translation>
+    </message>
+    <message>
+        <source>Cannot save “{0}”: {1}</source>
+        <translation>No se puede guardar «{0}»: {1}</translation>
     </message>
     <message>
         <location filename="..\tabs\_base.py" line="326" />

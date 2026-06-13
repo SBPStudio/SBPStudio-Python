@@ -32,12 +32,14 @@ Wrap core calls in a small lambda/partial to adapt their signatures.
 """
 from __future__ import annotations
 
-import traceback
 from typing import Any, Callable
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from topassuite.core.logger import get_logger
 from topassuite.core.tasks import CancelToken, Cancelled, TopasCoreError
+
+_LOG = get_logger("worker")
 
 # A unit of background work: receives a progress sink and a cancel token,
 # returns any result (delivered via the ``succeeded`` signal).
@@ -81,12 +83,18 @@ class CoreWorker(QThread):
             result = self._job(_progress, self._token)
         except Cancelled:
             # Normal, user-requested stop — not an error.
+            _LOG.debug("Background task cancelled by user.")
             return
         except TopasCoreError as exc:
-            self.failed.emit(type(exc).__name__, str(exc))
+            # Handled/expected error shown to the user — record it for the log.
+            # An exception may carry a friendly ``title`` (e.g. ExportError for a
+            # locked output file); otherwise fall back to the class name.
+            _LOG.error("Background task failed: %s: %s", type(exc).__name__, exc)
+            title = getattr(exc, "title", None) or type(exc).__name__
+            self.failed.emit(title, str(exc))
             return
-        except Exception as exc:  # unexpected: surface type + traceback to stderr
-            traceback.print_exc()
+        except Exception as exc:  # unexpected: log the FULL traceback to app.log
+            _LOG.exception("Unhandled error in background task")
             self.failed.emit("Error", f"{type(exc).__name__}: {exc}")
             return
 

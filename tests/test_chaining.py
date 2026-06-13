@@ -46,12 +46,43 @@ class TestDetectChains:
 
 
 class TestProfileChainConcat:
+    def test_chain_init_is_lazy(self, chain_pair):
+        """A freshly-detected chain must NOT hold a trace matrix (RAM-flat) —
+        only lightweight header-derived metadata, available immediately."""
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch = ProfileChain([sd1, sd2])
+        assert ch.data is None
+        assert ch.clip_p99 is None
+        # n_traces is summed from the stubs, not the (absent) matrix.
+        assert ch.n_traces == sd1.n_traces + sd2.n_traces
+
     def test_data_shape(self, chain_pair):
         path1, path2 = chain_pair
         sd1, sd2 = load_profile(path1), load_profile(path2)
         ch = ProfileChain([sd1, sd2])
+        ch.load_chain_traces()                       # explicit, lazy assembly
         assert ch.data.shape == (sd1.ns, sd1.n_traces + sd2.n_traces)
         assert ch.data.dtype == np.float32
+        assert ch.clip_p99 is not None
+
+    def test_load_chain_traces_from_evicted_stubs(self, chain_pair):
+        """The crash that bit us: constituent profiles were evicted to stubs
+        (data=None). load_chain_traces must re-read them from disk and stitch
+        correctly instead of np.concatenate-ing 0-D Nones."""
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch = ProfileChain([sd1, sd2])
+        # Simulate LRU eviction AFTER the chain was built.
+        sd1.data = sd2.data = None
+        ch.load_chain_traces()
+        assert ch.data.shape == (sd1.ns, sd1.n_traces + sd2.n_traces)
+
+    def test_load_chain_traces_idempotent(self, chain_pair):
+        path1, path2 = chain_pair
+        ch = ProfileChain([load_profile(path1), load_profile(path2)])
+        first = ch.load_chain_traces().data
+        assert ch.load_chain_traces().data is first   # no rebuild on 2nd call
 
     def test_dist_km_continuous(self, chain_pair):
         path1, path2 = chain_pair

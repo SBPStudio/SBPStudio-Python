@@ -122,6 +122,20 @@ class SubTabbedTab(QWidget):
         language_manager.language_changed.connect(self.retranslate_ui)
         self.retranslate_ui()
 
+    # ── Public surface (used by the sidebar 'Add to map' batch loader) ───────
+
+    @property
+    def map_view(self) -> "MapView":
+        """The navigation MapView hosted on this tab's Map sub-tab."""
+        return self._map
+
+    def reveal_map(self) -> None:
+        """Make the Map sub-tab show the live map (not a placeholder) and bring
+        it to front. Used when batch-adding tracks so the result is visible even
+        when no profile is active. Does NOT change the active profile or section."""
+        self.pages[MAP].set_view(self._map)
+        self.subtabs.setCurrentIndex(MAP)
+
     # ── Overridable hooks ───────────────────────────────────────────────────
 
     def empty_message(self) -> str:
@@ -282,16 +296,20 @@ class SubTabbedTab(QWidget):
             from topassuite.viz.render import (
                 build_theme, render_chain_figure, render_profile_figure, save_figure,
             )
-            # Lazy-load safety: profiles are added as header-only stubs and
-            # traces are loaded on selection. If the user triggers an export
-            # before that background load has finished (race condition), load
-            # the traces here on the worker thread so the export never fails.
+            # Lazy-load safety: profiles are header-only stubs and CHAINS assemble
+            # their matrix lazily. If the user triggers an export before that
+            # background load has finished (race) — or before the chain was ever
+            # viewed — load/assemble the traces here on the worker thread so the
+            # export never fails.
             _obj = obj
-            if not is_chain and getattr(_obj, "data", None) is None:
+            if getattr(_obj, "data", None) is None:
                 progress(float("nan"), "Loading traces for export…")
-                _obj = _lp(_obj.path, load_traces=True)
-                if getattr(_obj, "error", None):
-                    raise RuntimeError(f"Cannot load {_obj.name}: {_obj.error}")
+                if is_chain:
+                    _obj.load_chain_traces(cancel=cancel)
+                else:
+                    _obj = _lp(_obj.path, load_traces=True)
+                    if getattr(_obj, "error", None):
+                        raise RuntimeError(f"Cannot load {_obj.name}: {_obj.error}")
             progress(float("nan"), "")
 
             # 1) STATIC geometry: delay alignment on the FULL array first.
@@ -315,31 +333,38 @@ class SubTabbedTab(QWidget):
                 time_align=cfg["time_align"], fix_font_size=5.0,
                 fix_bbox_alpha=cfg["fix_bbox_alpha"], fix_color=cfg["fix_color"],
                 colors=build_theme(theme=cfg["theme"]))
+            # Publication-quality standalone render: the figure size comes purely
+            # from compute_figsize (native trace/sample dimensions + the baseline
+            # scale ratio) and the core matplotlib renderer rasterises it at the
+            # requested DPI. NO screen/viewport coupling — the export is fully
+            # decoupled from the transient on-screen ViewBox.
             render = render_chain_figure if is_chain else render_profile_figure
             fig = render(_obj, data, params, figsize=figsize, dpi=dpi, **render_opts)
-            # Make the seismic DATA AREA have the SAME aspect as the on-screen
-            # view (WYSIWYG scale). Matplotlib decorations (title, labels,
-            # colorbar) take a roughly fixed margin in inches, so we iterate:
-            # keep the data width, set figure height = data_w/aspect + margins,
-            # and re-run tight_layout until the data box converges to `aspect`.
-            if aspect:
-                seis = next((a for a in fig.axes if a.get_images()), None)
-                if seis is not None:
-                    for _ in range(4):
-                        fig.canvas.draw()
-                        pos = seis.get_position()
-                        fw, fh = fig.get_size_inches()
-                        if pos.width <= 0 or pos.height <= 0:
-                            break
-                        data_w = pos.width * fw
-                        margin_v = fh - pos.height * fh   # absolute non-data height
-                        fig.set_size_inches(fw, data_w / aspect + margin_v)
-                        try:
-                            fig.tight_layout(pad=1.2)
-                        except Exception:
-                            pass
-            save_figure(fig, out, dpi=dpi, fmt=fmt, pdf_page=cfg["pdf_page"])
-            fig.clear()
+            cancel.check()        # last chance to abort before the heavy save/raster
+            try:
+                save_figure(fig, out, dpi=dpi, fmt=fmt, pdf_page=cfg["pdf_page"])
+            except OSError as exc:
+                # Most common cause: the target PDF/PNG is open in another app
+                # (Acrobat, image viewer) → Windows locks it (PermissionError).
+                # Surface a clear, actionable message instead of a raw traceback.
+                from pathlib import Path
+                from topassuite.core.tasks import ExportError
+                name = Path(out).name
+                if isinstance(exc, PermissionError):
+                    msg = QCoreApplication.translate(
+                        "SubTabbedTab",
+                        "Cannot save “{0}”: the file is open in another program. "
+                        "Close it and try again.").format(name)
+                else:
+                    detail = getattr(exc, "strerror", None) or str(exc)
+                    msg = QCoreApplication.translate(
+                        "SubTabbedTab",
+                        "Cannot save “{0}”: {1}").format(name, detail)
+                err = ExportError(msg)
+                err.title = QCoreApplication.translate("SubTabbedTab", "Export failed")
+                raise err from exc
+            finally:
+                fig.clear()
             return out
 
         self.tasks.run_task(

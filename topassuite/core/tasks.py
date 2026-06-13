@@ -24,6 +24,12 @@ class CRSError(TopasCoreError):
 class ReprojectionError(TopasCoreError):
     """Raised when a reprojection operation fails (partial output cleaned up)."""
 
+class ExportError(TopasCoreError):
+    """Raised when an export/save fails for a user-actionable reason — e.g. the
+    target file is locked open in another program (PermissionError). Carries an
+    optional ``title`` so the GUI can show a friendly dialog heading instead of
+    the raw class name."""
+
 class Cancelled(TopasCoreError):
     """Raised by CancelToken.check() when cancellation has been requested."""
 

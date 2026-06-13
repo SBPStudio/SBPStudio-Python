@@ -74,3 +74,7 @@ class VisualizerTab(SubTabbedTab):
                                getattr(profile, "detected_crs", None))
         self._map.set_track(mx, my)
         self.preview.set_source(profile)
+        # Lock the view to the chosen aspect ON LOAD (the fit render above set the
+        # full-section geometry). Without this the section loads free-fill and
+        # stretches on zoom until the user touches the Scale spinner.
+        self._seismic.set_aspect(self.controls.aspect(), fit=True)

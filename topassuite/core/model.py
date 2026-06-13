@@ -244,20 +244,23 @@ class ProfileChain:
         self.label = (f"[{len(profiles)} perfiles]  {profiles[0].name} … {profiles[-1].name}"
                       if len(profiles) > 1
                       else f"[1 perfil]  {profiles[0].name}")
-        self._concat()
+        # LAZY by design: the heavy stitched trace matrix is NOT built here.
+        # __init__ relies solely on the lightweight header stubs (always in RAM),
+        # so chain detection stays fast and memory-flat and never collides with
+        # LRU eviction (which may have dropped constituent profiles' .data). The
+        # matrix is assembled on demand by load_chain_traces() when the chain is
+        # actually viewed.
+        self.data: Optional[np.ndarray] = None
+        self.clip_p99: Optional[float] = None
+        self._build_metadata()
 
-    # ── Concatenation ──────────────────────────────────────────────────────
+    # ── Lightweight metadata (header-only; no trace data) ──────────────────
 
-    def _concat(self) -> None:
-        # Seismic data: (ns, total_traces) float32.
-        # Force C-contiguity so downstream ViewBox slicing (the GUI preview
-        # extracts column/row ranges of this stitched array) is a fast memory
-        # view rather than a fragmented strided read. np.concatenate is already
-        # contiguous, so this is a no-op guard — but it makes the layout
-        # contract explicit and survives any future change to the build above.
-        self.data = np.ascontiguousarray(
-            np.concatenate([p.data for p in self.profiles], axis=1))
-
+    def _build_metadata(self) -> None:
+        """Assemble everything derivable from the header stubs alone — geometry,
+        timestamps, distance axis, boundaries, inspector headers. Deliberately
+        touches NO ``.data``, so it is safe even after LRU eviction has reverted
+        constituent profiles to lazy stubs."""
         # Delay recording time — preserved verbatim (NEVER altered)
         self.delays    = np.concatenate([p.delays    for p in self.profiles])
         self.min_delay = float(np.min(self.delays))
@@ -283,6 +286,9 @@ class ProfileChain:
             lab: np.concatenate([p.trace_headers[lab] for p in self.profiles])
             for lab in labels
         }
+        # CRS inherited from the first profile so the map can reproject the chain
+        # track even before the trace matrix is assembled.
+        self.detected_crs = self.profiles[0].detected_crs if self.profiles else None
 
         # Continuous cumulative distance including inter-profile gaps
         segments = []
@@ -306,7 +312,8 @@ class ProfileChain:
         self.ns        = p0.ns
         self.dur_ms    = p0.dur_ms
         self.delay_ms  = p0.delay_ms
-        self.n_traces  = self.data.shape[1]
+        # Total trace count summed from the stubs (NOT data.shape — data is lazy).
+        self.n_traces  = int(sum(p.n_traces for p in self.profiles))
 
         # Boundary positions (km along chain) — start of each non-first profile.
         # NOTE: uses per-profile total_km cumulative sum, NOT dist_km directly.
@@ -316,7 +323,43 @@ class ProfileChain:
             d += p.total_km
             self.boundaries_km.append(d)
 
+    # ── Lazy trace assembly (on demand, from disk if evicted) ──────────────
+
+    def load_chain_traces(self, cancel=None) -> "ProfileChain":
+        """Assemble the stitched ``(ns, total_traces)`` trace matrix on demand.
+
+        Idempotent: a no-op once ``self.data`` is populated. Each constituent
+        profile's traces are sourced from RAM when still resident, otherwise
+        re-read from disk via ``load_profile`` — so this works correctly even
+        after LRU eviction reverted them to header-only stubs. The per-profile
+        matrices are transient (only the single stitched chain matrix is kept),
+        keeping the memory footprint flat.
+
+        ``cancel`` (optional) is a CancelToken whose ``check()`` is polled per
+        profile so a long assembly can be aborted cooperatively.
+        """
+        if self.data is not None:
+            return self
+        from .io_segy import load_profile
+        mats = []
+        for p in self.profiles:
+            if cancel is not None:
+                cancel.check()
+            data = getattr(p, "data", None)
+            if data is None:                       # evicted / never loaded → disk
+                loaded = load_profile(p.path, load_traces=True)
+                if loaded.error:
+                    raise ValueError(f"Cannot load chain segment "
+                                     f"{p.name}: {loaded.error}")
+                data = loaded.data
+            mats.append(data)
+        # Force C-contiguity so downstream ViewBox slicing (the GUI preview
+        # extracts column/row ranges of this stitched array) is a fast memory
+        # view rather than a fragmented strided read.
+        self.data = np.ascontiguousarray(np.concatenate(mats, axis=1))
         self.clip_p99 = float(np.percentile(np.abs(self.data), 99))
+        self.n_traces = self.data.shape[1]
+        return self
 
     # ── Haversine distance helper ──────────────────────────────────────────
 

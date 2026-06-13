@@ -36,3 +36,6 @@ TopasSUITE_qt.py
 # OS
 .DS_Store
 Thumbs.db
+
+#Crash report log
+app.log
