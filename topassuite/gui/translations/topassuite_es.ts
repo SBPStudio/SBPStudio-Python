@@ -387,6 +387,10 @@ Interfaz PyQt6, desacoplada del núcleo de procesado.</translation>
         <translation>{0} cadena(s) importada(s).</translation>
     </message>
     <message>
+        <source>Export selected in batch…</source>
+        <translation>Exportar selección por lotes…</translation>
+    </message>
+    <message>
         <source>CLI</source>
         <translation>CLI</translation>
     </message>
@@ -1087,6 +1091,22 @@ Interfaz PyQt6, desacoplada del núcleo de procesado.</translation>
         <location filename="..\tabs\_base.py" line="317" />
         <source>Image saved: {0}</source>
         <translation>Imagen guardada: {0}</translation>
+    </message>
+    <message>
+        <source>Batch export…</source>
+        <translation>Exportación por lotes…</translation>
+    </message>
+    <message>
+        <source>Exporting {0}…</source>
+        <translation>Exportando {0}…</translation>
+    </message>
+    <message>
+        <source>Batch export complete: {0} file(s) saved.</source>
+        <translation>Exportación por lotes completa: {0} archivo(s) guardado(s).</translation>
+    </message>
+    <message>
+        <source>Batch export: {0} saved, {1} failed.</source>
+        <translation>Exportación por lotes: {0} guardado(s), {1} con error.</translation>
     </message>
     <message>
         <source>Export failed</source>

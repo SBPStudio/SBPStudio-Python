@@ -25,7 +25,7 @@ from ..components import (
 from ..dsp import DSPContext, PreviewController
 from ..i18n import language_manager
 from ..state import AppState
-from ._render import compute_figsize
+from ._render import compute_figsize, effective_export_dpi
 
 # Sub-tab indices.
 PROFILE, MAP, SPECTRUM, HEADERS = range(4)
@@ -52,6 +52,86 @@ class _Page(QStackedWidget):
     def show_placeholder(self, text: str) -> None:
         self.placeholder.set_text(text)
         self.setCurrentWidget(self.placeholder)
+
+
+def _batch_output_path(src_path: str, fmt: str, used: set) -> "Path":
+    """Folder-named export path for a source SEG-Y file: ``<dir>/<dir>.<fmt>``.
+
+    e.g. ``Z:/data/Line_01/1.sgy`` → ``Z:/data/Line_01/Line_01.pdf``. If that path
+    was already chosen in this batch (two items share a folder) it is de-duped
+    with the file stem so nothing is silently overwritten. Returns a ``Path``; the
+    caller adds ``str(path)`` to ``used``.
+    """
+    from pathlib import Path
+    src_dir = Path(src_path).parent
+    out = src_dir / f"{src_dir.name}.{fmt}"
+    if str(out) in used:
+        out = src_dir / f"{src_dir.name}_{Path(src_path).stem}.{fmt}"
+    return out
+
+
+def _render_export_figure(obj, cfg, params, node_cfg, aspect, align_enabled,
+                          is_chain, cancel):
+    """Shared per-item export render — used by BOTH the single export and every
+    batch item so their quality can never drift.
+
+    Runs the FULL-resolution DSP pipeline (static delay-alignment + dynamic nodes)
+    on ``obj.data`` (the 100 % native matrix — never the live view's decimated
+    ``_arr``), then renders to a Matplotlib Figure at a DPI floored by
+    ``effective_export_dpi`` so the embedded raster is never decimated, then
+    applies the WYSIWYG aspect fit. Returns ``(fig, render_dpi)``; the caller
+    saves and closes the figure.
+    """
+    from topassuite.core import apply_delay_alignment
+    from topassuite.gui.dsp import DSPContext, make_node
+    from topassuite.viz.render import (
+        build_theme, render_chain_figure, render_profile_figure,
+    )
+    # 1) STATIC geometry: delay alignment on the FULL array first.
+    data = obj.data.copy()
+    if align_enabled and getattr(obj, "delays", None) is not None:
+        data = apply_delay_alignment(
+            data, obj.delays, obj.min_delay, obj.dt_us,
+            fill_value=params["fill_value"])
+    # 2) Dynamic DSP node pipeline over the FULL-resolution array.
+    ctx = DSPContext.from_source(obj)
+    for key, npar in node_cfg:
+        cancel.check()
+        data = make_node(key, npar).apply(data, ctx)
+    cancel.check()
+    # Figure size from native dims; DPI floored so target ≥ (n_traces, ns) → the
+    # core never decimates the matrix (the historical pristine-CLI fidelity).
+    figsize = compute_figsize(obj, int(cfg["dpi"]), None, aspect, cfg["velocity"])
+    render_dpi = effective_export_dpi(figsize, data.shape, int(cfg["dpi"]))
+    render_opts = dict(
+        x_tick_km=cfg["x_tick"], t_tick_ms=cfg["t_tick"], show_grid=cfg["grid"],
+        title_override=None, clip_lo=0.0, time_tick_min=cfg["time_ticks"],
+        margin_top_ms=cfg["margin_top"], margin_bottom_ms=cfg["margin_bottom"],
+        time_fmt=cfg["time_fmt"], time_font_size=cfg["time_font_size"],
+        time_align=cfg["time_align"], fix_font_size=5.0,
+        fix_bbox_alpha=cfg["fix_bbox_alpha"], fix_color=cfg["fix_color"],
+        colors=build_theme(theme=cfg["theme"]))
+    render = render_chain_figure if is_chain else render_profile_figure
+    fig = render(obj, data, params, figsize=figsize, dpi=render_dpi, **render_opts)
+    # WYSIWYG aspect fit: grow the figure so the DATA box hits `aspect` at full
+    # size (decorations take a fixed inch margin) — restores the data-area pixels.
+    if aspect:
+        seis = next((a for a in fig.axes if a.get_images()), None)
+        if seis is not None:
+            for _ in range(4):
+                fig.canvas.draw()
+                pos = seis.get_position()
+                fw, fh = fig.get_size_inches()
+                if pos.width <= 0 or pos.height <= 0:
+                    break
+                data_w = pos.width * fw
+                margin_v = fh - pos.height * fh   # absolute non-data height
+                fig.set_size_inches(fw, data_w / aspect + margin_v)
+                try:
+                    fig.tight_layout(pad=1.2)
+                except Exception:
+                    pass
+    return fig, render_dpi
 
 
 class SubTabbedTab(QWidget):
@@ -268,7 +348,6 @@ class SubTabbedTab(QWidget):
             return
 
         is_chain = self._is_chain()
-        dpi = int(cfg["dpi"])
         aspect = self.controls.aspect()  # scale == the visualizer's aspect ratio
         params = dict(self.controls.display_params())  # presentation only (cmap/clip/fix)
         params["clip_lo"] = 0.0
@@ -291,16 +370,11 @@ class SubTabbedTab(QWidget):
         params["align"] = align_enabled
 
         def job(progress, cancel) -> str:
-            from topassuite.core import load_profile as _lp, apply_delay_alignment
-            from topassuite.gui.dsp import DSPContext, make_node
-            from topassuite.viz.render import (
-                build_theme, render_chain_figure, render_profile_figure, save_figure,
-            )
+            from topassuite.core import load_profile as _lp
+            from topassuite.viz.render import save_figure
             # Lazy-load safety: profiles are header-only stubs and CHAINS assemble
-            # their matrix lazily. If the user triggers an export before that
-            # background load has finished (race) — or before the chain was ever
-            # viewed — load/assemble the traces here on the worker thread so the
-            # export never fails.
+            # their matrix lazily. Load/assemble JIT on the worker thread so the
+            # export never fails (race, or chain never viewed).
             _obj = obj
             if getattr(_obj, "data", None) is None:
                 progress(float("nan"), "Loading traces for export…")
@@ -311,60 +385,12 @@ class SubTabbedTab(QWidget):
                     if getattr(_obj, "error", None):
                         raise RuntimeError(f"Cannot load {_obj.name}: {_obj.error}")
             progress(float("nan"), "")
-
-            # 1) STATIC geometry: delay alignment on the FULL array first.
-            data = _obj.data.copy()
-            if align_enabled and getattr(_obj, "delays", None) is not None:
-                data = apply_delay_alignment(
-                    data, _obj.delays, _obj.min_delay, _obj.dt_us,
-                    fill_value=params["fill_value"])
-            # 2) Dynamic DSP node pipeline over the FULL-resolution array.
-            ctx = DSPContext.from_source(_obj)
-            for key, npar in node_cfg:
-                cancel.check()
-                data = make_node(key, npar).apply(data, ctx)
-            cancel.check()
-            figsize = compute_figsize(_obj, dpi, None, aspect, cfg["velocity"])
-            render_opts = dict(
-                x_tick_km=cfg["x_tick"], t_tick_ms=cfg["t_tick"], show_grid=cfg["grid"],
-                title_override=None, clip_lo=0.0, time_tick_min=cfg["time_ticks"],
-                margin_top_ms=cfg["margin_top"], margin_bottom_ms=cfg["margin_bottom"],
-                time_fmt=cfg["time_fmt"], time_font_size=cfg["time_font_size"],
-                time_align=cfg["time_align"], fix_font_size=5.0,
-                fix_bbox_alpha=cfg["fix_bbox_alpha"], fix_color=cfg["fix_color"],
-                colors=build_theme(theme=cfg["theme"]))
-            render = render_chain_figure if is_chain else render_profile_figure
-            fig = render(_obj, data, params, figsize=figsize, dpi=dpi, **render_opts)
-            # Make the seismic DATA AREA have the SAME aspect as the on-screen
-            # view (WYSIWYG scale). Matplotlib decorations (title, labels,
-            # colorbar) take a roughly fixed margin in inches, so we iterate:
-            # keep the data width, set figure height = data_w/aspect + margins,
-            # and re-run tight_layout until the data box converges to `aspect`.
-            # RESTORED bit-for-bit from gui-core-filters: this loop is what gives
-            # the export its full-resolution, publication-quality rasterisation.
-            # compute_figsize sizes the WHOLE figure to w/aspect, but the fixed
-            # title/colorbar/label margins then squeeze the DATA axes far below
-            # that — few inches → few pixels at the target DPI → blurry. The loop
-            # measures the decoration margin and re-sizes so the DATA BOX itself
-            # hits `aspect` at full size, restoring the data area's pixel count.
-            if aspect:
-                seis = next((a for a in fig.axes if a.get_images()), None)
-                if seis is not None:
-                    for _ in range(4):
-                        fig.canvas.draw()
-                        pos = seis.get_position()
-                        fw, fh = fig.get_size_inches()
-                        if pos.width <= 0 or pos.height <= 0:
-                            break
-                        data_w = pos.width * fw
-                        margin_v = fh - pos.height * fh   # absolute non-data height
-                        fig.set_size_inches(fw, data_w / aspect + margin_v)
-                        try:
-                            fig.tight_layout(pad=1.2)
-                        except Exception:
-                            pass
+            # Shared render pipeline (identical to every batch item): full-res DSP
+            # + decimation-free DPI floor + WYSIWYG aspect fit.
+            fig, render_dpi = _render_export_figure(
+                _obj, cfg, params, node_cfg, aspect, align_enabled, is_chain, cancel)
             try:
-                save_figure(fig, out, dpi=dpi, fmt=fmt, pdf_page=cfg["pdf_page"])
+                save_figure(fig, out, dpi=render_dpi, fmt=fmt, pdf_page=cfg["pdf_page"])
             except OSError as exc:
                 # Most common cause: the target PDF/PNG is open in another app
                 # (Acrobat, image viewer) → Windows locks it (PermissionError).
@@ -397,6 +423,112 @@ class SubTabbedTab(QWidget):
         from pathlib import Path
         self.tasks.notify(QCoreApplication.translate(
             "SubTabbedTab", "Image saved: {0}").format(Path(out).name))
+
+    # ── Batch export (many profiles / chains in one background pass) ──────────
+
+    def export_batch(self, items: list, cfg: dict) -> None:
+        """Export every item in *items* to its own source folder, in ONE worker.
+
+        Inherits THIS tab's current DSP/filter settings (controls + pipeline) and
+        applies them uniformly to all items, via the SAME render pipeline as the
+        single export (``_render_export_figure``) — so batch quality is pristine
+        and identical. Each output lands in the item's source directory, named
+        after that folder (``<folder>/<folder>.<fmt>``). Memory-safe: heavy data is
+        loaded JIT and released after each item; the figure is closed every step.
+        """
+        is_chain = self._is_chain()
+        fmt = cfg["format"]
+        # Snapshot the side-panel DSP/presentation state on the GUI thread (Qt
+        # widgets are not thread-safe) — applied uniformly to every batch item.
+        aspect = self.controls.aspect()
+        params = dict(self.controls.display_params())
+        params["clip_lo"] = 0.0
+        params["fill_value"] = 0.0 if cfg["fill_zero"] else float("nan")
+        params["draw_file_boundaries"] = bool(cfg["draw_file_boundaries"])
+        node_cfg = [(n.KEY, dict(n.params)) for n in self.pipeline_panel.nodes()]
+        align_enabled = self.controls.align_enabled()
+        params["align"] = align_enabled
+
+        valid = [o for o in items
+                 if o is not None and not getattr(o, "error", None)]
+        if not valid:
+            self.tasks.notify(QCoreApplication.translate(
+                "SubTabbedTab", "Select an item first."))
+            return
+
+        def job(progress, cancel) -> tuple:
+            import matplotlib.pyplot as plt
+            from topassuite.core import load_profile as _lp
+            from topassuite.core.tasks import Cancelled
+            from topassuite.viz.render import save_figure
+
+            n = len(valid)
+            saved: list = []
+            failed: list = []
+            used: set = set()
+            for i, obj in enumerate(valid):
+                cancel.check()
+                name = getattr(obj, "label", None) or getattr(obj, "name", "item")
+                progress(i / n, QCoreApplication.translate(
+                    "SubTabbedTab", "Exporting {0}…").format(name))
+
+                # Source dir → folder-named output, de-duped so two items from the
+                # same folder never silently overwrite each other.
+                src_path = obj.profiles[0].path if is_chain else obj.path
+                out = _batch_output_path(src_path, fmt, used)
+                used.add(str(out))
+
+                was_loaded = getattr(obj, "data", None) is not None
+                render_obj = obj
+                fig = None
+                try:
+                    if not was_loaded:                       # JIT lazy-load
+                        if is_chain:
+                            obj.load_chain_traces(cancel=cancel)
+                        else:
+                            render_obj = _lp(obj.path, load_traces=True)
+                            if getattr(render_obj, "error", None):
+                                failed.append((name, render_obj.error))
+                                continue
+                    fig, render_dpi = _render_export_figure(
+                        render_obj, cfg, params, node_cfg, aspect,
+                        align_enabled, is_chain, cancel)
+                    save_figure(fig, str(out), dpi=render_dpi, fmt=fmt,
+                                pdf_page=cfg["pdf_page"])
+                    saved.append(str(out))
+                except Cancelled:
+                    raise                                    # abort the whole batch
+                except Exception as exc:                     # one bad item ≠ kill batch
+                    failed.append((name, str(exc)))
+                finally:
+                    if fig is not None:
+                        # CRITICAL: free the figure every step. render.py builds
+                        # UNMANAGED Figure() objects, so plt.close alone is a no-op
+                        # for them — fig.clear() releases the heavy imshow raster.
+                        fig.clear()
+                        plt.close(fig)
+                    # Release JIT-loaded heavy data → batch stays RAM-flat. Chains
+                    # mutate in place, so revert to a stub; transient profiles GC.
+                    if not was_loaded and is_chain:
+                        obj.data = None
+                        obj.clip_p99 = None
+            progress(1.0, "")
+            return saved, failed
+
+        self.tasks.run_task(
+            job, self._on_batch_exported,
+            QCoreApplication.translate("SubTabbedTab", "Batch export…"))
+
+    def _on_batch_exported(self, result: tuple) -> None:
+        saved, failed = result
+        if failed:
+            self.tasks.notify(QCoreApplication.translate(
+                "SubTabbedTab", "Batch export: {0} saved, {1} failed.").format(
+                    len(saved), len(failed)))
+        else:
+            self.tasks.notify(QCoreApplication.translate(
+                "SubTabbedTab", "Batch export complete: {0} file(s) saved.").format(
+                    len(saved)))
 
     def _on_export_fix_requested(self) -> None:
         obj = self._active_object()

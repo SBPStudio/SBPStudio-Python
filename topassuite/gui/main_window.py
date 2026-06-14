@@ -22,9 +22,9 @@ from typing import List
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QActionGroup
 from PyQt6.QtWidgets import (
-    QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QSplitter,
-    QStatusBar, QTabWidget, QVBoxLayout, QWidget,
+    QDialog, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QListWidget, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
+    QSplitter, QStatusBar, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .i18n import LANGUAGE_NAMES, language_manager
@@ -239,6 +239,8 @@ class MainWindow(QMainWindow):
             QListWidget.SelectionMode.ExtendedSelection)
         self.prof_list.currentRowChanged.connect(self._on_profile_row_changed)
         self.prof_list.itemSelectionChanged.connect(self._update_map_buttons)
+        self.prof_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.prof_list.customContextMenuRequested.connect(self._prof_context_menu)
         pl.addWidget(self.prof_list, 1)
 
         row = QHBoxLayout()
@@ -302,6 +304,8 @@ class MainWindow(QMainWindow):
             QListWidget.SelectionMode.ExtendedSelection)
         self.chain_list.currentRowChanged.connect(self._on_chain_row_changed)
         self.chain_list.itemSelectionChanged.connect(self._update_map_buttons)
+        self.chain_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.chain_list.customContextMenuRequested.connect(self._chain_context_menu)
         cl.addWidget(self.chain_list, 1)
 
         self._btn_chain_to_map = QPushButton()
@@ -569,6 +573,33 @@ class MainWindow(QMainWindow):
         selection. Cheap — runs on every selection change."""
         self._btn_prof_to_map.setEnabled(bool(self._selected_profiles()))
         self._btn_chain_to_map.setEnabled(bool(self._selected_chains()))
+
+    # ── Batch export (right-click → 'Export selected in batch…') ──────────────
+    def _prof_context_menu(self, pos) -> None:
+        self._list_context_menu(self.prof_list, self._selected_profiles(),
+                                self.tab_visualizer, pos)
+
+    def _chain_context_menu(self, pos) -> None:
+        self._list_context_menu(self.chain_list, self._selected_chains(),
+                                self.tab_chains, pos)
+
+    def _list_context_menu(self, widget, items: list, tab, pos) -> None:
+        """Show the batch-export action for the current multi-selection."""
+        if not items:
+            return
+        menu = QMenu(self)
+        act_export = menu.addAction(self.tr("Export selected in batch…"))
+        if menu.exec(widget.mapToGlobal(pos)) is act_export:
+            self._batch_export(items, tab)
+
+    def _batch_export(self, items: list, tab) -> None:
+        """Open the export options ONCE, then hand the whole selection to the
+        relevant tab's worker-backed batch exporter (inherits its DSP settings)."""
+        from .components import ExportDialog
+        dlg = ExportDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        tab.export_batch(items, dlg.config())
 
     def _add_profiles_to_map(self) -> None:
         self._tracks_to_map(self._selected_profiles(), self.tab_visualizer)
