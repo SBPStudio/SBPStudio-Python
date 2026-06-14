@@ -19,9 +19,14 @@ Export   : ``_base.SubTabbedTab`` calls ``render_profile/chain_figure``
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Optional, Sequence
 
 import numpy as np
+
+# Hard cap on the export render DPI floor — keeps a pathological tiny-figure /
+# huge-matrix export from producing an enormous embedded raster.
+EXPORT_DPI_CEILING = 2400
 
 # Interactive-view resolution caps. A screen shows at most a few thousand
 # pixels, so colormapping a 100k-trace matrix at full resolution is wasted
@@ -78,6 +83,41 @@ def compute_figsize(source: Any, dpi: int, x_scale: Optional[float],
     else:
         h = figheight
     return (w, h)
+
+
+def effective_export_dpi(figsize: tuple, data_shape: tuple, requested_dpi: int,
+                         ceiling: int = EXPORT_DPI_CEILING) -> int:
+    """Render DPI that guarantees the embedded raster carries the FULL native
+    sample grid — no decimation in the core colouriser.
+
+    The core renders the matrix to ``target = figsize × dpi`` before ``imshow``.
+    If ``target`` is smaller than the data's native ``(n_traces, ns)`` the matrix
+    is decimated → soft/blurry PDF. We raise the DPI just enough that
+    ``figsize × dpi >= (n_traces, ns)`` in BOTH axes, with ``requested_dpi`` as the
+    floor (never lower than what the user picked) and ``ceiling`` as the cap.
+
+    This lives in the GUI export wiring only; it does NOT change ``figsize``
+    (the aspect/page proportions) nor the core renderer, and it never touches the
+    CLI path (which computes its own figsize/DPI).
+
+    Parameters
+    ----------
+    figsize       : (width_in, height_in) of the export figure
+    data_shape    : the FULL native matrix shape ``(ns, n_traces)``
+    requested_dpi : the user/dialog-selected DPI (the floor)
+    ceiling       : upper bound to keep the embedded raster sane
+
+    Returns
+    -------
+    int DPI in ``[requested_dpi, ceiling]``.
+    """
+    src_h, src_w = int(data_shape[0]), int(data_shape[1])     # (ns, n_traces)
+    w_in, h_in = float(figsize[0]), float(figsize[1])
+    req = int(requested_dpi)
+    if w_in <= 0 or h_in <= 0:
+        return req
+    need = max(src_w / w_in, src_h / h_in)        # dpi to reach native in both axes
+    return int(min(max(req, math.ceil(need)), ceiling))
 
 
 def compute_section(obj: Any, data: np.ndarray, params: dict,
