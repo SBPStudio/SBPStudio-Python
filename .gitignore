@@ -6,8 +6,12 @@ __pycache__/
 .ruff_cache/
 
 # Generated demo data / outputs
+examples/_demo_in/
 examples/_demo_out/
 examples/_real_out/
+
+# Proprietary SEG-Y survey data — NEVER commit (provided by the authorised user)
+examples/_real_in/
 
 # Generated SEG-Y and images
 *_REPROY*

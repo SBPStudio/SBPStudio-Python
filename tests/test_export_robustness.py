@@ -22,7 +22,7 @@ def _source(n_traces=1347, ns=2048, dt_us=250, total_km=12.5):
 
 class TestComputeFigsizeDataDriven:
     def _figsize(self, **kw):
-        from topassuite.gui.tabs._render import compute_figsize
+        from sbp_studio.gui.tabs._render import compute_figsize
         return compute_figsize(**kw)
 
     def test_width_from_native_traces(self):
@@ -49,7 +49,7 @@ class TestComputeFigsizeDataDriven:
 
 class TestExportError:
     def test_is_core_error_with_title(self):
-        from topassuite.core.tasks import ExportError, TopasCoreError
+        from sbp_studio.core.tasks import ExportError, TopasCoreError
         err = ExportError("Cannot save “x.pdf”: the file is open in another program.")
         err.title = "Export failed"
         assert isinstance(err, TopasCoreError)
@@ -57,10 +57,10 @@ class TestExportError:
         assert (getattr(err, "title", None) or type(err).__name__) == "Export failed"
 
     def test_plain_core_error_falls_back_to_class_name(self):
-        from topassuite.core.tasks import CRSError
+        from sbp_studio.core.tasks import CRSError
         err = CRSError("bad crs")
         assert (getattr(err, "title", None) or type(err).__name__) == "CRSError"
 
     def test_exported_from_core(self):
-        from topassuite.core.tasks import ExportError
+        from sbp_studio.core.tasks import ExportError
         assert ExportError is not None

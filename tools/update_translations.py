@@ -5,13 +5,13 @@ update_translations.py — Regenerate and (optionally) compile the GUI translati
 Workflow
 --------
 1. ``pylupdate6`` scans the GUI source for ``tr()`` / ``translate()`` calls and
-   MERGES them into each ``topassuite_<lang>.ts`` file — existing translations
+   MERGES them into each ``sbp_studio_<lang>.ts`` file — existing translations
    are preserved, new strings are added as ``unfinished``, removed ones marked
    ``vanished``. Edit the ``.ts`` files (Qt Linguist or by hand) to translate.
 
 2. If ``lrelease`` is on PATH, each ``.ts`` is compiled to a ``.qm``. The app
    loads the ``.qm`` automatically when present; otherwise it parses the ``.ts``
-   directly (see topassuite/gui/i18n.py), so compilation is optional.
+   directly (see sbp_studio/gui/i18n.py), so compilation is optional.
 
 English is the base/source language and has no ``.ts`` file.
 
@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-GUI = REPO / "topassuite" / "gui"
+GUI = REPO / "sbp_studio" / "gui"
 TRANSLATIONS = GUI / "translations"
 LANGS = ["es"]  # languages with a .ts file (English is the source language)
 
@@ -44,15 +44,15 @@ def main() -> int:
         return 1
 
     for lang in LANGS:
-        ts = TRANSLATIONS / f"topassuite_{lang}.ts"
+        ts = TRANSLATIONS / f"sbp_studio_{lang}.ts"
         print(f"[pylupdate6] -> {ts.name}")
         subprocess.run([pylupdate, *_sources(), "-ts", str(ts)], check=True)
 
     lrelease = shutil.which("lrelease") or shutil.which("lrelease-qt6")
     if lrelease:
         for lang in LANGS:
-            ts = TRANSLATIONS / f"topassuite_{lang}.ts"
-            qm = TRANSLATIONS / f"topassuite_{lang}.qm"
+            ts = TRANSLATIONS / f"sbp_studio_{lang}.ts"
+            qm = TRANSLATIONS / f"sbp_studio_{lang}.qm"
             print(f"[lrelease] {ts.name} -> {qm.name}")
             subprocess.run([lrelease, str(ts), "-qm", str(qm)], check=True)
     else:

@@ -6,7 +6,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from topassuite.core import (
+from sbp_studio.core import (
     load_profile, process_profile_data, apply_filter_preset,
     apply_predictive_decon, time_window,
 )

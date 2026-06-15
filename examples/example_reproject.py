@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from topassuite.core import (
+from sbp_studio.core import (
     load_profile, detect_chains,
     reproject_one, reproject_chain,
 )

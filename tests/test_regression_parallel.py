@@ -26,15 +26,15 @@ import numpy as np
 import pytest
 import segyio
 
-from topassuite.core.processing import (
+from sbp_studio.core.processing import (
     _hilbert_parallel, _ref_agc, _parallel_apply,
 )
-from topassuite.core.io_segy import (
+from sbp_studio.core.io_segy import (
     _ref_reproject_trace, _opt_reproject_coords_bulk,
     _build_transformer, _safe_coord,
     join_profiles, reproject_chain, load_profile,
 )
-from topassuite.core import detect_chains
+from sbp_studio.core import detect_chains
 
 
 # ── Tolerances (documented) ────────────────────────────────────────────────────
@@ -343,7 +343,7 @@ class TestOutScFix:
     """
 
     def test_geographic_scalar_is_minus_10000(self, simple_segy, tmp_path):
-        from topassuite.core.io_segy import reproject_one as _ro
+        from sbp_studio.core.io_segy import reproject_one as _ro
         shutil.copy(simple_segy, str(tmp_path / "src.sgy"))
         sd  = load_profile(str(tmp_path / "src.sgy"))
         out = _ro(sd, "EPSG:4326", "EPSG:4258")   # geographic → geographic
@@ -355,7 +355,7 @@ class TestOutScFix:
         os.remove(out)
 
     def test_projected_scalar_unchanged(self, simple_segy, tmp_path):
-        from topassuite.core.io_segy import reproject_one as _ro
+        from sbp_studio.core.io_segy import reproject_one as _ro
         shutil.copy(simple_segy, str(tmp_path / "src.sgy"))
         sd  = load_profile(str(tmp_path / "src.sgy"))
         out = _ro(sd, "EPSG:4326", "EPSG:32630")   # geographic → projected

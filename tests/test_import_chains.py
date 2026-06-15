@@ -15,8 +15,8 @@ import os
 import pytest
 
 from tests.make_synthetic_segy import make_synthetic_segy
-from topassuite.core import import_chains_from_directory
-from topassuite.core.tasks import CancelToken, Cancelled
+from sbp_studio.core import import_chains_from_directory
+from sbp_studio.core.tasks import CancelToken, Cancelled
 
 
 def _campaign(tmp_path):

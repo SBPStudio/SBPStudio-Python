@@ -17,7 +17,7 @@ from __future__ import annotations
 from PyQt6.QtWidgets import QApplication
 
 from tests.make_synthetic_segy import make_synthetic_segy
-from topassuite.core import load_profile
+from sbp_studio.core import load_profile
 
 
 def _qt():
@@ -44,7 +44,7 @@ def _make_stubs(tmp_path, n: int) -> list:
 
 def test_add_ten_keeps_ram_flat_and_section_untouched(tmp_path):
     _qt()
-    from topassuite.gui.main_window import MainWindow
+    from sbp_studio.gui.main_window import MainWindow
     win = MainWindow()
     stubs = _make_stubs(tmp_path, 10)
     for s in stubs:
@@ -73,7 +73,7 @@ def test_add_ten_keeps_ram_flat_and_section_untouched(tmp_path):
 
 def test_multi_selection_does_not_load_a_profile(tmp_path):
     _qt()
-    from topassuite.gui.main_window import MainWindow
+    from sbp_studio.gui.main_window import MainWindow
     win = MainWindow()
     for s in _make_stubs(tmp_path, 3):
         win.state.add_profile(s)
@@ -89,7 +89,7 @@ def test_multi_selection_does_not_load_a_profile(tmp_path):
 
 def test_add_button_enabled_only_with_valid_selection(tmp_path):
     _qt()
-    from topassuite.gui.main_window import MainWindow
+    from sbp_studio.gui.main_window import MainWindow
     win = MainWindow()
     assert win._btn_prof_to_map.isEnabled() is False     # nothing selected
     for s in _make_stubs(tmp_path, 2):
@@ -107,7 +107,7 @@ def test_add_button_enabled_only_with_valid_selection(tmp_path):
 
 def test_errored_profiles_are_skipped(tmp_path):
     _qt()
-    from topassuite.gui.main_window import MainWindow
+    from sbp_studio.gui.main_window import MainWindow
     win = MainWindow()
     good = _make_stubs(tmp_path, 1)[0]
     bad = load_profile(str(tmp_path / "missing.sgy"), load_traces=False)  # .error set

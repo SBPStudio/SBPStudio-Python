@@ -20,8 +20,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from topassuite.core import apply_agc
-from topassuite.gui.dsp import (
+from sbp_studio.core import apply_agc
+from sbp_studio.gui.dsp import (
     AGCNode, DSPContext, Pipeline, extract_visible_window,
 )
 
@@ -325,35 +325,35 @@ class TestNodeMigration:
         return as_matrix(synthetic_trace(ns=400, noise_std=0.05), n_traces=80)
 
     def _ctx(self, delays=None):
-        from topassuite.gui.dsp import DSPContext
+        from sbp_studio.gui.dsp import DSPContext
         return DSPContext(dt_us=self.DT_US, ns=400, n_traces=80,
                           delays=delays,
                           min_delay=float(delays.min()) if delays is not None else 0.0)
 
     def test_bandpass_node_matches_core(self):
-        from topassuite.gui.dsp import BandpassNode
-        from topassuite.core import apply_bandpass
+        from sbp_studio.gui.dsp import BandpassNode
+        from sbp_studio.core import apply_bandpass
         d = self._data()
         out = BandpassNode({"flo": 600, "fhi": 5000}).apply(d, self._ctx())
         np.testing.assert_array_equal(out, apply_bandpass(d, 600, 5000, self.DT_US))
 
     def test_tvg_node_matches_core(self):
-        from topassuite.gui.dsp import TVGNode
-        from topassuite.core import apply_tvg
+        from sbp_studio.gui.dsp import TVGNode
+        from sbp_studio.core import apply_tvg
         d = self._data()
         out = TVGNode({"alpha": 12.0}).apply(d, self._ctx())
         np.testing.assert_array_equal(out, apply_tvg(d, 12.0, self.DT_US))
 
     def test_decon_node_matches_core(self):
-        from topassuite.gui.dsp import PredictiveDeconNode
-        from topassuite.core import apply_predictive_decon
+        from sbp_studio.gui.dsp import PredictiveDeconNode
+        from sbp_studio.core import apply_predictive_decon
         d = self._data()
         out = PredictiveDeconNode({"op_ms": 12, "gap_ms": 2, "white_pct": 1.0}).apply(d, self._ctx())
         np.testing.assert_array_equal(out, apply_predictive_decon(d, self.DT_US, 12, 2, 1.0))
 
     def test_preset_envelope_node_matches_core(self):
-        from topassuite.gui.dsp import PresetNode
-        from topassuite.core import apply_filter_preset
+        from sbp_studio.gui.dsp import PresetNode
+        from sbp_studio.core import apply_filter_preset
         d = self._data()
         out = PresetNode({"preset": "envelope"}).apply(d, self._ctx())
         np.testing.assert_array_equal(out, apply_filter_preset(d, "envelope", self.DT_US))
@@ -361,8 +361,8 @@ class TestNodeMigration:
     def test_delay_alignment_is_static_not_a_node(self):
         """Delay alignment is a STATIC geometry correction — it must NOT be a
         movable pipeline node (the controller/export apply core directly)."""
-        from topassuite.core import apply_delay_alignment
-        from topassuite.gui.dsp import NODE_REGISTRY
+        from sbp_studio.core import apply_delay_alignment
+        from sbp_studio.gui.dsp import NODE_REGISTRY
         assert "align" not in {c.KEY for c in NODE_REGISTRY}
         # The core function still exists and grows the matrix correctly.
         delays = np.random.default_rng(1).integers(20, 60, 80).astype(np.float32)
@@ -373,8 +373,8 @@ class TestNodeMigration:
 
     def test_full_pipeline_in_order_matches_standalone_chain(self):
         """A mixed node pipeline applied in order == the standalone core chain."""
-        from topassuite.gui.dsp import Pipeline, BandpassNode, TVGNode, AGCNode
-        from topassuite.core import apply_bandpass, apply_tvg, apply_agc
+        from sbp_studio.gui.dsp import Pipeline, BandpassNode, TVGNode, AGCNode
+        from sbp_studio.core import apply_bandpass, apply_tvg, apply_agc
         d = self._data()
         ctx = self._ctx()
         pipe = Pipeline([BandpassNode({"flo": 500, "fhi": 6000}),
@@ -387,7 +387,7 @@ class TestNodeMigration:
 
     def test_registry_has_filter_nodes_only(self):
         """Registry holds the reorderable DSP FILTERS only — NOT static geometry."""
-        from topassuite.gui.dsp import NODE_REGISTRY
+        from sbp_studio.gui.dsp import NODE_REGISTRY
         keys = {c.KEY for c in NODE_REGISTRY}
         assert keys == {"swell", "water_mute", "decon", "bandpass", "preset", "tvg", "agc"}
         assert "align" not in keys
@@ -405,7 +405,7 @@ class TestMarineFilters:
 
     # ── Water mute ──
     def test_water_mute_zeros_above_seabed_keeps_below(self):
-        from topassuite.core import apply_water_mute
+        from sbp_studio.core import apply_water_mute
         tr = self._seabed_trace()
         tr[300] = 0.3                              # a fainter deeper reflector
         data = np.repeat(tr[:, None], 30, axis=1).astype(np.float32)
@@ -416,15 +416,15 @@ class TestMarineFilters:
         assert out.dtype == np.float32 and out is not data
 
     def test_water_mute_node_matches_core(self):
-        from topassuite.gui.dsp import WaterMuteNode, DSPContext
-        from topassuite.core import apply_water_mute
+        from sbp_studio.gui.dsp import WaterMuteNode, DSPContext
+        from sbp_studio.core import apply_water_mute
         data = np.repeat(self._seabed_trace()[:, None], 20, axis=1).astype(np.float32)
         ctx = DSPContext(dt_us=self.DT_US, ns=data.shape[0], n_traces=data.shape[1])
         out = WaterMuteNode({"threshold_pct": 25, "margin_ms": 4}).apply(data, ctx)
         np.testing.assert_array_equal(out, apply_water_mute(data, 25, 4, self.DT_US))
 
     def test_water_mute_all_zero_trace_is_safe(self):
-        from topassuite.core import apply_water_mute
+        from sbp_studio.core import apply_water_mute
         data = np.zeros((256, 8), dtype=np.float32)
         out = apply_water_mute(data, 30, 5, self.DT_US)
         assert np.all(np.isfinite(out)) and out.shape == data.shape
@@ -440,7 +440,7 @@ class TestMarineFilters:
         return data
 
     def test_swell_removes_incoherent_heave(self):
-        from topassuite.core import apply_swell_filter
+        from sbp_studio.core import apply_swell_filter
         data = self._heaved()
         pk_b = np.argmax(np.abs(data), axis=0)
         out = apply_swell_filter(data, window_traces=31, max_shift_ms=2.0, dt_us=self.DT_US)
@@ -449,7 +449,7 @@ class TestMarineFilters:
         assert out.shape == data.shape and out.dtype == np.float32
 
     def test_swell_preserves_coherent_topography(self):
-        from topassuite.core import apply_swell_filter
+        from sbp_studio.core import apply_swell_filter
         nt = 200
         base = self._seabed_trace()
         trend = (5 * np.sin(2 * np.pi * np.arange(nt) / 120)).round().astype(int)
@@ -460,7 +460,7 @@ class TestMarineFilters:
         assert np.corrcoef(pk_a, 200 + trend)[0, 1] > 0.9
 
     def test_swell_direction_pulls_outlier_to_consensus(self):
-        from topassuite.core import apply_swell_filter
+        from sbp_studio.core import apply_swell_filter
         base = self._seabed_trace()
         data = np.repeat(base[:, None], 60, axis=1).astype(np.float32)
         data[:, 30] = np.roll(base, 5)             # one trace heaved +5
@@ -468,8 +468,8 @@ class TestMarineFilters:
         assert abs(int(np.argmax(np.abs(out[:, 30]))) - 200) <= 1
 
     def test_swell_node_matches_core(self):
-        from topassuite.gui.dsp import SwellFilterNode, DSPContext
-        from topassuite.core import apply_swell_filter
+        from sbp_studio.gui.dsp import SwellFilterNode, DSPContext
+        from sbp_studio.core import apply_swell_filter
         data = self._heaved(nt=80)
         ctx = DSPContext(dt_us=self.DT_US, ns=data.shape[0], n_traces=data.shape[1])
         out = SwellFilterNode({"window_traces": 21, "max_shift_ms": 3.0}).apply(data, ctx)
@@ -478,7 +478,7 @@ class TestMarineFilters:
     def test_water_mute_is_precrop_swell_is_not(self):
         """Water mute needs the full trace → flagged PRECROP (run pre-crop in the
         preview); swell is a windowed filter → not PRECROP."""
-        from topassuite.gui.dsp import WaterMuteNode, SwellFilterNode, AGCNode
+        from sbp_studio.gui.dsp import WaterMuteNode, SwellFilterNode, AGCNode
         assert WaterMuteNode.PRECROP is True
         assert SwellFilterNode.PRECROP is False
         assert AGCNode.PRECROP is False
@@ -496,7 +496,7 @@ class TestAmplitudeSpectrum:
                 + np.random.default_rng(0).normal(0, 0.02, (ns, nt)).astype(np.float32))
 
     def test_freq_axis_and_length(self):
-        from topassuite.core import compute_amplitude_spectrum
+        from sbp_studio.core import compute_amplitude_spectrum
         data = self._tones()
         f, a = compute_amplitude_spectrum(data, self.DT_US)
         assert f.shape == a.shape
@@ -505,14 +505,14 @@ class TestAmplitudeSpectrum:
         assert f[0] == 0.0
 
     def test_db_scale_normalised_to_zero_peak(self):
-        from topassuite.core import compute_amplitude_spectrum
+        from sbp_studio.core import compute_amplitude_spectrum
         f, db = compute_amplitude_spectrum(self._tones(), self.DT_US)
         assert abs(float(db.max())) < 1e-4          # peak normalised to 0 dB
         assert float(db.min()) <= 0.0               # everything else ≤ 0 dB
 
     def test_dc_bin_forced_to_floor(self):
         """The 0 Hz spike must be eradicated so it can't compress the plot."""
-        from topassuite.core import compute_amplitude_spectrum
+        from sbp_studio.core import compute_amplitude_spectrum
         # Strong DC offset on top of a tone — classic skew case.
         data = self._tones(freqs=(1500.0,)) + 50.0
         f, db = compute_amplitude_spectrum(data, self.DT_US)
@@ -521,14 +521,14 @@ class TestAmplitudeSpectrum:
         assert abs(f[np.argmax(db)] - 1500) < 60
 
     def test_peaks_at_injected_tones(self):
-        from topassuite.core import compute_amplitude_spectrum
+        from sbp_studio.core import compute_amplitude_spectrum
         f, db = compute_amplitude_spectrum(self._tones(freqs=(1000.0, 3000.0)), self.DT_US)
         at = lambda hz: float(db[np.argmin(np.abs(f - hz))])
         # Tones sit near the 0 dB peak; the noise floor is tens of dB down.
         assert at(1000) > at(500) + 15 and at(3000) > at(3800) + 15
 
     def test_bandpass_attenuation_visible_in_spectrum(self):
-        from topassuite.core import compute_amplitude_spectrum, apply_bandpass
+        from sbp_studio.core import compute_amplitude_spectrum, apply_bandpass
         data = self._tones(freqs=(1000.0, 3000.0))
         bp = apply_bandpass(data, 500, 1500, self.DT_US)
         f, db = compute_amplitude_spectrum(bp, self.DT_US)
@@ -536,14 +536,14 @@ class TestAmplitudeSpectrum:
         assert at(3000) < at(1000) - 30             # 3 kHz ≥30 dB down vs passband
 
     def test_1d_trace_accepted(self):
-        from topassuite.core import compute_amplitude_spectrum
+        from sbp_studio.core import compute_amplitude_spectrum
         t = np.arange(1024) * self.DT_US / 1e6
         tr = np.sin(2 * np.pi * 2000 * t).astype(np.float32)
         f, db = compute_amplitude_spectrum(tr, self.DT_US)
         assert abs(f[np.argmax(db)] - 2000) < 50    # peak at 2 kHz
 
     def test_degenerate_input_safe(self):
-        from topassuite.core import compute_amplitude_spectrum
+        from sbp_studio.core import compute_amplitude_spectrum
         f, a = compute_amplitude_spectrum(np.zeros((2, 4), np.float32), self.DT_US)
         assert np.all(np.isfinite(a)) and len(f) == len(a)
 
@@ -560,7 +560,7 @@ class TestAdvancedSpectrum:
                 + np.random.default_rng(0).normal(0, 0.05, (ns, nt)).astype(np.float32))
 
     def test_welch_result_fields(self):
-        from topassuite.core import compute_spectrum
+        from sbp_studio.core import compute_spectrum
         sp = compute_spectrum(self._data(), 1e6 / self.DT_US)
         # Percentile band ordering and spectrogram shape.
         assert np.all(sp.spec_p90_db >= sp.spec_p10_db - 1e-6)
@@ -572,9 +572,9 @@ class TestAdvancedSpectrum:
         """The advanced panel stays empty until show_result() is called."""
         from PyQt6.QtWidgets import QApplication
         QApplication.instance() or QApplication([])
-        from topassuite.gui.components.spectrum_view import (
+        from sbp_studio.gui.components.spectrum_view import (
             SpectrumView, SCOPE_VIEWBOX, SCOPE_FULL)
-        from topassuite.core import compute_spectrum
+        from sbp_studio.core import compute_spectrum
         sv = SpectrumView()
         assert len(sv.c_mean.getData()[0] or []) == 0          # empty until generated
         sp = compute_spectrum(self._data(), 1e6 / self.DT_US)
@@ -585,8 +585,8 @@ class TestAdvancedSpectrum:
         assert {sv.cb_scope.itemData(0), sv.cb_scope.itemData(1)} == {SCOPE_VIEWBOX, SCOPE_FULL}
 
     def test_band_energy_sums_to_100(self):
-        from topassuite.core import compute_spectrum
-        from topassuite.core.spectrum import TOPAS_BANDS
+        from sbp_studio.core import compute_spectrum
+        from sbp_studio.core.spectrum import TOPAS_BANDS
         sp = compute_spectrum(self._data(), 1e6 / self.DT_US)
         assert sp.band_labels and len(sp.band_labels) == len(sp.band_pcts)
         assert abs(sum(sp.band_pcts) - 100.0) < 0.5
@@ -596,8 +596,8 @@ class TestAdvancedSpectrum:
     def test_panel_renders_full_advanced_layout(self):
         from PyQt6.QtWidgets import QApplication
         QApplication.instance() or QApplication([])
-        from topassuite.gui.components.spectrum_view import SpectrumView
-        from topassuite.core import compute_spectrum
+        from sbp_studio.gui.components.spectrum_view import SpectrumView
+        from sbp_studio.core import compute_spectrum
         sv = SpectrumView()
         sp = compute_spectrum(self._data(), 1e6 / self.DT_US)
         sv.show_result(sp, 1e6 / self.DT_US, np.linspace(0, 5, 120), ())
@@ -608,9 +608,9 @@ class TestAdvancedSpectrum:
     def test_band_bars_peak_distinct_and_theme_adaptive(self):
         from PyQt6.QtWidgets import QApplication
         QApplication.instance() or QApplication([])
-        from topassuite.gui.theme import theme
-        from topassuite.gui.components.spectrum_view import SpectrumView, MEAN_COLOR
-        from topassuite.core import compute_spectrum
+        from sbp_studio.gui.theme import theme
+        from sbp_studio.gui.components.spectrum_view import SpectrumView, MEAN_COLOR
+        from sbp_studio.core import compute_spectrum
         sv = SpectrumView()
         sp = compute_spectrum(self._data(), 1e6 / self.DT_US)
 
@@ -648,7 +648,7 @@ class TestNavigationMap:
 
     def test_set_track_and_aspect_locked(self):
         self._qt()
-        from topassuite.gui.components.map_view import MapView
+        from sbp_studio.gui.components.map_view import MapView
         mv = MapView()
         assert mv.plot.getViewBox().state["aspectLocked"] == 1.0   # strict 1:1
         x, y, dist = self._track()
@@ -659,7 +659,7 @@ class TestNavigationMap:
 
     def test_visible_segment_is_index_subset(self):
         self._qt()
-        from topassuite.gui.components.map_view import MapView
+        from sbp_studio.gui.components.map_view import MapView
         mv = MapView()
         x, y, _ = self._track()
         mv.set_track(x, y)
@@ -676,7 +676,7 @@ class TestNavigationMap:
         distance array has huge frozen-GPS plateaus. Resolved by masking the
         REAL distance array (boolean mask), not searchsorted nor interpolation."""
         self._qt()
-        from topassuite.gui.components.seismic_view import SeismicView
+        from sbp_studio.gui.components.seismic_view import SeismicView
         n = 400
         # Distance with a long plateau in the middle AND a frozen end.
         dist = np.linspace(0, 10, n)
@@ -703,7 +703,7 @@ class TestNavigationMap:
 
     def test_click_emits_nearest_trace_index(self):
         self._qt()
-        from topassuite.gui.components.map_view import MapView
+        from sbp_studio.gui.components.map_view import MapView
         mv = MapView()
         x, y, _ = self._track()
         mv.set_track(x, y)
@@ -720,7 +720,7 @@ class TestNavigationMap:
 
     def test_basemap_conditional_on_geographic_coords(self):
         self._qt()
-        from topassuite.gui.components.map_view import MapView
+        from sbp_studio.gui.components.map_view import MapView
         mv = MapView()
         assert mv._basemap.isVisible() is False          # nothing loaded yet
         # Geographic degrees (Antarctic) → basemap shown.
@@ -735,7 +735,7 @@ class TestNavigationMap:
     def test_track_injected_as_managed_layer(self):
         self._qt()
         from PyQt6.QtCore import Qt
-        from topassuite.gui.components.map_view import MapView, _ROLE_IS_TRACK
+        from sbp_studio.gui.components.map_view import MapView, _ROLE_IS_TRACK
         mv = MapView()
         assert mv._track_item is None
         mv.set_track(np.linspace(-70, -69, 20), np.linspace(-65, -64, 20))
@@ -755,8 +755,8 @@ class TestNavigationMap:
     def test_track_reorder_vs_raster_and_remove_guard(self):
         self._qt()
         from PyQt6.QtCore import Qt
-        from topassuite.gui.components.map_view import MapView, _ROLE_IS_TRACK
-        from topassuite.core import RasterLayer
+        from sbp_studio.gui.components.map_view import MapView, _ROLE_IS_TRACK
+        from sbp_studio.core import RasterLayer
         mv = MapView()
         mv.add_layer(RasterLayer(name="r", image=np.zeros((6, 6), np.uint8),
                                  bbox=(-3.0, -2.9, 43.0, 43.1)))
@@ -778,7 +778,7 @@ class TestNavigationMap:
     def test_opacity_slider_drives_selected_layer(self):
         self._qt()
         from PyQt6.QtCore import Qt
-        from topassuite.gui.components.map_view import MapView
+        from sbp_studio.gui.components.map_view import MapView
         mv = MapView()
         mv.set_track(np.linspace(-70, -69, 10), np.linspace(-65, -64, 10))
         mv.layer_list.setCurrentItem(mv._track_item)        # currentItemChanged → sync
@@ -793,14 +793,14 @@ class TestNavigationMap:
     def test_basemap_is_below_track_and_click_transparent(self):
         self._qt()
         from PyQt6.QtCore import Qt
-        from topassuite.gui.components.map_view import MapView
+        from sbp_studio.gui.components.map_view import MapView
         mv = MapView()
         assert mv._basemap.zValue() < 0                  # under the trackline
         assert mv._basemap.acceptedMouseButtons() == Qt.MouseButton.NoButton
 
     def test_basemap_loads_local_geojson(self):
         self._qt()
-        from topassuite.gui.components.map_view import MapView
+        from sbp_studio.gui.components.map_view import MapView
         mv = MapView()
         # The bundled assets/coastlines_highres.geojson is present → real coast.
         assert mv._basemap_is_graticule is False
@@ -809,7 +809,7 @@ class TestNavigationMap:
     def test_basemap_graticule_fallback_when_asset_missing(self, monkeypatch, tmp_path):
         self._qt()
         from pathlib import Path
-        from topassuite.gui.components.map_view import MapView
+        from sbp_studio.gui.components.map_view import MapView
         missing = tmp_path / "nope.geojson"
         monkeypatch.setattr(MapView, "_asset_path", staticmethod(lambda: Path(missing)))
         mv = MapView()
@@ -818,7 +818,7 @@ class TestNavigationMap:
 
     def test_geojson_parser_handles_polygon_and_linestring(self):
         self._qt()
-        from topassuite.gui.components.map_view import MapView
+        from sbp_studio.gui.components.map_view import MapView
         gj = {"type": "FeatureCollection", "features": [
             {"type": "Feature", "geometry": {"type": "Polygon",
              "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]]}},
@@ -830,7 +830,7 @@ class TestNavigationMap:
 
     def test_seismic_center_on_distance(self):
         self._qt()
-        from topassuite.gui.components.seismic_view import SeismicView
+        from sbp_studio.gui.components.seismic_view import SeismicView
         sv = SeismicView()
         sv.plot.getViewBox().setXRange(0, 20, padding=0)
         sv.center_on_distance(12.0)
@@ -844,7 +844,7 @@ class TestCoordinateExtraction:
     scalar scaling (the Antarctic 'collapse to 0,0' guard). Core-only, no Qt."""
 
     def test_to_signed_reinterprets_unsigned_bit_patterns(self):
-        from topassuite.core.io_segy import _to_signed
+        from sbp_studio.core.io_segy import _to_signed
         # 16-bit: 65436 (unsigned) == -100 (signed >h).
         assert int(_to_signed(65436, 16)) == -100
         assert int(_to_signed(-100, 16)) == -100        # already signed → unchanged
@@ -853,14 +853,14 @@ class TestCoordinateExtraction:
         assert int(_to_signed(-650000, 32)) == -650000
 
     def test_scalar_fac_standard_rule(self):
-        from topassuite.core.io_segy import _scalar_fac
+        from sbp_studio.core.io_segy import _scalar_fac
         assert _scalar_fac(-100) == 0.01      # negative → divide by |scalar|
         assert _scalar_fac(100) == 100.0      # positive → multiply
         assert _scalar_fac(0) == 1.0          # zero → no scaling
 
     def test_negative_antarctic_coords_not_collapsed(self, tmp_path):
         from tests.make_synthetic_segy import make_synthetic_segy
-        from topassuite.core import load_profile
+        from sbp_studio.core import load_profile
         p = make_synthetic_segy(
             str(tmp_path / "antarctic.sgy"), n_traces=30,
             scalar_coord=-100, coord_unit=3,
@@ -883,7 +883,7 @@ class TestHeaderInspector:
 
     def test_core_exposes_text_and_trace_headers(self, tmp_path):
         from tests.make_synthetic_segy import make_synthetic_segy
-        from topassuite.core import load_profile
+        from sbp_studio.core import load_profile
         p = make_synthetic_segy(str(tmp_path / "h.sgy"), n_traces=40,
                                 scalar_coord=-100, coord_unit=3,
                                 base_lon=-64.5, base_lat=-70.3, lon_step=0.01)
@@ -905,7 +905,7 @@ class TestHeaderInspector:
 
     def test_table_model_dims_data_and_headers(self):
         self._qt()
-        from topassuite.gui.components.header_view import TraceHeaderModel
+        from sbp_studio.gui.components.header_view import TraceHeaderModel
         from PyQt6.QtCore import Qt
         cols = {"A": np.array([10, 20, 30]), "B": np.array([-1, -2, -3])}
         m = TraceHeaderModel(cols)
@@ -917,7 +917,7 @@ class TestHeaderInspector:
 
     def test_table_model_scales_to_50k_rows_lazily(self):
         self._qt()
-        from topassuite.gui.components.header_view import TraceHeaderModel
+        from sbp_studio.gui.components.header_view import TraceHeaderModel
         big = {"X": np.arange(50_000, dtype=np.int32)}
         m = TraceHeaderModel(big)
         assert m.rowCount() == 50_000
@@ -925,7 +925,7 @@ class TestHeaderInspector:
 
     def test_headerview_select_is_silent_click_emits(self):
         self._qt()
-        from topassuite.gui.components.header_view import HeaderView
+        from sbp_studio.gui.components.header_view import HeaderView
 
         class _Obj:
             text_header = "C 1 HELLO"
@@ -944,7 +944,7 @@ class TestHeaderInspector:
     def test_seismic_click_emits_trace_via_searchsorted(self):
         self._qt()
         from PyQt6.QtCore import Qt, QPointF
-        from topassuite.gui.components.seismic_view import SeismicView
+        from sbp_studio.gui.components.seismic_view import SeismicView
         sv = SeismicView()
         dist = np.linspace(0.0, 10.0, 101)
         sv.set_distance_axis(dist)
@@ -963,8 +963,8 @@ class TestHeaderInspector:
 
     def test_chain_concatenates_trace_headers(self, tmp_path):
         from tests.make_synthetic_segy import make_chain_pair
-        from topassuite.core import load_profile
-        from topassuite.core.model import ProfileChain
+        from sbp_studio.core import load_profile
+        from sbp_studio.core.model import ProfileChain
         p1, p2 = make_chain_pair(str(tmp_path))
         profs = [load_profile(p1), load_profile(p2)]
         ch = ProfileChain(profs)
@@ -977,7 +977,7 @@ class TestTrackCleaning:
     distance axis. All maths run in core/io_segy — nothing here touches Qt."""
 
     def test_median_filter_rejects_gps_spikes(self):
-        from topassuite.core import smooth_track
+        from sbp_studio.core import smooth_track
         n = 200
         lon = np.linspace(-70.0, -69.5, n)        # high-latitude track
         lat = np.linspace(-65.0, -64.7, n)
@@ -994,7 +994,7 @@ class TestTrackCleaning:
         assert abs(slat[0]  - lat[0])  < 1e-6 and abs(slat[-1] - lat[-1]) < 1e-6
 
     def test_smoothing_tames_step_to_step_jitter(self):
-        from topassuite.core import smooth_track
+        from sbp_studio.core import smooth_track
         rng = np.random.default_rng(0)
         n = 300
         lon = np.linspace(0.0, 1.0, n) + rng.normal(0, 0.02, n)
@@ -1004,7 +1004,7 @@ class TestTrackCleaning:
         assert np.std(np.diff(slat)) < np.std(np.diff(lat))
 
     def test_short_track_returned_unchanged(self):
-        from topassuite.core import smooth_track
+        from sbp_studio.core import smooth_track
         lon, lat = np.array([1.0, 2.0]), np.array([3.0, 4.0])
         slon, slat = smooth_track(lon, lat)
         np.testing.assert_array_equal(slon, lon)
@@ -1012,7 +1012,7 @@ class TestTrackCleaning:
 
     def test_loaded_profile_has_clean_track_and_monotonic_distance(self, tmp_path):
         from tests.make_synthetic_segy import make_synthetic_segy
-        from topassuite.core import load_profile
+        from sbp_studio.core import load_profile
         p = make_synthetic_segy(
             str(tmp_path / "arc.sgy"), n_traces=80,
             scalar_coord=-10000, coord_unit=3,
@@ -1031,7 +1031,7 @@ class TestTrackCleaning:
         visible window with searchsorted — including across a plateau."""
         from PyQt6.QtWidgets import QApplication
         QApplication.instance() or QApplication([])
-        from topassuite.gui.components.seismic_view import SeismicView
+        from sbp_studio.gui.components.seismic_view import SeismicView
         n = 300
         dist = np.linspace(0.0, 15.0, n)
         dist[-50:] = dist[-50]                      # frozen-GPS plateau at the end
@@ -1051,7 +1051,7 @@ class TestReprojection:
     """Core point-array reprojection (core/spatial.py). No Qt — pure pyproj."""
 
     def test_roundtrip_wgs84_utm(self):
-        from topassuite.core import reproject_points
+        from sbp_studio.core import reproject_points
         lons = np.array([-3.0, -2.5, -2.0])
         lats = np.array([43.0, 43.2, 43.4])
         xs, ys = reproject_points(lons, lats, "EPSG:4326", "EPSG:32630")
@@ -1062,20 +1062,20 @@ class TestReprojection:
         np.testing.assert_allclose(blat, lats, atol=1e-6)
 
     def test_identity_is_passthrough(self):
-        from topassuite.core import reproject_points
+        from sbp_studio.core import reproject_points
         lons = np.array([10.0, 11.0]); lats = np.array([50.0, 51.0])
         xs, ys = reproject_points(lons, lats, "EPSG:4326", "EPSG:4326")
         np.testing.assert_array_equal(xs, lons)
         np.testing.assert_array_equal(ys, lats)
 
     def test_invalid_crs_raises(self):
-        from topassuite.core import reproject_points
-        from topassuite.core.tasks import CRSError
+        from sbp_studio.core import reproject_points
+        from sbp_studio.core.tasks import CRSError
         with pytest.raises(CRSError):
             reproject_points([0.0], [0.0], "EPSG:4326", "NOT-A-CRS")
 
     def test_to_geographic_passthrough_when_geographic(self):
-        from topassuite.core import to_geographic
+        from sbp_studio.core import to_geographic
         lons = np.array([-8.0, -7.9]); lats = np.array([43.0, 43.1])
         gx, gy = to_geographic(lons, lats, "EPSG:4326")
         np.testing.assert_array_equal(gx, lons)
@@ -1085,7 +1085,7 @@ class TestReprojection:
         np.testing.assert_array_equal(gx2, lons)
 
     def test_to_geographic_converts_projected(self):
-        from topassuite.core import to_geographic, reproject_points
+        from sbp_studio.core import to_geographic, reproject_points
         # Start from a known geographic point, project to UTM metres…
         lon0, lat0 = -3.0, 43.0
         xs, ys = reproject_points([lon0], [lat0], "EPSG:4326", "EPSG:32630")
@@ -1095,14 +1095,14 @@ class TestReprojection:
         np.testing.assert_allclose([gx[0], gy[0]], [lon0, lat0], atol=1e-6)
 
     def test_to_geographic_never_raises_on_bad_crs(self):
-        from topassuite.core import to_geographic
+        from sbp_studio.core import to_geographic
         lons = np.array([5.0]); lats = np.array([5.0])
         gx, gy = to_geographic(lons, lats, "BOGUS")     # falls back to input
         np.testing.assert_array_equal(gx, lons)
         np.testing.assert_array_equal(gy, lats)
 
     def test_crs_catalog_structure(self):
-        from topassuite.core import CRS_CATALOG, CRS_PRESETS
+        from sbp_studio.core import CRS_CATALOG, CRS_PRESETS
         cats = [c for c, _ in CRS_CATALOG]
         assert cats == ["Geographic", "Polar Stereographic",
                         "UTM North (WGS 84)", "UTM South (WGS 84)"]
@@ -1116,7 +1116,7 @@ class TestReprojection:
     def test_reproject_one_honors_out_path(self, tmp_path):
         import os
         from tests.make_synthetic_segy import make_synthetic_segy
-        from topassuite.core import load_profile, reproject_one
+        from sbp_studio.core import load_profile, reproject_one
         p = make_synthetic_segy(str(tmp_path / "in.sgy"), n_traces=10,
                                 base_lon=-3.0, base_lat=43.0)
         prof = load_profile(p, load_traces=False)
@@ -1134,7 +1134,7 @@ class TestCliConsole:
     def _console(self):
         from PyQt6.QtWidgets import QApplication, QWidget
         QApplication.instance() or QApplication([])
-        from topassuite.gui.components.cli_console import CliConsole
+        from sbp_studio.gui.components.cli_console import CliConsole
         return CliConsole(QWidget())
 
     def _send(self, c, line):
@@ -1180,7 +1180,7 @@ class TestCliConsole:
         assert "Error: kaboom" in out          # caught and printed, UI survives
 
     def test_tokenize_keeps_windows_paths_and_strips_quotes(self):
-        from topassuite.gui.components.cli_console import CliConsole
+        from sbp_studio.gui.components.cli_console import CliConsole
         toks = CliConsole._tokenize(
             r'export-image .\examples\L01.sgy --fix-color "#cc4444" --preset envelope')
         assert toks == ["export-image", r".\examples\L01.sgy",
@@ -1214,7 +1214,7 @@ class TestCliPaths:
     def _console(self):
         from PyQt6.QtWidgets import QApplication, QWidget
         QApplication.instance() or QApplication([])
-        from topassuite.gui.components.cli_console import CliConsole
+        from sbp_studio.gui.components.cli_console import CliConsole
         return CliConsole(QWidget())
 
     def _send(self, c, line):
@@ -1224,23 +1224,23 @@ class TestCliPaths:
     def test_app_root_frozen_uses_executable_dir(self, monkeypatch):
         import os
         import sys
-        from topassuite.gui.components import cli_console as cc
+        from sbp_studio.gui.components import cli_console as cc
         # Frozen → folder containing the .exe (next to it), NOT sys._MEIPASS.
         monkeypatch.setattr(sys, "frozen", True, raising=False)
         monkeypatch.setattr(sys, "executable",
-                            os.path.join("C:" + os.sep, "app", "TopasSuite.exe"),
+                            os.path.join("C:" + os.sep, "app", "SBPStudio.exe"),
                             raising=False)
         assert cc._app_root() == os.path.join("C:" + os.sep, "app")
 
     def test_app_root_source_is_project_root(self, monkeypatch):
         import os
         import sys
-        from topassuite.gui.components import cli_console as cc
+        from sbp_studio.gui.components import cli_console as cc
         monkeypatch.delattr(sys, "frozen", raising=False)
         root = cc._app_root()
         # The project root actually contains the package AND the examples dir,
         # so user paths like .\examples\… resolve correctly.
-        assert os.path.isdir(os.path.join(root, "topassuite"))
+        assert os.path.isdir(os.path.join(root, "sbp_studio"))
         assert os.path.isdir(os.path.join(root, "examples"))
 
     def test_path_heuristic_skips_non_paths(self):
@@ -1279,17 +1279,17 @@ class TestCliGuide:
     def test_guide_dialog_has_spanish_content_and_example(self):
         from PyQt6.QtWidgets import QApplication
         QApplication.instance() or QApplication([])
-        from topassuite.gui.components.cli_console import CliGuideDialog
+        from sbp_studio.gui.components.cli_console import CliGuideDialog
         dlg = CliGuideDialog()
         text = dlg.browser.toPlainText()
         assert "Guía de Comandos" in text
         assert "export-image" in text and "--fix-bbox-alpha" in text   # exact example
-        assert "python -m topassuite.cli.main" in text                 # explains no prefix
+        assert "python -m sbp_studio.cli.main" in text                 # explains no prefix
 
     def test_guide_has_practical_examples_with_real_file(self):
         from PyQt6.QtWidgets import QApplication
         QApplication.instance() or QApplication([])
-        from topassuite.gui.components.cli_console import CliGuideDialog, _GUIDE_FILE
+        from sbp_studio.gui.components.cli_console import CliGuideDialog, _GUIDE_FILE
         text = CliGuideDialog().browser.toPlainText()
         assert "Ejemplos Prácticos" in text
         assert _GUIDE_FILE in text                                     # real ANT26 file
@@ -1324,7 +1324,7 @@ class TestGisReaders:
     def test_read_vector_reprojects_to_wgs84(self, tmp_path):
         import geopandas as gpd
         from shapely.geometry import LineString
-        from topassuite.core import read_gis_layer, VectorLayer
+        from sbp_studio.core import read_gis_layer, VectorLayer
         import pyproj
         tf = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:32630", always_xy=True)
         xs, ys = tf.transform([-3.0, -2.9], [43.0, 43.1])
@@ -1337,7 +1337,7 @@ class TestGisReaders:
         np.testing.assert_allclose(layer.paths[0][0], [-3.0, 43.0], atol=1e-6)
 
     def test_read_geotiff_bbox_in_wgs84(self, tmp_path):
-        from topassuite.core import read_gis_layer, RasterLayer
+        from sbp_studio.core import read_gis_layer, RasterLayer
         p = str(tmp_path / "r.tif")
         arr = self._write_geotiff(p, 32630, 5e5, 4.8e6, 100.0, h=8, w=12)
         layer = read_gis_layer(p)
@@ -1348,7 +1348,7 @@ class TestGisReaders:
         assert abs(lon0 - (-3.0)) < 0.05 and abs(lat1 - 43.35) < 0.05
 
     def test_geographic_geotiff_passthrough(self, tmp_path):
-        from topassuite.core import read_gis_layer
+        from sbp_studio.core import read_gis_layer
         p = str(tmp_path / "geo.tif")
         # WGS84 raster: origin lon=-8, lat=43, 0.01° pixels.
         self._write_geotiff(p, 4326, -8.0, 43.0, 0.01, h=10, w=10)
@@ -1359,14 +1359,14 @@ class TestGisReaders:
 
     def test_plain_tiff_without_georef_raises(self, tmp_path):
         import tifffile
-        from topassuite.core import read_geotiff
+        from sbp_studio.core import read_geotiff
         p = str(tmp_path / "plain.tif")
         tifffile.imwrite(p, (np.zeros((4, 4))).astype(np.uint8))
         with pytest.raises(ValueError):
             read_geotiff(p)
 
     def test_unsupported_extension_raises(self):
-        from topassuite.core import read_gis_layer
+        from sbp_studio.core import read_gis_layer
         with pytest.raises(ValueError):
             read_gis_layer("foo.xyz")
 

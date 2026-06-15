@@ -13,8 +13,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
-from topassuite.core import load_profile, compute_spectrum
-from topassuite.viz import render_spectrum_figure, save_figure
+from sbp_studio.core import load_profile, compute_spectrum
+from sbp_studio.viz import render_spectrum_figure, save_figure
 
 DATA_DIR = Path(__file__).parent / "_demo_in"
 OUT_DIR  = Path(__file__).parent / "_demo_out"

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 
-from topassuite.gui.tabs._render import (
+from sbp_studio.gui.tabs._render import (
     EXPORT_DPI_CEILING, compute_figsize, effective_export_dpi,
 )
 
@@ -42,8 +42,8 @@ def test_end_to_end_export_embeds_full_sample_grid(tmp_path):
     """The wired DPI floor embeds the full ns rows; the un-floored 600 DPI path
     decimates below ns — proving both the bug and the fix through the REAL core."""
     from tests.make_synthetic_segy import make_synthetic_segy
-    from topassuite.core import load_profile
-    from topassuite.viz.render import render_profile_figure
+    from sbp_studio.core import load_profile
+    from sbp_studio.viz.render import render_profile_figure
 
     p = make_synthetic_segy(str(tmp_path / "hi.sgy"), n_traces=60, ns=2048)
     sd = load_profile(p, load_traces=True)
@@ -69,8 +69,8 @@ def test_cli_render_path_unchanged():
     a low-DPI render (CLI default) still works and is NOT forced higher (the CLI
     never calls effective_export_dpi)."""
     import inspect
-    from topassuite.cli import commands
-    from topassuite.viz.render import render_profile_figure
+    from sbp_studio.cli import commands
+    from sbp_studio.viz.render import render_profile_figure
 
     src = inspect.getsource(commands)
     assert "effective_export_dpi" not in src          # CLI does its own DPI/figsize

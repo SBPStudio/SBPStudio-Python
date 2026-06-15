@@ -16,11 +16,11 @@ import numpy as np
 import pytest
 import segyio
 
-from topassuite.core import (
+from sbp_studio.core import (
     load_profile, load_metadata, reproject_one, reproject_chain,
     detect_chains, CRSError, ReprojectionError,
 )
-from topassuite.core.io_segy import _ref_reproject_trace
+from sbp_studio.core.io_segy import _ref_reproject_trace
 
 
 class TestReprojectOne:
@@ -113,7 +113,7 @@ class TestReprojectOne:
         src = str(tmp_path / "src.sgy")
         shutil.copy(simple_segy, src)
         sd  = load_profile(src)
-        import topassuite.core.io_segy as _io
+        import sbp_studio.core.io_segy as _io
         orig = _io._opt_reproject_coords_bulk
         def _bad(*a, **k):
             raise RuntimeError("forced test error")

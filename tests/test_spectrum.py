@@ -6,8 +6,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from topassuite.core import load_profile, compute_spectrum, SegyProfile
-from topassuite.core.spectrum import _ref_compute_spectrum, SpectrumResult
+from sbp_studio.core import load_profile, compute_spectrum, SegyProfile
+from sbp_studio.core.spectrum import _ref_compute_spectrum, SpectrumResult
 
 
 class TestComputeSpectrum:
