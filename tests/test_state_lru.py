@@ -14,7 +14,7 @@ import weakref
 import numpy as np
 from PyQt6.QtWidgets import QApplication
 
-from topassuite.gui.state import AppState, MAX_HOT_PROFILES
+from sbp_studio.gui.state import AppState, MAX_HOT_PROFILES
 
 
 def _qt():

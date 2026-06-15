@@ -11,8 +11,8 @@ import struct
 import numpy as np
 import pytest
 
-from topassuite.core import load_profile, compute_fix_positions
-from topassuite.core.geometry_export import (
+from sbp_studio.core import load_profile, compute_fix_positions
+from sbp_studio.core.geometry_export import (
     write_fix_points_shp, write_fix_points_geojson, write_fix_points_csv,
     write_navline_shp, write_navline_geojson, write_navline_csv,
     parse_timestamp,

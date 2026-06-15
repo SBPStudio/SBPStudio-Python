@@ -13,7 +13,7 @@ from __future__ import annotations
 from PyQt6.QtWidgets import QApplication
 
 from tests.make_synthetic_segy import make_chain_pair
-from topassuite.core import load_profile
+from sbp_studio.core import load_profile
 
 
 def _qt():
@@ -29,7 +29,7 @@ def _drain(win, timeout_ms: int = 5000) -> None:
 
 def test_detection_is_memory_flat(tmp_path):
     _qt()
-    from topassuite.gui.main_window import MainWindow
+    from sbp_studio.gui.main_window import MainWindow
     win = MainWindow()
     p1, p2 = make_chain_pair(str(tmp_path), prefix="g", gap_km=0.05)
     for path in (p1, p2):
@@ -47,7 +47,7 @@ def test_detection_is_memory_flat(tmp_path):
 
 def test_selecting_chain_lazily_assembles_traces(tmp_path):
     _qt()
-    from topassuite.gui.main_window import MainWindow
+    from sbp_studio.gui.main_window import MainWindow
     win = MainWindow()
     p1, p2 = make_chain_pair(str(tmp_path), prefix="g", gap_km=0.05)
     for path in (p1, p2):

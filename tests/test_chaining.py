@@ -6,7 +6,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from topassuite.core import load_profile, detect_chains, ProfileChain
+from sbp_studio.core import load_profile, detect_chains, ProfileChain
 
 
 class TestDetectChains:

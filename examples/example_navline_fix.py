@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from topassuite.core import (
+from sbp_studio.core import (
     load_profile, compute_fix_positions,
     write_navline_geojson, write_navline_csv,
     write_fix_points_geojson, write_fix_points_csv,

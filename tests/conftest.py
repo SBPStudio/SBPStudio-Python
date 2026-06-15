@@ -12,7 +12,7 @@ from .make_synthetic_segy import make_synthetic_segy, make_chain_pair
 
 @pytest.fixture(scope="session")
 def tmp_dir(tmp_path_factory):
-    return tmp_path_factory.mktemp("topassuite_tests")
+    return tmp_path_factory.mktemp("sbp_studio_tests")
 
 
 @pytest.fixture(scope="session")

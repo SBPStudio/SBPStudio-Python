@@ -23,8 +23,8 @@ def _qt():
 
 def test_reproject_aborts_on_cancelled_token(tmp_path):
     from tests.make_synthetic_segy import make_synthetic_segy
-    from topassuite.core import load_profile, reproject_one
-    from topassuite.core.tasks import CancelToken, Cancelled
+    from sbp_studio.core import load_profile, reproject_one
+    from sbp_studio.core.tasks import CancelToken, Cancelled
     p = make_synthetic_segy(str(tmp_path / "c.sgy"), n_traces=50,
                             base_lon=-3.0, base_lat=43.0)
     prof = load_profile(p, load_traces=False)
@@ -43,7 +43,7 @@ def test_reproject_aborts_on_cancelled_token(tmp_path):
 
 def test_coreworker_cancel_midrun_emits_no_success():
     app = _qt()
-    from topassuite.gui.workers.base import CoreWorker
+    from sbp_studio.gui.workers.base import CoreWorker
     succeeded, failed = [], []
 
     def job(progress, cancel):
@@ -68,7 +68,7 @@ def test_coreworker_cancel_midrun_emits_no_success():
 
 def test_coreworker_runs_to_completion_without_cancel():
     app = _qt()
-    from topassuite.gui.workers.base import CoreWorker
+    from sbp_studio.gui.workers.base import CoreWorker
     got = []
     worker = CoreWorker(lambda progress, cancel: 21 * 2)
     worker.succeeded.connect(got.append)
@@ -82,7 +82,7 @@ def test_coreworker_runs_to_completion_without_cancel():
 
 def test_cancel_button_lifecycle_and_wiring():
     _qt()
-    from topassuite.gui.main_window import MainWindow
+    from sbp_studio.gui.main_window import MainWindow
     win = MainWindow()
     # Use isHidden() (explicit-hidden flag) not isVisible() — the latter is False
     # whenever the top-level window hasn't been shown, regardless of our intent.

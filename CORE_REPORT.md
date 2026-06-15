@@ -1,14 +1,16 @@
-# CORE_REPORT — TOPAS Suite Core Extraction
+# CORE_REPORT — SBP Studio Core Extraction
 
-> Last updated: 2026-06-02
-> Tests: **115 / 115 passing**
-> `topas_core.py` (original draft): **deleted** — superseded by `topassuite/`
+> Last updated: 2026-06-16
+> Tests: **290 collected** (core + CLI run headless; the PyQt6/GUI suites run on a desktop with a display)
+> `topas_core.py` (original draft): **deleted** — superseded by `sbp_studio/`
+> Package renamed `topassuite` → **`sbp_studio`** (import path, launchers, translations).
+> See [`GUI_REPORT.md`](GUI_REPORT.md) for the PyQt6 desktop interface built on top of this core.
 
 ---
 
 ## 1. Final layout + public API per module
 
-### `topassuite/core/`
+### `sbp_studio/core/`
 
 | Module | Public symbols | Notes |
 |--------|---------------|-------|
@@ -16,7 +18,7 @@
 | `tasks.py` | `TopasCoreError`, `SegyLoadError`, `CRSError`, `ReprojectionError`, `Cancelled`, `ProgressCallback`, `CancelToken`, `LogCallback`, `PhasedTimer` | `PhasedTimer` for `--timeit` |
 | `_backends.py` | `gpu_available()`, `worker_count()`, `fftw_available()`, `accel_info()`, `GPU`, `FFTW`, `N_WORKERS`, `XP` | pyfftw auto-activated; accel_info() feeds `accel` CLI |
 | `model.py` | `SegyMetadata`, `SegyProfile`, `ProfileChain` | ref |
-| `io_segy.py` | `load_metadata`, `load_profile`, `reproject_one`, `reproject_chain`, `join_profiles` | optimised path active; out_sc bug fixed |
+| `io_segy.py` | `load_metadata`, `load_profile`, `reproject_one`, `reproject_chain`, `join_profiles` | optimised path active; out_sc bug fixed; **duplicate-timestamp trace cleanup** (`_timestamp_dedup_mask`) |
 | `processing.py` | `apply_predictive_decon`, `apply_filter_preset`, `process_profile_data`, `process_chain_data`, `time_window`, `_hilbert_parallel`, `_ref_agc` | Hilbert + AGC parallelised |
 | `spectrum.py` | `compute_spectrum(data, fs)→SpectrumResult` | ref |
 | `coordinates.py` | `resolve_crs(str)→str`, `validate_crs(str)→CRS` | ref |
@@ -24,7 +26,7 @@
 | `coloring.py` | `colormapped_rgba(data, cmap_name, vmin, vmax)→uint8` | GPU branch when CuPy present |
 | `geometry_export.py` | `parse_timestamp`, `compute_fix_positions`, `write_fix_points_shp/geojson/csv`, `write_navline_shp/geojson/csv` | ref |
 
-### `topassuite/viz/`
+### `sbp_studio/viz/`
 
 | Module | Public symbols | Notes |
 |--------|---------------|-------|
@@ -46,7 +48,7 @@ colors
 
 `save_raw_rgba(source, data, path, params, render_opts, px_per_trace, dpi, figheight, is_chain, pdf_page)`
 
-### `topassuite/cli/`
+### `sbp_studio/cli/`
 
 | Module | Subcommands |
 |--------|-------------|
@@ -59,13 +61,28 @@ colors
 Processing:     --preset, --bandpass, --agc, --tvg, --align, --fill-zero, --clip, --clip-lo,
                 --cmap, --invert
 Quality:        --quality, --dpi, --px-per-trace, --figheight, --auto-height, --fill-zero
-Physical scale: --x-scale, --y-scale, --velocity, --ratio
+Physical scale: --x-scale, --y-scale, --velocity, --ratio, --ve, --max-aspect
+X-axis mode:    --trace-axis, --km-no-stretch           (vs default distance/km extent)
+Memory safety:  --mem-budget-gb                          (default 6; RAM-cap, anti-OOM)
 Axes/ticks:     --x-tick, --t-tick, --time-ticks, --time-fmt, --time-font-size, --time-align
 FIX marks:      --fix, --fix-color, --fix-font-size, --fix-bbox-alpha
 Margins:        --margin-top, --margin-bottom
 Theme/colour:   --theme, --bg-color, --text-color, --axes-bg-color
 Output:         --no-axes, --format, --pdf-page, --title, --timeit, --out
 ```
+
+**Scaling modes (new — keep many lines visually comparable):**
+
+| Mode | Flags | Behaviour |
+|------|-------|-----------|
+| Lock aspect | `--ratio R` | Constant figure shape; vertical exaggeration (VE) floats with line length |
+| Lock VE | `--x-scale K --ve N` | Constant VE → geologically comparable across lengths; `--ve` derives height as `N·depth_km/x_scale`, length-independent |
+| Hybrid | `--x-scale K --ve N --max-aspect R` | Locks VE but caps the aspect at `R:1` so an extreme line never deforms into an "infinite noodle" (VE overridden only for that line) |
+
+`--mem-budget-gb` caps the rasteriser to a RAM budget (default 6 GB) via a coupled
+down-scale that preserves aspect **and** VE — fixes `numpy ArrayMemoryError` on
+100+ km / high-DPI exports. Validated against free RAM before rendering; a prominent
+warning is printed if the budget exceeds the machine's free RAM.
 
 ### `examples/`
 
@@ -126,7 +143,7 @@ Output:         --no-axes, --format, --pdf-page, --title, --timeit, --out
 
 ## 4. Optimisations implemented
 
-Benchmarked on real TOPAS data: 6-file chain, 7234 × 9677 samples, dt=31 µs, 8-core CPU, pyfftw active.
+Benchmarked on real SBP data: 6-file chain, 7234 × 9677 samples, dt=31 µs, 8-core CPU, pyfftw active.
 
 | Optimisation | Implementation | Measured speedup | Regression gate |
 |-------------|---------------|-----------------|----------------|
@@ -250,3 +267,16 @@ With CuPy (GTX 960M, 2 GB VRAM, single profile):
 | **Low** | `--scale-bar` graphical scale bar on images | Pending |
 | **Low** | `--velocity V` depth axis (requires velocity model) | Pending |
 | **Low** | Bulk header write for reprojection (segyio internal API) | Pending |
+
+---
+
+## 11. Recent additions (2026-06)
+
+| Feature | Module | Summary |
+|---------|--------|---------|
+| **Duplicate-timestamp cleanup** | `io_segy._timestamp_dedup_mask` + `_populate_profile_from_file` | TOPAS files stamp blocks of consecutive traces with an identical DayOfYear/Hour/Minute/Second. The loader builds the `(n,4)` time matrix, diffs consecutive rows, and drops repeats (first trace always kept; bypassed if the time words are all-zero). The **same** keep-mask filters every per-trace array (data, lons/lats, delays, water depth, timestamps, inspector headers) so nothing misaligns. Records `original_n_traces` / `n_purged`; updates `n_traces`. File-copy ops (`reproject_*` / `join_profiles`) iterate the file's true `tracecount`, so they stay byte-faithful — the purge is a display/analysis feature. Tests: `test_dedup_timestamps.py`. |
+| **Constant-VE scaling** | `cli/commands._figsize`, `cli/main` | `--ve N` (with `--x-scale`) fixes vertical exaggeration length-independently (`h = N·depth_km/x_scale`). `--max-aspect R` is the "infinite-noodle" guard that caps the aspect only when a `--ve` line would otherwise be extreme. Closed form: `VE = x_scale·2e6 / (velocity·y_scale)`. Tests: `test_cli_figsize_clamp.py`. |
+| **Rasteriser RAM safeguard** | `cli/commands._safe_pixel_budget`, `_figsize` | Caps the output raster to a RAM budget (default **6 GB**, `--mem-budget-gb`) by scaling both figure axes by a single factor `s = √(budget/required)` — preserves aspect **and** VE, only lowering pixel density. Prevents `numpy ArrayMemoryError` on very long / high-DPI lines. Tests: `test_export_mem_safety.py`. |
+| **X-axis modes** | `viz/render` (`_x_axis_extent`, `_label_x_axis`) | `--trace-axis` (one column per trace, axis in trace number) and `--km-no-stretch` (km labels at real trace positions, no horizontal stretch) alongside the historical distance/km extent. |
+| **Chain blockiness fix** | `viz/render.render_chain_figure` | The stitched native-width chain image is now smoothly resized (bilinear/LANCZOS) to the output pixel width before `imshow`, instead of nearest-upscaling each trace into a `px_per_trace`-wide block. |
+| **Configurable axis fonts + grid** | `viz/render` | `axis_font_size`, `grid_alpha`, `grid_lw` threaded through `render_profile_figure` / `render_chain_figure` (defaults reproduce the historical look). |

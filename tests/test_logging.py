@@ -1,7 +1,7 @@
 """
 test_logging.py — Persistent logging infrastructure (core/logger.py).
 
-Fast, no heavy I/O. Each test that touches the shared ``topassuite`` logger uses
+Fast, no heavy I/O. Each test that touches the shared ``sbp_studio`` logger uses
 the ``fresh_logger`` fixture, which snapshots and fully restores the logger's
 handler state so the rest of the suite stays silent (no stray app.log).
 """
@@ -12,12 +12,12 @@ import os
 
 import pytest
 
-from topassuite.core import logger as L
+from sbp_studio.core import logger as L
 
 
 @pytest.fixture
 def fresh_logger():
-    """Give a test a clean (unconfigured) ``topassuite`` logger, then restore."""
+    """Give a test a clean (unconfigured) ``sbp_studio`` logger, then restore."""
     lg = L.get_logger()
     saved_handlers = lg.handlers[:]
     saved = (lg.level, lg.propagate, getattr(lg, "_topas_configured", None))
@@ -43,12 +43,12 @@ def fresh_logger():
 
 def test_app_root_is_project_root():
     root = L.app_root()
-    assert os.path.isdir(os.path.join(root, "topassuite"))
+    assert os.path.isdir(os.path.join(root, "sbp_studio"))
 
 
 def test_get_logger_names():
-    assert L.get_logger().name == "topassuite"
-    assert L.get_logger("io_segy").name == "topassuite.io_segy"
+    assert L.get_logger().name == "sbp_studio"
+    assert L.get_logger("io_segy").name == "sbp_studio.io_segy"
 
 
 def test_default_is_silent_until_configured():
@@ -66,7 +66,7 @@ def test_configure_writes_rotating_app_log(fresh_logger, tmp_path):
     p = tmp_path / L.LOG_FILENAME
     assert p.exists()
     text = p.read_text(encoding="utf-8")
-    assert "boom-marker" in text and "ERROR" in text and "topassuite.io_segy" in text
+    assert "boom-marker" in text and "ERROR" in text and "sbp_studio.io_segy" in text
 
 
 def test_configure_is_idempotent(fresh_logger, tmp_path):

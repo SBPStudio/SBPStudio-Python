@@ -14,8 +14,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from topassuite.gui.tabs._base import _batch_output_path, _render_export_figure
-from topassuite.gui.tabs._render import compute_figsize, effective_export_dpi
+from sbp_studio.gui.tabs._base import _batch_output_path, _render_export_figure
+from sbp_studio.gui.tabs._render import compute_figsize, effective_export_dpi
 
 
 # ── File routing / naming ───────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ def _cfg(dpi=600):
 
 def test_render_export_figure_is_pristine_and_non_mutating(tmp_path):
     from tests.make_synthetic_segy import make_synthetic_segy
-    from topassuite.core import load_profile
+    from sbp_studio.core import load_profile
 
     p = make_synthetic_segy(str(tmp_path / "L.sgy"), n_traces=60, ns=2048)
     sd = load_profile(p, load_traces=True)

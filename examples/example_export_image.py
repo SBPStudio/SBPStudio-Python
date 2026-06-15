@@ -13,8 +13,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
-from topassuite.core import load_profile, detect_chains, process_profile_data, process_chain_data
-from topassuite.viz import render_profile_figure, render_chain_figure, save_figure
+from sbp_studio.core import load_profile, detect_chains, process_profile_data, process_chain_data
+from sbp_studio.viz import render_profile_figure, render_chain_figure, save_figure
 
 DATA_DIR = Path(__file__).parent / "_demo_in"
 OUT_DIR  = Path(__file__).parent / "_demo_out"

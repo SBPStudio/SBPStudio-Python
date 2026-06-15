@@ -15,7 +15,7 @@ import pytest
 
 
 def _run(args: list, check: bool = True) -> subprocess.CompletedProcess:
-    cmd = [sys.executable, "-m", "topassuite.cli.main"] + args
+    cmd = [sys.executable, "-m", "sbp_studio.cli.main"] + args
     return subprocess.run(
         cmd, capture_output=True, text=True,
         check=check, timeout=120,
