@@ -1,0 +1,25 @@
+# SBP Studio 0.5.0 — runtime dependencies (pip / PyInstaller build environment)
+#
+# Mirrors env/environment.yml but expressed as pip packages, for the packaging
+# pipeline. The canonical development environment remains the conda one
+# (see env/environment.yml). Install with:
+#
+#     pip install -r requirements.txt
+#
+# Notes:
+#   * conda ships PyQt6 under the package name `pyqt`; on PyPI it is `PyQt6`.
+#   * img2pdf transitively installs pikepdf + lxml (PDF export backend).
+
+# ── Core numerical / I/O ────────────────────────────────────────────────────
+numpy>=1.24
+scipy>=1.10
+segyio>=1.9
+pyproj>=3.4
+matplotlib>=3.7
+pillow>=9.0
+img2pdf
+psutil>=5.9
+
+# ── Desktop GUI (PyQt6 + PyQtGraph) ─────────────────────────────────────────
+PyQt6>=6.5
+pyqtgraph>=0.13

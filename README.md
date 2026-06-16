@@ -30,28 +30,28 @@ both driven by the same code, so an image exported from the GUI is byte-for-byte
 CLI would produce.
 
 **Core / CLI**
-- ✅ Fully headless — no DISPLAY, no Qt required
-- ✅ GPU acceleration via CuPy (optional, auto-detected) + pyfftw FFT backend (2-5×)
-- ✅ Parallel CPU processing across all cores
-- ✅ Lossless PDF export with physical scale control (img2pdf)
-- ✅ Plotter-ready images: physical km/in + ms/in scale, UTC time axis, FIX marks
-- ✅ **Constant vertical-exaggeration** scaling (`--ve` / `--max-aspect`) so lines of any length stay comparable
-- ✅ **RAM-safe export** (`--mem-budget-gb`) — no more `ArrayMemoryError` on 100+ km lines
-- ✅ **Duplicate-timestamp trace cleanup** for raw TOPAS files
-- ✅ Three colour themes: `dark`, `light`, `print`
+- Fully headless — no DISPLAY, no Qt required
+- GPU acceleration via CuPy (optional, auto-detected) + pyfftw FFT backend (2-5×)
+- Parallel CPU processing across all cores
+- Lossless PDF export with physical scale control (img2pdf)
+- Plotter-ready images: physical km/in + ms/in scale, UTC time axis, FIX marks
+- **Constant vertical-exaggeration** scaling (`--ve` / `--max-aspect`) so lines of any length stay comparable
+- **RAM-safe export** (`--mem-budget-gb`) — no more `ArrayMemoryError` on 100+ km lines
+- **Duplicate-timestamp trace cleanup** for raw TOPAS files
+- Three colour themes: `dark`, `light`, `print`
 
 **Desktop GUI (PyQt6 + PyQtGraph)**
-- 🖥️ Live, hardware-accelerated seismic / map / spectrum / header views
-- 🎛️ Reorderable DSP node pipeline (decon · bandpass · preset · TVG · AGC · water-mute · swell)
-- 📐 Aspect / VE / hybrid scaling controls with a live DPI & size readout
-- 🔍 **Render Viewport HQ** — an export-quality overlay of the zoomed-in area, on demand
-- 🌍 CRS reprojection + navline/FIX geometry export, integrated CLI console
-- 🧮 Memory-bounded (lazy load + LRU); RAM-budget guard before heavy exports
+- Live, hardware-accelerated seismic / map / spectrum / header views
+- Reorderable DSP node pipeline (decon · bandpass · preset · TVG · AGC · water-mute · swell)
+- Aspect / VE / hybrid scaling controls with a live DPI & size readout
+- **Render Viewport HQ** — an export-quality overlay of the zoomed-in area, on demand
+- CRS reprojection + navline/FIX geometry export, integrated CLI console
+- Memory-bounded (lazy load + LRU); RAM-budget guard before heavy exports
 
 > ✅ **290 tests** — the headless core + CLI suites run anywhere; the PyQt6 GUI suites run on a desktop with a display.
 > 📑 See [`CORE_REPORT.md`](CORE_REPORT.md) (computation/CLI) and [`GUI_REPORT.md`](GUI_REPORT.md) (desktop interface) for full architecture notes.
 
-> ⚠️ This repository does **not** include proprietary SEG-Y survey data. Real data files must be provided by the authorised user.
+> ⚠️ This repository does **not** include proprietary SEG-Y survey data.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -500,7 +500,7 @@ Carried forward from the original monolith (documented, not fixed):
 
 ## 📄 License
 
-Distributed under the MIT License. See [`LICENSE`](LICENSE) for more information.
+Distributed under the GNU General Public License v3.0 (GPL-3.0). See [`LICENSE`](LICENSE) for more information.
 
 This license applies to the source code, scripts and documentation in this repository. It does not apply to SEG-Y survey data, Kongsberg TOPAS software, or any third-party proprietary materials.
 

@@ -28,6 +28,7 @@ examples/_real_in/
 # Build / packaging
 build/
 dist/
+releases/
 *.egg-info/
 .venv/
 .env/

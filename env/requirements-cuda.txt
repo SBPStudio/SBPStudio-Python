@@ -1,0 +1,27 @@
+# SBP Studio 0.5.0 — optional NVIDIA CUDA acceleration (CuPy)
+#
+# Install on TOP of requirements.txt, ONLY in the build environment used to
+# produce the CUDA variant of the packaged app:
+#
+#     pip install -r requirements.txt
+#     pip install -r requirements-cuda.txt
+#
+# IMPORTANT — use the [ctk] extra so the wheel pulls the CUDA Toolkit runtime
+# libraries (cudart, nvrtc, cuBLAS, cuFFT, …) as self-contained pip packages
+# (nvidia-*-cu12). This is what makes a *packageable* CuPy: a bare
+# `pip install cupy-cuda12x` (or a conda cupy without cudatoolkit) leaves CuPy
+# loading CUDA DLLs from a system/CUDA_PATH location that is NOT present inside
+# a frozen .exe, so the bundled app reports "GPU not available". The [ctk]
+# wheels place the DLLs under site-packages/nvidia/**/bin, which the packaging
+# .spec then collects into the bundle.
+#
+# Pick the wheel that matches the CUDA driver line on the TARGET machines:
+#   * cupy-cuda12x → CUDA 12.x / 13.x drivers   (default below)
+#   * cupy-cuda11x → CUDA 11.x drivers
+#
+# The application detects CuPy at import time and falls back silently to the
+# CPU path when no compatible GPU/driver is present (see core/_backends.py),
+# so the CUDA build still runs on machines without an NVIDIA GPU — it simply
+# does not accelerate. The packaging .spec bundles CuPy only when SBP_BUILD_CUDA=1.
+
+cupy-cuda12x[ctk]
