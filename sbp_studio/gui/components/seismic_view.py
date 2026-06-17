@@ -242,11 +242,10 @@ class SeismicView(QWidget):
         self._hq_view_key = (round(vx0, 6), round(vx1, 6), round(vy0, 6), round(vy1, 6))
 
     def clear_hq_overlay(self) -> None:
-        """Hide the HQ overlay, reverting to the fast PyQtGraph view."""
-        if self._hq_item is not None and self._hq_active:
-            self._hq_item.setVisible(False)
-            self._hq_item.setImage(np.zeros((1, 1, 4), dtype=np.uint8),
-                                   autoLevels=False)   # free the raster
+        """Remove the HQ overlay from the scene, reverting to the fast PyQtGraph view."""
+        if self._hq_item is not None:
+            self.plot.removeItem(self._hq_item)
+            self._hq_item = None
         self._hq_active = False
         self._hq_view_key = None
 

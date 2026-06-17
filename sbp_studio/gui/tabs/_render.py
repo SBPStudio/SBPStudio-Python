@@ -250,7 +250,7 @@ def compute_section(obj: Any, data: np.ndarray, params: dict,
     fixes = []
     if params.get("fix"):
         fixes = [(f[0], f[1], f[2]) for f in compute_fix_positions(
-            obj.timestamps, obj.dist_km, obj.lons, obj.lats, int(params["fix_iv"]))]
+            obj.timestamps, obj.dist_km, obj.track_lons, obj.track_lats, int(params["fix_iv"]))]
 
     return dict(
         arr=arr,                                     # (rows_dec, cols_dec) float32

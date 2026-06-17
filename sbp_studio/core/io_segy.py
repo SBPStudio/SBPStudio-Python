@@ -123,16 +123,21 @@ def smooth_track(lons: np.ndarray, lats: np.ndarray,
             median_filter(lats, size=k, mode="nearest"))
 
 
-def _timestamp_dedup_mask(doy, hod, moh, som) -> Optional[np.ndarray]:
+def _timestamp_dedup_mask(doy, hod, moh, som, sx, sy) -> Optional[np.ndarray]:
     """Return a boolean keep-mask (length n_traces) that drops consecutive traces
-    sharing an identical acquisition timestamp, or ``None`` when no cleaning is
-    warranted.
+    sharing an identical acquisition timestamp AND position, or ``None`` when no
+    cleaning is warranted.
 
     The SBP acquisition system occasionally stamps several CONSECUTIVE traces
     with the same DayOfYear/Hour/Minute/Second — duplicate shots that smear the
-    section horizontally and misalign the navigation. We build the (n_traces, 4)
-    time-vector matrix, diff consecutive rows, and keep a trace ONLY when its
-    time vector differs from its predecessor (the first trace is always kept).
+    section horizontally and misalign the navigation. We build the (n_traces, 6)
+    matrix [DOY, Hour, Minute, Second, SourceX, SourceY], diff consecutive rows,
+    and keep a trace ONLY when its vector differs from its predecessor in at least
+    one field (the first trace is always kept).
+
+    Requiring coordinate identity (raw SourceX/SourceY integers) prevents
+    high-ping-rate files (>1 Hz) from being mass-purged: real pings at the same
+    whole-second timestamp will have different positions and are correctly kept.
 
     Safety bypass: if the parsed time headers are all zeros (a file that simply
     does not populate the time words) we return ``None`` so nothing is purged —
@@ -140,9 +145,10 @@ def _timestamp_dedup_mask(doy, hod, moh, som) -> Optional[np.ndarray]:
     when there is nothing to clean (no consecutive duplicates), so the common
     case stays an exact pass-through (Zero-regression contract)."""
     tvec = np.stack([np.asarray(doy), np.asarray(hod),
-                     np.asarray(moh), np.asarray(som)], axis=1).astype(np.int64)
-    if tvec.shape[0] < 2 or not np.any(tvec):
-        return None                      # <2 traces, or all-zero headers → bypass
+                     np.asarray(moh), np.asarray(som),
+                     np.asarray(sx),  np.asarray(sy)], axis=1).astype(np.int64)
+    if tvec.shape[0] < 2 or not np.any(tvec[:, :4]):
+        return None                      # <2 traces, or all-zero time headers → bypass
     changed = np.any(np.diff(tvec, axis=0) != 0, axis=1)     # (n-1,) differs-from-prev
     keep = np.concatenate(([True], changed))                 # always keep trace[0]
     if keep.all():
@@ -235,7 +241,8 @@ def _dist_km(lons: np.ndarray, lats: np.ndarray, coord_unit: int) -> np.ndarray:
     dlat = np.diff(lats)
     dlon = np.diff(lons)
     _is_geo = coord_unit in (2, 3) or (
-        -180 <= float(lons[0]) <= 180 and -90 <= float(lats[0]) <= 90)
+        -180 <= float(np.nanmedian(lons)) <= 180 and
+        -90  <= float(np.nanmedian(lats)) <= 90)
     if _is_geo:
         lat_m = np.mean(lats)
         d = np.sqrt((dlat * 111.32)**2 +
@@ -323,6 +330,8 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
         _hdr[segyio.TraceField.HourOfDay],
         _hdr[segyio.TraceField.MinuteOfHour],
         _hdr[segyio.TraceField.SecondOfMinute],
+        _hdr[segyio.TraceField.SourceX],
+        _hdr[segyio.TraceField.SourceY],
     )
     if _keep is not None:
         for fld in list(_hdr):
@@ -395,12 +404,15 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
     prof.dist_km = _dist_km(prof.track_lons, prof.track_lats, prof.coord_unit)
     prof.total_km = float(prof.dist_km[-1])
 
-    # Header Inspector data — textual header + RAW per-trace header fields.
-    # Cheap and available even header-only (no trace DATA needed).
-    prof.text_header   = _decode_text_header(f.text[0])
-    prof.trace_headers = _extract_trace_headers(f)
-    if _keep is not None:                        # keep the inspector aligned too
-        prof.trace_headers = {k: v[_keep] for k, v in prof.trace_headers.items()}
+    # Header Inspector data — textual header is always decoded (single 3200-byte
+    # block, negligible cost). The full 91-field per-trace extract is deferred
+    # for header-only stubs (chain detection, pre-scan) where no inspector is
+    # shown; it runs only when traces are loaded so the GUI inspector works.
+    prof.text_header = _decode_text_header(f.text[0])
+    if load_traces:
+        prof.trace_headers = _extract_trace_headers(f)
+        if _keep is not None:                    # keep the inspector aligned too
+            prof.trace_headers = {k: v[_keep] for k, v in prof.trace_headers.items()}
     prof.detected_crs, prof.crs_notes = _detect_crs(prof.coord_unit, prof.lons)
 
     # OQ-2: warn if projected CRS axis unit is not metres
@@ -517,10 +529,10 @@ def _opt_reproject_coords_bulk(src_f: "segyio.SegyFile",
         src_f.attributes(segyio.TraceField.SourceGroupScalar)[:], dtype=float)
     raw_units   = np.asarray(
         src_f.attributes(segyio.TraceField.CoordinateUnits)[:], dtype=int)
-    raw_sxs     = np.asarray(
-        src_f.attributes(segyio.TraceField.SourceX)[:], dtype=float)
-    raw_sys     = np.asarray(
-        src_f.attributes(segyio.TraceField.SourceY)[:], dtype=float)
+    raw_sxs     = _to_signed(
+        src_f.attributes(segyio.TraceField.SourceX)[:], 32).astype(float)
+    raw_sys     = _to_signed(
+        src_f.attributes(segyio.TraceField.SourceY)[:], 32).astype(float)
 
     # Vectorised _scalar_fac: clip negative abs to ≥1 to avoid div-by-zero;
     # the np.where on scalars<0 branch is only used where scalars<0, but
@@ -609,8 +621,8 @@ def reproject_one(
                         log(f"  traza {i+1}/{n_src}…")
                         progress(0.1 + 0.9 * i / n_src,
                                  f"traza {i+1}/{n_src}")
-                    dst.header[i] = src.header[i]
-                    dst.header[i].update({
+                    h = dict(src.header[i])
+                    h.update({
                         segyio.TraceField.SourceX:           _safe_coord(nxs[i], div),
                         segyio.TraceField.SourceY:           _safe_coord(nys[i], div),
                         segyio.TraceField.GroupX:            _safe_coord(nxs[i], div),
@@ -618,6 +630,7 @@ def reproject_one(
                         segyio.TraceField.SourceGroupScalar: out_sc,
                         segyio.TraceField.CoordinateUnits:   new_uc,
                     })
+                    dst.header[i] = h
                     dst.trace[i] = src.trace[i]
 
         progress(1.0, "done")

@@ -294,11 +294,14 @@ class ProfileChain:
         # Header Inspector: keep the first profile's textual header; concatenate
         # the per-trace raw header fields across the whole chain.
         self.text_header = self.profiles[0].text_header if self.profiles else ""
-        labels = list(self.profiles[0].trace_headers.keys()) if self.profiles else []
-        self.trace_headers = {
-            lab: np.concatenate([p.trace_headers[lab] for p in self.profiles])
-            for lab in labels
-        }
+        if self.profiles and all(p.trace_headers for p in self.profiles):
+            labels = list(self.profiles[0].trace_headers.keys())
+            self.trace_headers = {
+                lab: np.concatenate([p.trace_headers[lab] for p in self.profiles])
+                for lab in labels
+            }
+        else:
+            self.trace_headers = {}
         # CRS inherited from the first profile so the map can reproject the chain
         # track even before the trace matrix is assembled.
         self.detected_crs = self.profiles[0].detected_crs if self.profiles else None
@@ -328,13 +331,15 @@ class ProfileChain:
         # Total trace count summed from the stubs (NOT data.shape — data is lazy).
         self.n_traces  = int(sum(p.n_traces for p in self.profiles))
 
-        # Boundary positions (km along chain) — start of each non-first profile.
-        # NOTE: uses per-profile total_km cumulative sum, NOT dist_km directly.
-        self.boundaries_km: List[float] = []
-        d = 0.0
-        for p in self.profiles[:-1]:
-            d += p.total_km
-            self.boundaries_km.append(d)
+        # Boundary positions (km along chain) — first dist_km value of each
+        # non-first profile, read directly from the assembled dist_km so the
+        # seam positions include inter-profile gaps and stay consistent with
+        # every searchsorted call on dist_km.
+        trace_offsets = np.cumsum([p.n_traces for p in self.profiles])
+        self.boundaries_km: List[float] = [
+            float(self.dist_km[trace_offsets[i]])
+            for i in range(len(self.profiles) - 1)
+        ]
 
     # ── Lazy trace assembly (on demand, from disk if evicted) ──────────────
 
@@ -365,6 +370,8 @@ class ProfileChain:
                     raise ValueError(f"Cannot load chain segment "
                                      f"{p.name}: {loaded.error}")
                 data = loaded.data
+                if not p.trace_headers:            # upgrade stub with full headers
+                    p.trace_headers = loaded.trace_headers
             mats.append(data)
         # Force C-contiguity so downstream ViewBox slicing (the GUI preview
         # extracts column/row ranges of this stitched array) is a fast memory
@@ -372,6 +379,15 @@ class ProfileChain:
         self.data = np.ascontiguousarray(np.concatenate(mats, axis=1))
         self.clip_p99 = float(np.percentile(np.abs(self.data), 99))
         self.n_traces = self.data.shape[1]
+        # Rebuild the chain-level header map now every constituent is fully loaded.
+        # This populates the Header Inspector when the chain view re-emits
+        # active_chain_changed after the worker completes.
+        if not self.trace_headers and all(p.trace_headers for p in self.profiles):
+            labels = list(self.profiles[0].trace_headers.keys())
+            self.trace_headers = {
+                lab: np.concatenate([p.trace_headers[lab] for p in self.profiles])
+                for lab in labels
+            }
         return self
 
     # ── Haversine distance helper ──────────────────────────────────────────

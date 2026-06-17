@@ -671,6 +671,7 @@ class MainWindow(QMainWindow):
         worker.progress.connect(self.on_progress)
         worker.succeeded.connect(on_success)
         worker.failed.connect(self.show_error)
+        worker.finished.connect(worker.deleteLater)
         worker.finished.connect(lambda w=worker: self._finish_worker(w))
         self._workers.add(worker)
         worker.start()

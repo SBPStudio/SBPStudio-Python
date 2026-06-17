@@ -380,8 +380,18 @@ def _style_axes(ax, fig=None) -> None:
 # ── Shared render helpers ──────────────────────────────────────────────────────
 
 def _vmin_vmax(d: np.ndarray, clip_pct: float, clip_lo: float) -> tuple:
-    """Compute (vmin, vmax) from data percentiles."""
-    flat = np.abs(d[~np.isnan(d)])
+    """Compute (vmin, vmax) from data percentiles.
+
+    Subsamples to at most 200 000 elements before the percentile so that the
+    cost stays flat regardless of matrix size (identical strategy to the
+    preview's _estimate_vmax). The clip ceiling does not need exact precision —
+    a uniform 2-D stride subsample of this size gives a stable estimate.
+    """
+    samp = d
+    if samp.size > 200_000:
+        step = int((samp.size / 200_000) ** 0.5) + 1
+        samp = samp[::step, ::step]
+    flat = np.abs(samp[np.isfinite(samp)])
     if flat.size == 0:
         return 0.0, 1.0
     vmax = float(np.percentile(flat, clip_pct)) or 1.0
@@ -605,7 +615,7 @@ def _colorize_for_target(d: np.ndarray, cmap_name: str,
     vh = src_h / max(tgt_h, 1)
     vw = src_w / max(tgt_w, 1)
 
-    if vh > 2.0 or vw > 2.0:
+    if vh > 1.0 or vw > 1.0:
         try:
             from scipy.ndimage import zoom as _zoom
             sh = tgt_h / src_h
@@ -730,7 +740,7 @@ def render_profile_figure(
 
     if params.get("fix"):
         fixes = compute_fix_positions(
-            sd.timestamps, sd.dist_km, sd.lons, sd.lats,
+            sd.timestamps, sd.dist_km, sd.track_lons, sd.track_lats,
             int(params.get("fix_iv", 5)))
         _draw_fix_marks(ax, fixes,
                         color=fix_color or C["highlight"],
@@ -738,7 +748,7 @@ def render_profile_figure(
                         axes_bg=C["entry"])
 
     if time_tick_min:
-        _add_time_axis(ax, sd.timestamps, sd.dist_km, sd.lons, sd.lats,
+        _add_time_axis(ax, sd.timestamps, sd.dist_km, sd.track_lons, sd.track_lats,
                        time_tick_min, time_fmt=time_fmt,
                        time_font_size=time_font_size, time_align=time_align,
                        colors=C)
@@ -801,37 +811,35 @@ def render_chain_figure(
         int(np.searchsorted(ch.dist_km, bk)) for bk in ch.boundaries_km
     ] + [ch.n_traces]
 
-    tgt_h = int(figsize[1] * dpi)   # target height in pixels
+    tgt_h    = int(figsize[1] * dpi)   # target height in pixels
+    target_w = int(figsize[0] * dpi)   # target width in pixels
+
+    # Per-segment output pixel widths — proportional to trace count, last
+    # segment absorbs rounding so they sum exactly to target_w. This lets
+    # _colorize_for_target resize both axes in one pass on float32 (before
+    # colorization), eliminating the unbudgeted native-width intermediate that
+    # previously grew to n_traces × tgt_h × 4 bytes before the final resize.
+    seg_ns     = [e - s for s, e in zip(seg_boundaries[:-1], seg_boundaries[1:])]
+    total_tr   = ch.n_traces or 1
+    seg_widths = [round(target_w * n / total_tr) for n in seg_ns]
+    if seg_widths:
+        seg_widths[-1] = target_w - sum(seg_widths[:-1])
 
     rgba_segs  = []
     seg_vmaxes = []
-    for seg_start, seg_end in zip(seg_boundaries[:-1], seg_boundaries[1:]):
+    for i, (seg_start, seg_end) in enumerate(zip(seg_boundaries[:-1], seg_boundaries[1:])):
         seg_d = d[:, seg_start:seg_end]
         vm, vx = _vmin_vmax(seg_d, clip_pct, clip_lo_)
         seg_vmaxes.append(vx)
-        # ── Key optimisation: each segment is resized to its correct number
-        # of OUTPUT pixels before colourisation.  For figheight=7 @ 300 DPI,
-        # tgt_h=2100 vs raw_h≈10000 → 4.76:1 vertical downsample on float32
-        # (cheap) instead of on the 4× larger RGBA uint8 array (expensive).
-        seg_tgt = (seg_end - seg_start, tgt_h)   # keep 1:1 horizontally
+        seg_tgt = (max(1, seg_widths[i]), tgt_h)
         rgba_segs.append(_colorize_for_target(seg_d, cmap_name, vm, vx, seg_tgt))
 
     vmax_cb = float(np.median(seg_vmaxes)) if seg_vmaxes else 1.0
     vmin_cb = 0.0
-    # All segments already at target height; concatenate horizontally only.
-    resized = np.concatenate(rgba_segs, axis=1)
-    n_traces_native = resized.shape[1]          # one column per trace (= ch.n_traces)
-    # ── Smooth horizontal scaling to the OUTPUT pixel width ────────────────────
-    # The segments were kept at NATIVE trace width; if the axes is wider (e.g.
-    # --px-per-trace 4 → target_w = 4·n_traces) imshow(interpolation="none") would
-    # NEAREST-upscale every trace into a hard px_per_trace-wide block — the
-    # horizontal 'smearing/blockiness' on chain exports. Resize the stitched image
-    # to the real output width with a smooth (bilinear/LANCZOS) filter, exactly as
-    # the single-profile renderer does via _colorize_for_target. imshow is then
-    # 1:1, so the traces blend smoothly instead of stair-stepping.
-    target_w = int(figsize[0] * dpi)
-    if target_w >= 1 and resized.shape[1] != target_w:
-        resized = _resize_rgba(resized, (target_w, resized.shape[0]))
+    # Segments are already at their final pixel dimensions; concatenation
+    # produces the complete (tgt_h, target_w, 4) array directly.
+    resized          = np.concatenate(rgba_segs, axis=1)
+    n_traces_native  = ch.n_traces   # trace count for axis labelling (≠ pixel width)
 
     fig = Figure(figsize=figsize, dpi=dpi, facecolor=C["panel"])
     ax  = fig.add_subplot(111)
@@ -880,7 +888,7 @@ def render_chain_figure(
 
     if params.get("fix"):
         fixes = compute_fix_positions(
-            ch.timestamps, ch.dist_km, ch.lons, ch.lats,
+            ch.timestamps, ch.dist_km, ch.track_lons, ch.track_lats,
             int(params.get("fix_iv", 5)))
         _draw_fix_marks(ax, fixes,
                         color=fix_color or C["highlight"],
@@ -888,7 +896,7 @@ def render_chain_figure(
                         axes_bg=C["entry"])
 
     if time_tick_min:
-        _add_time_axis(ax, ch.timestamps, ch.dist_km, ch.lons, ch.lats,
+        _add_time_axis(ax, ch.timestamps, ch.dist_km, ch.track_lons, ch.track_lats,
                        time_tick_min, time_fmt=time_fmt,
                        time_font_size=time_font_size, time_align=time_align,
                        colors=C, boundaries_km=ch.boundaries_km)
@@ -1225,8 +1233,12 @@ def save_figure(
             scale  = min(pw_in / fw, ph_in / fh)
             fig.set_size_inches(fw * scale, fh * scale)
 
-    kwargs: dict = {"dpi": dpi, "bbox_inches": "tight",
-                    "facecolor": fig.get_facecolor()}
+    # Adjust subplot spacing to prevent label/tick/colorbar clipping without
+    # triggering the extra full-DPI Agg rasterization that bbox_inches="tight"
+    # requires. tight_layout uses approximate text metrics (not a pixel render).
+    fig.tight_layout(pad=0.3)
+
+    kwargs: dict = {"dpi": dpi, "facecolor": fig.get_facecolor()}
     if fmt:
         kwargs["format"] = fmt
     fig.savefig(path, **kwargs)

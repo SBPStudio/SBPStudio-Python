@@ -83,23 +83,12 @@ def _ref_colormapped_rgba(
         hi        = float(vmax) if vmax != vmin else vmin + 1e-9
         data_norm = np.clip((data.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
 
-    if n_traces < 128 or n_workers <= 1:
-        cmap = _get_colormap(cmap_name)
-        return (cmap(data_norm) * 255).astype(np.uint8)
-
-    chunk_size = max(1, n_traces // n_workers)
-    slices     = [slice(j, min(j + chunk_size, n_traces))
-                  for j in range(0, n_traces, chunk_size)]
-    tiles      = [data_norm[:, sl] for sl in slices]
-    results    = [None] * len(tiles)
-
-    with _cf.ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futs = {pool.submit(_render_rgba_tile_norm, t, cmap_name): k
-                for k, t in enumerate(tiles)}
-        for fut in _cf.as_completed(futs):
-            results[futs[fut]] = fut.result()
-
-    return np.concatenate(results, axis=1)
+    # Single vectorised call: cmap() is already an efficient NumPy operation.
+    # The former tile-based ThreadPoolExecutor added pool-creation overhead and
+    # a final concatenate for negligible gain (GIL limits actual parallelism on
+    # the CPU path). n_workers is kept in the signature for API compatibility.
+    cmap = _get_colormap(cmap_name)
+    return (cmap(data_norm) * 255).astype(np.uint8)
 
 
 def colormapped_rgba(

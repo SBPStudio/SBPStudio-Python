@@ -8,6 +8,11 @@ from __future__ import annotations
 
 from typing import Dict
 
+# Default amplitude clip percentile — single source of truth used by both
+# the interactive preview and the headless export renderer as a fallback when
+# the params dict carries no explicit "clip" key.
+DEFAULT_CLIP_PCT: float = 99.6
+
 # Colormap palette: human-readable label → matplotlib cmap name.
 CMAPS: Dict[str, str] = {
     "Blanco / Negro": "Greys",

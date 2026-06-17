@@ -225,8 +225,8 @@ class PreviewController(QObject):
             return
 
         # ── Presentation: clip vmax, colormap, extent ───────────────────────
-        from sbp_studio.core.constants import CMAPS
-        clip = float(disp.get("clip", 99))
+        from sbp_studio.core.constants import CMAPS, DEFAULT_CLIP_PCT
+        clip = float(disp.get("clip", DEFAULT_CLIP_PCT))
         vmax = self._estimate_vmax(visible, clip)
 
         cmap_name = CMAPS.get(disp.get("cmap", "Viridis"), "viridis")
