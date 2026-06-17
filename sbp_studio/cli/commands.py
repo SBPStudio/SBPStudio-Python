@@ -107,26 +107,28 @@ def _make_cancel_token() -> CancelToken:
     return tok
 
 
-def _load_profiles(files: List[str], quiet: bool = False) -> List[SegyProfile]:
+def _load_profiles(files: List[str], quiet: bool = False,
+                   load_traces: bool = True) -> List[SegyProfile]:
     profiles = []
     for f in files:
         if not quiet:
             print(f"  Loading {Path(f).name}…", file=sys.stderr)
-        sd = load_profile(f)
+        sd = load_profile(f, load_traces=load_traces)
         if sd.error:
             print(f"  WARNING: {Path(f).name}: {sd.error}", file=sys.stderr)
         profiles.append(sd)
     return profiles
 
 
-def _load_profiles_parallel(files: List[str]) -> List[SegyProfile]:
+def _load_profiles_parallel(files: List[str],
+                            load_traces: bool = True) -> List[SegyProfile]:
     """
     Load multiple SEG-Y files concurrently with ThreadPoolExecutor.
     Each file is a separate segyio handle → no shared state, thread-safe.
     I/O-bound: threading gives ~Nx speedup for N files on SSD/NVMe.
     """
     if len(files) <= 1:
-        return _load_profiles(files)
+        return _load_profiles(files, load_traces=load_traces)
 
     n_workers = min(len(files), 4)   # cap at 4 to avoid disk thrashing
     results:   List[Optional[SegyProfile]] = [None] * len(files)
@@ -134,7 +136,7 @@ def _load_profiles_parallel(files: List[str]) -> List[SegyProfile]:
     def _load_one(idx_path):
         idx, path = idx_path
         print(f"  Loading {Path(path).name}…", file=sys.stderr)
-        sd = load_profile(path)
+        sd = load_profile(path, load_traces=load_traces)
         if sd.error:
             print(f"  WARNING: {Path(path).name}: {sd.error}", file=sys.stderr)
         return idx, sd
@@ -361,12 +363,16 @@ def cmd_export_image(args) -> None:
     # ── Timer ──────────────────────────────────────────────────────────────
     timer = PhasedTimer(enabled=getattr(args, "timeit", False))
 
-    # ── Load profiles (parallel for multiple files) ────────────────────────
+    # ── Load profiles header-only (parallel for multiple files) ───────────────
+    # Trace matrices are JIT-loaded per file in the export loop below so that
+    # only one profile's full matrix is resident at a time (peak RAM = 1 file,
+    # not N files). All metadata needed for figsize / chain-detect is present
+    # in header-only stubs. The parallel speedup for I/O is preserved.
     with timer.phase("loading"):
         if len(args.files) > 1:
-            profiles = _load_profiles_parallel(args.files)
+            profiles = _load_profiles_parallel(args.files, load_traces=False)
         else:
-            profiles = _load_profiles(args.files)
+            profiles = _load_profiles(args.files, load_traces=False)
 
     valid = [p for p in profiles if not p.error]
     if not valid:
@@ -734,10 +740,16 @@ def cmd_export_image(args) -> None:
         for sd in valid:
             print(f"\nExporting {sd.name}…", file=sys.stderr)
             with timer.phase("processing"):
-                data = process_profile_data(sd, params)
+                full = load_profile(sd.path, load_traces=True)
+                if full.error:
+                    print(f"  ERROR reloading {sd.name}: {full.error}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                data = process_profile_data(full, params)
+                full.data = None    # release raw matrix; processed data stays
             out = args.out or str(Path(sd.path).with_suffix(f".{fmt}"))
             with timer.phase("render+save"):
-                _export_one(sd, data, out, is_chain=False)
+                _export_one(full, data, out, is_chain=False)
 
     if getattr(args, "timeit", False):
         print(timer.report(prefix="\n  "), file=sys.stderr)

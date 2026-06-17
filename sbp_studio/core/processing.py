@@ -35,6 +35,9 @@ import scipy.linalg
 from scipy import signal as sp_signal
 
 from ._backends import XP as _XP, GPU as _GPU, N_WORKERS as _N_WORKERS
+from .logger import get_logger
+
+_LOG = get_logger("processing")
 
 
 # ── Parallel helper ────────────────────────────────────────────────────────────
@@ -57,7 +60,9 @@ def _parallel_apply(fn, data: np.ndarray, *args,
     chunks     = [data[:, sl] for sl in slices]
     results    = [None] * len(chunks)
 
-    with _cf.ThreadPoolExecutor(max_workers=n_workers) as pool:
+    # Cap at 4 to avoid N×N contention with BLAS threads when running inside
+    # a CoreWorker export job (BLAS already threads per worker internally).
+    with _cf.ThreadPoolExecutor(max_workers=min(n_workers, 4)) as pool:
         futs = {pool.submit(fn, ch, *args, **kwargs): k
                 for k, ch in enumerate(chunks)}
         for fut in _cf.as_completed(futs):
@@ -517,6 +522,18 @@ def apply_delay_alignment(data: np.ndarray, delays: np.ndarray,
     ns, n_traces = data.shape
     dt_ms   = dt_us / 1000.0
     offsets = np.round((np.asarray(delays) - min_delay) / dt_ms).astype(int)
+    # Guard against corrupt DelayRecordingTime headers: a single bad value can
+    # make extra = millions of rows → OOM. Cap at ns samples (one full record
+    # length); any larger shift is physically impossible for valid SBP data.
+    if offsets.size:
+        bad = offsets > ns
+        if bad.any():
+            _LOG.warning(
+                "apply_delay_alignment: %d trace(s) have delay offsets > record "
+                "length (%d samples max); clamping to %d. Max corrupt value: %d.",
+                int(bad.sum()), ns, ns, int(offsets[bad].max()),
+            )
+            offsets = np.clip(offsets, 0, ns)
     extra   = int(offsets.max()) if offsets.size else 0
     aligned = np.full((ns + extra, n_traces), fill_value, dtype=np.float32)
     row_idx = np.arange(ns)[:, None] + offsets[None, :]
@@ -557,7 +574,7 @@ def apply_water_mute(data: np.ndarray, threshold_pct: float,
     ns, n_traces = data.shape
     dt_ms  = dt_us / 1000.0
     abs_d  = np.abs(data)
-    peak   = abs_d.max(axis=0)                         # (n_traces,)
+    peak   = np.nanmax(abs_d, axis=0)                  # (n_traces,) — NaN-safe for aligned data
     thresh = (threshold_pct / 100.0) * peak            # (n_traces,)
 
     # First sample per trace reaching the threshold (the peak always qualifies,
@@ -725,7 +742,7 @@ def _process_data_generic(obj: Any, params: Dict[str, Any]) -> np.ndarray:
     """
     from .constants import FILTER_PRESETS as _FP
 
-    data = obj.data.copy()
+    data = obj.data   # no upfront copy — each active stage returns a new array
 
     if params.get("decon"):
         data = apply_predictive_decon(data, obj.dt_us,
@@ -759,6 +776,8 @@ def _process_data_generic(obj: Any, params: Dict[str, Any]) -> np.ndarray:
         data = apply_delay_alignment(data, obj.delays, obj.min_delay,
                                      obj.dt_us, fill_value=fill_value)
 
+    if data is obj.data:   # no stage ran — copy to honour "new array" contract
+        data = data.copy()
     return data
 
 
