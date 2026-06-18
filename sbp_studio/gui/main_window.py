@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
 
 from .i18n import LANGUAGE_NAMES, language_manager
 from .state import AppState
-from .tabs import ChainsTab, ReprojectorTab, VisualizerTab
+from .tabs import ReprojectorTab, VisualizerTab
 from .theme import THEMES, theme
 from .workers import CoreWorker
 
@@ -330,10 +330,8 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tab_visualizer = VisualizerTab(self.state, self)
         self.tab_reprojector = ReprojectorTab(self.state, self)
-        self.tab_chains = ChainsTab(self.state, self)
         self.tabs.addTab(self.tab_visualizer, "")
         self.tabs.addTab(self.tab_reprojector, "")
-        self.tabs.addTab(self.tab_chains, "")
         return self.tabs
 
     # ── Status bar ────────────────────────────────────────────────────────────
@@ -413,6 +411,7 @@ class MainWindow(QMainWindow):
         # Kick off trace loading for stub profiles so the tab shows "Loading…"
         # instead of waiting for the user to click Render.
         if key is not None:
+            self._clear_other_list_selection(self.chain_list)
             prof = self.state.profiles.get(key)
             if prof is not None and getattr(prof, "data", None) is None and not getattr(prof, "error", None):
                 self._load_profile_traces(prof)
@@ -435,8 +434,23 @@ class MainWindow(QMainWindow):
         # viewed (mirrors the per-profile lazy load). The tab shows "Loading…"
         # meanwhile and transitions once update_chain_data re-emits.
         chain = self.state.active_chain
-        if chain is not None and getattr(chain, "data", None) is None:
-            self._load_chain_traces(chain)
+        if chain is not None:
+            self._clear_other_list_selection(self.prof_list)
+            if getattr(chain, "data", None) is None:
+                self._load_chain_traces(chain)
+
+    def _clear_other_list_selection(self, widget) -> None:
+        """Clear the highlight on the sidebar list that did NOT drive the active
+        view, so the unified Visualizer's source is unambiguous. Signals are
+        blocked so clearing never cascades into a set_active(None) — the state's
+        other-kind active object is intentionally left intact (the tab's mode
+        flag, not the list highlight, governs what renders). Map buttons are
+        refreshed manually since itemSelectionChanged is suppressed."""
+        widget.blockSignals(True)
+        widget.clearSelection()
+        widget.setCurrentRow(-1)
+        widget.blockSignals(False)
+        self._update_map_buttons()
 
     def _load_chain_traces(self, chain) -> None:
         """Background worker: assemble a chain's trace matrix on demand, loading
@@ -456,7 +470,7 @@ class MainWindow(QMainWindow):
     def _add_profiles(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
             self, self.tr("Add profiles"), "",
-            self.tr("SEG-Y (*.sgy *.segy);;All files (*)"))
+            self.tr("SEG-Y (*.sgy *.segy *.seg);;All files (*)"))
         if not paths:
             return
         self.task_started(self.tr("Reading headers…"))
@@ -583,35 +597,42 @@ class MainWindow(QMainWindow):
     # ── Batch export (right-click → 'Export selected in batch…') ──────────────
     def _prof_context_menu(self, pos) -> None:
         self._list_context_menu(self.prof_list, self._selected_profiles(),
-                                self.tab_visualizer, pos)
+                                False, pos)
 
     def _chain_context_menu(self, pos) -> None:
         self._list_context_menu(self.chain_list, self._selected_chains(),
-                                self.tab_chains, pos)
+                                True, pos)
 
-    def _list_context_menu(self, widget, items: list, tab, pos) -> None:
+    def _list_context_menu(self, widget, items: list, is_chain: bool, pos) -> None:
         """Show the batch-export action for the current multi-selection."""
         if not items:
             return
         menu = QMenu(self)
         act_export = menu.addAction(self.tr("Export selected in batch…"))
         if menu.exec(widget.mapToGlobal(pos)) is act_export:
-            self._batch_export(items, tab)
+            self._batch_export(items, is_chain)
 
-    def _batch_export(self, items: list, tab) -> None:
+    def _batch_export(self, items: list, is_chain: bool) -> None:
         """Open the export options ONCE, then hand the whole selection to the
-        relevant tab's worker-backed batch exporter (inherits its DSP settings)."""
+        unified Visualizer tab's worker-backed batch exporter (inherits its DSP
+        settings). ``is_chain`` selects the render/load path for the batch items
+        explicitly — decoupled from the live view's current mode."""
         from .components import ExportDialog
         dlg = ExportDialog(self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        tab.export_batch(items, dlg.config())
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            cfg = dlg.config()
+        finally:
+            dlg.deleteLater()
+        handler = self.tab_visualizer.source_handler(is_chain=is_chain)
+        self.tab_visualizer.export_batch(items, cfg, handler)
 
     def _add_profiles_to_map(self) -> None:
         self._tracks_to_map(self._selected_profiles(), self.tab_visualizer)
 
     def _add_chains_to_map(self) -> None:
-        self._tracks_to_map(self._selected_chains(), self.tab_chains)
+        self._tracks_to_map(self._selected_chains(), self.tab_visualizer)
 
     def _tracks_to_map(self, objs: list, tab) -> None:
         """Extract the navigation tracks of *objs* (profiles or chains) and add
@@ -808,7 +829,6 @@ class MainWindow(QMainWindow):
         # Tabs
         self.tabs.setTabText(0, self.tr("  ▣  Visualizer  "))
         self.tabs.setTabText(1, self.tr("  ⇄  Reprojector  "))
-        self.tabs.setTabText(2, self.tr("  ⛓  Chains  "))
 
         # Status bar
         if self._active_tasks == 0:

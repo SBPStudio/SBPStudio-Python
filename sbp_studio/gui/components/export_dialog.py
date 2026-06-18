@@ -116,6 +116,20 @@ class ExportDialog(QDialog):
         # Draw the grid (cells) using the X/Y spacings above. Off → no grid.
         root.addWidget(self.cb_grid)
 
+        # Reflector-safe downscale: when the export must shrink below native (a
+        # RAM-capped DPI), pool by max-|amplitude| so thin high-amplitude
+        # reflectors survive instead of being averaged out by bilinear. Default on.
+        self.cb_maxabs = QCheckBox()
+        self.cb_maxabs.setChecked(True)
+        root.addWidget(self.cb_maxabs)
+
+        # ── Dynamic info panel (Part 1): native DPI, quality %, RAM estimate ──
+        # Recomputed live as DPI / memory budget change so the user sees exactly
+        # what the engine will do BEFORE exporting.
+        self.lbl_quality = QLabel()
+        self.lbl_quality.setWordWrap(True)
+        root.addWidget(self.lbl_quality)
+
         # ── Live budget / output-size status (Part 1) ────────────────────────
         # Shows the estimated raster size for the current DPI + scale, and — when
         # the chosen DPI would exceed the memory budget — the forced-safe DPI the
@@ -150,13 +164,16 @@ class ExportDialog(QDialog):
     # ── Live budget validation (Part 1) ──────────────────────────────────────
 
     def _estimate(self) -> Optional[tuple]:
-        """Return (figsize, chosen_dpi, eff_dpi, safe_dpi, mpx) for the current
-        settings, or None when there is no source to estimate against. ``eff_dpi``
-        is what the export will REALLY use (native-need raise, capped by budget);
-        ``safe_dpi`` is the budget ceiling."""
+        """Return (figsize, chosen_dpi, eff_dpi, safe_dpi, mpx, native_dpi, ram_gb)
+        for the current settings, or None when there is no source to estimate
+        against. ``eff_dpi`` is what the export will REALLY use (native-need raise,
+        capped by budget); ``safe_dpi`` is the budget ceiling; ``native_dpi`` is
+        the DPI for a 1:1 raster (1 px per trace horizontally / sample vertically);
+        ``ram_gb`` is the RGBA matrix footprint (w·h·4 bytes) at ``eff_dpi``."""
         if self._source is None or self._scale_cfg is None:
             return None
         try:
+            import math
             from ..tabs._render import (figsize_for_scale, effective_export_dpi,
                                         dpi_for_budget)
             chosen = self._dpi()
@@ -169,7 +186,13 @@ class ExportDialog(QDialog):
             if safe is not None and eff > safe:
                 eff = max(50, safe)
             mpx = (figsize[0] * eff) * (figsize[1] * eff) / 1e6
-            return figsize, chosen, eff, safe, mpx
+            # Native (1:1) DPI: 1 output px per trace (x) / sample (y).
+            w_in, h_in = float(figsize[0]), float(figsize[1])
+            native = (int(math.ceil(max(nt / w_in, ns / h_in)))
+                      if w_in > 0 and h_in > 0 else eff)
+            # RGBA matrix footprint at the effective DPI (w·h·4 bytes).
+            ram_gb = (w_in * eff) * (h_in * eff) * 4 / 1024 ** 3
+            return figsize, chosen, eff, safe, mpx, native, ram_gb
         except Exception:
             return None
 
@@ -177,8 +200,27 @@ class ExportDialog(QDialog):
         est = self._estimate()
         if est is None:
             self.lbl_budget.setText("")
+            self.lbl_quality.setText("")
             return
-        _figsize, chosen, eff, safe, mpx = est
+        _figsize, chosen, eff, safe, mpx, native, ram_gb = est
+
+        # ── Info panel: native DPI · quality · RAM ──
+        native = max(1, int(native))
+        quality = min(100.0, 100.0 * eff / native)
+        ram_txt = (self.tr("{0:.2f} GB").format(ram_gb) if ram_gb >= 1.0
+                   else self.tr("{0:.0f} MB").format(ram_gb * 1024))
+        if quality >= 99.5:
+            self.lbl_quality.setStyleSheet("color:#3a8a3a;")
+            q_line = self.tr("Quality: {0:.0f}% (native resolution)").format(quality)
+        else:
+            self.lbl_quality.setStyleSheet("color:#cc7000;")
+            q_line = self.tr("Quality: {0:.0f}% (downsampled)").format(quality)
+        self.lbl_quality.setText(
+            self.tr("Native DPI: {0} (1 px / trace · sample)").format(native)
+            + "\n" + q_line
+            + "\n" + self.tr("Estimated RAM: {0}").format(ram_txt))
+
+        # ── Budget line (unchanged behaviour) ──
         if safe is not None and eff < chosen:
             self.lbl_budget.setStyleSheet("color:#cc7000;")
             self.lbl_budget.setText(self.tr(
@@ -198,7 +240,7 @@ class ExportDialog(QDialog):
         est = self._estimate()
         if est is None:
             return
-        _figsize, chosen, eff, safe, _mpx = est
+        _figsize, chosen, eff, safe, *_ = est
         if safe is not None and chosen > safe:
             self.cb_dpi.setCurrentText(str(int(eff)))
             self._update_budget_status()
@@ -226,6 +268,7 @@ class ExportDialog(QDialog):
             margin_top=float(self.sp_mtop.value()),
             margin_bottom=float(self.sp_mbot.value()),
             mem_budget_gb=float(self.sp_membudget.value()),
+            max_abs_pool=self.cb_maxabs.isChecked(),
             # ── Baked defaults ──
             velocity=1500.0,
             pdf_page="auto",
@@ -256,6 +299,12 @@ class ExportDialog(QDialog):
             label_widget.setText(text)
         self.cb_boundaries.setText(self.tr("Include red file boundary lines in export"))
         self.cb_grid.setText(self.tr("Draw grid (uses the X/Y spacings above)"))
+        self.cb_maxabs.setText(self.tr("Use Max-Abs pooling when downsampling "
+                                       "(preserves amplitude peaks)"))
+        self.cb_maxabs.setToolTip(self.tr(
+            "When the export must shrink below native resolution, keep the "
+            "strongest sample per block instead of averaging — preserves thin, "
+            "high-amplitude reflectors."))
         # Standard buttons render with no visible text under the dark QSS — set
         # explicit, translated text so they're always readable.
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(self.tr("Accept"))

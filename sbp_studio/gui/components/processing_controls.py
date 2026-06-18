@@ -33,6 +33,11 @@ from sbp_studio.core.constants import (
     CMAPS, FILTER_DESCRIPTIONS, FILTER_PRESETS,
 )
 
+# Live-preview horizontal detail (px per trace). The user-facing px/trace control
+# was replaced by the physical 'traces per cm' scale; this fixed value keeps the
+# preview column cap + HQ overlay sharpness at their historical level.
+DEFAULT_PX_PER_TRACE = 20.0
+
 
 class LabeledSlider(QWidget):
     """Horizontal slider with arbitrary float resolution and a value label."""
@@ -102,8 +107,43 @@ class ProcessingControls(QWidget):
         self.cmap_cb = QComboBox()
         self.cmap_cb.addItems(list(CMAPS.keys()))
         v.addWidget(self.cmap_cb)
+        # Invert + amplitude-range mode (diverging −1..1 vs sequential 0..1), one
+        # row of checkboxes. The two ranges are mutually exclusive.
         self.inv_cmap = QCheckBox()
-        v.addWidget(self.inv_cmap)
+        self.amp_diverging = QCheckBox()       # [-1 to 1] — diverging amplitudes
+        self.amp_sequential = QCheckBox()      # [ 0 to 1] — sequential amplitudes
+        self.amp_sequential.setChecked(True)   # default: |amp| 0..1 (historical)
+        _amp_row = QHBoxLayout()
+        _amp_row.setContentsMargins(0, 0, 0, 0)
+        _amp_row.setSpacing(8)
+        _amp_row.addWidget(self.inv_cmap)
+        _amp_row.addWidget(self.amp_diverging)
+        _amp_row.addWidget(self.amp_sequential)
+        _amp_row.addStretch(1)
+        v.addLayout(_amp_row)
+        self.amp_diverging.toggled.connect(self._on_amp_diverging)
+        self.amp_sequential.toggled.connect(self._on_amp_sequential)
+
+        # ── Render style (directly under the palette) ──
+        # Wiggle (+ Variable Area beside it); Raster below, interactive only when
+        # Wiggle is on. Wiggle traces render in BLACK. Wiggle OFF = pure density.
+        self.wiggle_cb = QCheckBox()
+        self.va_cb = QCheckBox()
+        self.va_cb.setChecked(True)
+        _wig_row = QHBoxLayout()
+        _wig_row.setContentsMargins(0, 0, 0, 0)
+        _wig_row.setSpacing(8)
+        _wig_row.addWidget(self.wiggle_cb)
+        _wig_row.addWidget(self.va_cb)
+        _wig_row.addStretch(1)
+        v.addLayout(_wig_row)
+        self.raster_cb = QCheckBox()
+        self.raster_cb.setChecked(True)
+        self.raster_cb.setEnabled(False)       # enabled only when Wiggle is on
+        v.addWidget(self.raster_cb)
+        self.wiggle_cb.toggled.connect(self._on_wiggle_toggled)
+        for _cb in (self.wiggle_cb, self.va_cb, self.raster_cb):
+            _cb.toggled.connect(lambda *_: self.display_changed.emit())
 
         # ── Predictive deconvolution ──
         self.sec_decon = self._section()
@@ -267,19 +307,34 @@ class ProcessingControls(QWidget):
         _tight_row((self.rb_hybrid, 1), (self.sp_maxasp, 0))
         self.cap_scale_hint = self._caption()
 
-        # ── Resolution: pixels per trace ─────────────────────────────────────
-        # Drives the EXPORT horizontal density (aspect-mode figure width, == the
-        # CLI --px-per-trace) AND the live VIEWER detail (raises the preview column
-        # cap so zooming in stays sharp). Higher = sharper / heavier.
-        self.cap_pxtrace = QLabel()
-        self.cap_pxtrace.setObjectName("sub")
-        self.sp_pxtrace = QDoubleSpinBox()
-        self.sp_pxtrace.setRange(1.0, 200.0)
-        self.sp_pxtrace.setSingleStep(1.0)
-        self.sp_pxtrace.setDecimals(0)
-        self.sp_pxtrace.setValue(20.0)
-        self.sp_pxtrace.setMaximumWidth(72)
-        _tight_row((self.cap_pxtrace, 1), (self.sp_pxtrace, 0))
+        # ── Horizontal scale: traces per cm (label, then slider + numeric) ────
+        # Replaces the old px/trace control. STRICTLY horizontal: sets the export
+        # width (n_traces / tpc / 2.54) and the live horizontal density; the
+        # vertical (time) scale is held constant (decoupled — see figsize_for_scale
+        # and SeismicView.set_aspect). Higher = compressed; lower = stretched.
+        self.cap_tpc = QLabel()
+        self.cap_tpc.setObjectName("sub")
+        v.addWidget(self.cap_tpc)                 # label on its own line, above
+        self.sld_tpc = QSlider(Qt.Orientation.Horizontal)
+        self.sld_tpc.setRange(1, 2000)
+        self.sld_tpc.setSingleStep(1)
+        self.sld_tpc.setPageStep(25)
+        self.sp_tpc = QDoubleSpinBox()
+        self.sp_tpc.setRange(1.0, 2000.0)
+        self.sp_tpc.setDecimals(0)
+        self.sp_tpc.setSingleStep(1.0)
+        self.sp_tpc.setValue(40.0)
+        self.sp_tpc.setMaximumWidth(72)
+        self.sld_tpc.setValue(40)
+        _tpc_row = QHBoxLayout()
+        _tpc_row.setContentsMargins(0, 0, 0, 0)
+        _tpc_row.setSpacing(4)
+        _tpc_row.addWidget(self.sld_tpc, 1)       # slider fills the row width
+        _tpc_row.addWidget(self.sp_tpc, 0)
+        v.addLayout(_tpc_row)
+        self._syncing_tpc = False
+        self.sld_tpc.valueChanged.connect(self._on_tpc_slider)
+        self.sp_tpc.valueChanged.connect(self._on_tpc_spin)
 
         # ── Dynamic export-DPI readout (Part 2) ──────────────────────────────
         # Shows the resolution the export will actually generate for the CURRENT
@@ -300,9 +355,8 @@ class ProcessingControls(QWidget):
             rb.toggled.connect(lambda *_: self.scale_changed.emit())
         for sp in (self.sp_ratio, self.sp_ve, self.sp_maxasp):
             sp.valueChanged.connect(lambda *_: self.scale_changed.emit())
-        # px/trace changes both the export width AND the live viewer detail.
-        self.sp_pxtrace.valueChanged.connect(lambda *_: self.scale_changed.emit())
-        self.sp_pxtrace.valueChanged.connect(lambda *_: self.display_changed.emit())
+        # traces/cm changes the export width AND the live horizontal density.
+        self.sp_tpc.valueChanged.connect(lambda *_: self.scale_changed.emit())
 
         # ── Action — two side-by-side render buttons (Part 3) ──
         line = QFrame()
@@ -337,6 +391,8 @@ class ProcessingControls(QWidget):
         # downstream by the controller's own work being cheap).
         self.cmap_cb.currentTextChanged.connect(lambda *_: self.display_changed.emit())
         self.inv_cmap.toggled.connect(lambda *_: self.display_changed.emit())
+        self.amp_diverging.toggled.connect(lambda *_: self.display_changed.emit())
+        self.amp_sequential.toggled.connect(lambda *_: self.display_changed.emit())
         self.clip.valueChanged.connect(lambda *_: self.display_changed.emit())
         self.fix.toggled.connect(lambda *_: self.display_changed.emit())
         self.fix_interval.valueChanged.connect(lambda *_: self.display_changed.emit())
@@ -385,6 +441,7 @@ class ProcessingControls(QWidget):
         not a pipeline node): the controller applies it to the base array before
         the dynamic nodes. ``boundaries`` is the file-seam overlay toggle.
         """
+        wiggle = self.wiggle_cb.isChecked()
         return dict(
             cmap=self.cmap_cb.currentText(),
             inv_cmap=self.inv_cmap.isChecked(),
@@ -393,7 +450,16 @@ class ProcessingControls(QWidget):
             fix_iv=int(self.fix_interval.value()),
             align=self.align_delays.isChecked(),
             boundaries=self.show_boundaries.isChecked(),
-            px_per_trace=float(self.sp_pxtrace.value()),
+            px_per_trace=DEFAULT_PX_PER_TRACE,
+            # Render style derived from the checkboxes: Wiggle on → 'wiggle' with
+            # optional Variable-Area fill; the raster underlay is user-toggleable
+            # only with Wiggle on (Density always keeps the raster).
+            style="wiggle" if wiggle else "density",
+            va_fill=self.va_cb.isChecked(),
+            show_raster=(self.raster_cb.isChecked() if wiggle else True),
+            # Amplitude range: diverging (−1..1, signed) vs sequential (0..1, |amp|).
+            amp_range=("diverging" if self.amp_diverging.isChecked()
+                       else "sequential"),
         )
 
     def align_enabled(self) -> bool:
@@ -439,15 +505,30 @@ class ProcessingControls(QWidget):
             mode = "hybrid"
         else:
             mode = "aspect"
+        # layout_mode is FORCED to 'decoupled' (the Layout-mode dropdown was
+        # removed): traces/cm is strictly horizontal, the vertical scale comes
+        # from VE and never changes with the trace spacing.
         return dict(mode=mode,
                     ratio=float(self.sp_ratio.value()),
                     ve=float(self.sp_ve.value()),
                     max_aspect=float(self.sp_maxasp.value()),
-                    px_per_trace=float(self.sp_pxtrace.value()))
+                    traces_per_cm=float(self.sp_tpc.value()),
+                    layout_mode="decoupled")
 
     def px_per_trace(self) -> float:
-        """Pixels per trace — export horizontal density + live viewer detail."""
-        return float(self.sp_pxtrace.value())
+        """Live-preview horizontal detail (px per trace) — a fixed value now that
+        the physical 'traces per cm' control governs export width. Kept for the
+        preview column cap + HQ overlay sharpness."""
+        return DEFAULT_PX_PER_TRACE
+
+    def render_style(self) -> str:
+        """Section render style: 'density' or 'wiggle' (from the Wiggle checkbox)."""
+        return "wiggle" if self.wiggle_cb.isChecked() else "density"
+
+    def show_raster(self) -> bool:
+        """Whether the raster base layer is drawn (always True unless Wiggle is on
+        and the Raster checkbox is cleared = 'Wiggle Only')."""
+        return self.raster_cb.isChecked() if self.wiggle_cb.isChecked() else True
 
     def set_dpi_estimate(self, text: str) -> None:
         """Set the live 'resulting export DPI' readout (computed by the tab)."""
@@ -469,13 +550,48 @@ class ProcessingControls(QWidget):
         self.sld_deform.setValue(int(round(val * self._DEF_SCALE)))
         self._syncing_deform = False
 
+    # ── Traces-per-cm slider ↔ spin sync ─────────────────────────────────────
+
+    def _on_tpc_slider(self, val: int) -> None:
+        if self._syncing_tpc:
+            return
+        self._syncing_tpc = True
+        self.sp_tpc.setValue(float(val))
+        self._syncing_tpc = False
+
+    def _on_tpc_spin(self, val: float) -> None:
+        if self._syncing_tpc:
+            return
+        self._syncing_tpc = True
+        self.sld_tpc.setValue(int(round(val)))
+        self._syncing_tpc = False
+
+    def _on_wiggle_toggled(self, on: bool) -> None:
+        """The Raster checkbox is interactive only when Wiggle is on (Density
+        always keeps the raster). Its checked state is preserved across toggles."""
+        self.raster_cb.setEnabled(bool(on))
+
+    def _on_amp_diverging(self, on: bool) -> None:
+        """Diverging (−1..1) and sequential (0..1) amplitude ranges are mutually
+        exclusive — at least one is always set (default sequential)."""
+        if on:
+            self.amp_sequential.setChecked(False)
+        elif not self.amp_sequential.isChecked():
+            self.amp_sequential.setChecked(True)
+
+    def _on_amp_sequential(self, on: bool) -> None:
+        if on:
+            self.amp_diverging.setChecked(False)
+        elif not self.amp_diverging.isChecked():
+            self.amp_diverging.setChecked(True)
+
     def reset_scale_defaults(self) -> None:
         """Part 3: restore every aspect/scale setting to its default in one click."""
         self.rb_aspect.setChecked(True)
         self.sp_ratio.setValue(3.0)        # syncs the deformation slider too
         self.sp_ve.setValue(67.0)
         self.sp_maxasp.setValue(5.0)
-        self.sp_pxtrace.setValue(20.0)
+        self.sp_tpc.setValue(40.0)         # syncs the traces/cm slider too
         self.scale_changed.emit()
 
     def aspect(self) -> Optional[float]:
@@ -513,6 +629,24 @@ class ProcessingControls(QWidget):
         self.cap_fix_interval.setText(self.tr("Interval (min):"))
         # Checkboxes / button
         self.inv_cmap.setText(self.tr("Invert colors"))
+        self.amp_diverging.setText(self.tr("[ -1 to 1 ]"))
+        self.amp_diverging.setToolTip(self.tr(
+            "Diverging amplitude range (−1..1) — colormaps centred on zero for "
+            "signed amplitudes."))
+        self.amp_sequential.setText(self.tr("[ 0 to 1 ]"))
+        self.amp_sequential.setToolTip(self.tr(
+            "Sequential amplitude range (0..1) — colormaps for |amplitude|."))
+        self.wiggle_cb.setText(self.tr("Wiggle"))
+        self.wiggle_cb.setToolTip(self.tr(
+            "Draw traces as black wiggle lines over the raster (zoom in for more "
+            "native detail)."))
+        self.va_cb.setText(self.tr("Variable area"))
+        self.va_cb.setToolTip(self.tr(
+            "Fill the positive lobes of each wiggle (classic variable-area look)."))
+        self.raster_cb.setText(self.tr("Raster"))
+        self.raster_cb.setToolTip(self.tr(
+            "Show the colour raster underneath the wiggles (only with Wiggle on; "
+            "off = wiggle only)."))
         self.decon.setText(self.tr("Enable deconvolution"))
         self.filt.setText(self.tr("Enable filter"))
         self.tvg.setText(self.tr("Adaptive TVG (compensate α)"))
@@ -543,10 +677,12 @@ class ProcessingControls(QWidget):
             "right."))
         self.sp_ratio.setToolTip(self.sld_deform.toolTip())
         self.btn_scale_reset.setText(self.tr("↺  Reset aspect settings"))
-        self.cap_pxtrace.setText(self.tr("Pixels / trace (resolution)"))
-        self.sp_pxtrace.setToolTip(self.tr(
-            "Horizontal sharpness: higher = more pixels per trace in the export "
-            "and more detail in the live view (heavier). Matches CLI --px-per-trace."))
+        self.cap_tpc.setText(self.tr("Traces / cm (horizontal scale)"))
+        self.sp_tpc.setToolTip(self.tr(
+            "Horizontal trace spacing: higher = more traces per cm (compressed), "
+            "lower = stretched. Strictly horizontal — the vertical (time) scale "
+            "never changes."))
+        self.sld_tpc.setToolTip(self.sp_tpc.toolTip())
         self.btn_render.setText(self.tr("⟳  Render Full"))
         self.btn_render.setToolTip(self.tr("Re-render the whole seismic line."))
         self.btn_render_viewport.setText(self.tr("🔍  Render Viewport HQ"))

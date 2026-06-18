@@ -40,8 +40,7 @@ from typing import List, Optional, Any
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")  # must be called before importing pyplot/Figure
-import matplotlib.pyplot as plt
+matplotlib.use("Agg")  # must be called before importing Figure
 import matplotlib.colors as mcolors
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
@@ -593,18 +592,68 @@ def _resize_rgba(rgba: np.ndarray, target_px: tuple) -> np.ndarray:
         return rgba
 
 
+def _maxabs_pool_1d(a: np.ndarray, tgt: int, axis: int = 0) -> np.ndarray:
+    """Reduce ``a`` along ``axis`` to ``tgt`` bins keeping the MAX-|value| sample
+    per bin. Preserves thin, high-amplitude reflectors that plain averaging /
+    bilinear interpolation would smear out. ``tgt >= size`` (upsample) is a no-op
+    on that axis.
+
+    Fast path: when ``src`` is exactly divisible by ``tgt`` the entire reduction
+    is a single reshape + argmax (no Python loop). Fallback: Python loop with
+    variable-width bins for non-integer block ratios."""
+    src = a.shape[axis]
+    if tgt < 1 or tgt >= src:
+        return a
+    a = np.moveaxis(a, axis, 0)   # bring the target axis to front
+
+    if src % tgt == 0:
+        # ── Vectorized fast path: uniform block size ─────────────────────────
+        blk     = src // tgt
+        tail    = a.shape[1:]
+        blocks  = a.reshape(tgt, blk, *tail)                            # (tgt, blk, ...)
+        safe    = np.where(np.isfinite(blocks), np.abs(blocks), -1.0)  # mask NaN/Inf
+        idx     = np.argmax(safe, axis=1)                               # (tgt, ...)
+        out     = np.take_along_axis(blocks,
+                                     np.expand_dims(idx, axis=1),
+                                     axis=1)[:, 0]                      # (tgt, ...)
+    else:
+        # ── Fallback: Python loop for non-integer block ratios ───────────────
+        edges = np.linspace(0, src, tgt + 1).astype(int)
+        out   = np.empty((tgt,) + a.shape[1:], dtype=a.dtype)
+        for i in range(tgt):
+            s   = int(edges[i])
+            e   = max(s + 1, int(edges[i + 1]))
+            blk = a[s:e]
+            # Mask non-finite entries so NaN/Inf never wins argmax.
+            idx    = np.argmax(np.where(np.isfinite(blk), np.abs(blk), -1.0), axis=0)
+            out[i] = np.take_along_axis(blk, idx[None], axis=0)[0]
+
+    return np.moveaxis(out, 0, axis)
+
+
+def _downsample_maxabs(d: np.ndarray, tgt_h: int, tgt_w: int) -> np.ndarray:
+    """2-D max-|amplitude| downsample of a float array toward (tgt_h, tgt_w).
+    Only axes that are actually shrinking are pooled (upscaled axes pass through,
+    to be resized by the caller). Reflector-peak-preserving counterpart of the
+    live view's ``_pool_rows_maxabs``."""
+    d = _maxabs_pool_1d(d, tgt_h, axis=0)
+    d = _maxabs_pool_1d(d, tgt_w, axis=1)
+    return np.ascontiguousarray(d)
+
+
 def _colorize_for_target(d: np.ndarray, cmap_name: str,
                           vmin: float, vmax: float,
-                          target_px: tuple) -> np.ndarray:
+                          target_px: tuple,
+                          max_abs_pool: bool = False) -> np.ndarray:
     """
     Colorize a 2-D float32 seismic array to a target pixel size using
     the faster of two paths:
 
-    Path A — downsample float32 FIRST, then colorize (fast):
-        Used when either dimension is downsampled > 2:1.
-        scipy.ndimage.zoom(order=1) on float32 is much cheaper than
-        PIL LANCZOS on an RGBA uint8 array that is 4× larger.
-        Result: identical visual quality at typical display/print scales.
+    Path A — downsample float32 FIRST, then colorize:
+        Used when either dimension is downsampled. With ``max_abs_pool`` the
+        shrink uses MAX-|amplitude| pooling (reflector-safe — thin high-amplitude
+        events survive); otherwise ``scipy.ndimage.zoom(order=1)`` (bilinear).
+        Downsampling float32 first is much cheaper than PIL on the 4× RGBA array.
 
     Path B — colorize FIRST, then PIL resize (original path):
         Used for upsampling or near 1:1 scales.
@@ -616,6 +665,14 @@ def _colorize_for_target(d: np.ndarray, cmap_name: str,
     vw = src_w / max(tgt_w, 1)
 
     if vh > 1.0 or vw > 1.0:
+        if max_abs_pool:
+            # Pool ONLY the shrinking axis/axes to the target; a final resize
+            # (no-op or up-scale of the other axis) brings it to exact target_px.
+            ph = tgt_h if vh > 1.0 else src_h
+            pw = tgt_w if vw > 1.0 else src_w
+            d_s = _downsample_maxabs(d, ph, pw).astype(np.float32)
+            rgba = colormapped_rgba(d_s, cmap_name, vmin, vmax)
+            return _resize_rgba(rgba, target_px)
         try:
             from scipy.ndimage import zoom as _zoom
             sh = tgt_h / src_h
@@ -628,6 +685,56 @@ def _colorize_for_target(d: np.ndarray, cmap_name: str,
     # Path B
     rgba = colormapped_rgba(d, cmap_name, vmin, vmax)
     return _resize_rgba(rgba, target_px)
+
+
+# ── Wiggle / variable-area overlay ──────────────────────────────────────────────
+
+# Budget: max wiggle traces actually drawn. The raster base layer (when shown)
+# keeps full trace detail; the vector overlay is decimated to this many columns
+# so the wiggle stays legible and the export (and any vector PDF) stays light.
+WIGGLE_MAX_TRACES = 1200
+
+
+def _draw_wiggle_overlay(ax, d: np.ndarray, x_lo: float, x_hi: float,
+                         t0: float, t1: float, *, vmax: float,
+                         va_fill: bool = True, wiggle_gain: float = 1.0,
+                         max_traces: int = WIGGLE_MAX_TRACES,
+                         color: str = "#000000", lw: float = 0.4) -> None:
+    """Overlay budgeted wiggle (+ optional variable-area fill) traces onto ``ax``.
+
+    ``d`` is the (ns, n_traces) float window already time-cropped/margined. Trace
+    columns are decimated to ``max_traces`` so the vector overlay stays legible
+    and fast regardless of the native trace count (the raster base layer, if
+    drawn, still carries full detail). Each drawn trace is plotted as a horizontal
+    deflection x = centre + (amp/vmax)·spacing·gain; positive lobes are filled
+    (classic variable-area look) when ``va_fill``. Also pins the axes limits so a
+    'Wiggle Only' figure (no imshow) is framed correctly (time downward)."""
+    n_rows, n_cols = d.shape
+    if n_cols < 1 or n_rows < 2:
+        return
+    vmax = float(vmax) or 1.0
+    step = max(1, int(np.ceil(n_cols / max(1, max_traces))))
+    cols = np.arange(0, n_cols, step)
+    n_draw = cols.size
+    span = float(x_hi - x_lo)
+    centres = x_lo + (cols + 0.5) / n_cols * span         # native col → x position
+    # Median inter-trace gap: robust when the vessel is stationary (span=0,
+    # all centres identical → global-average would collapse deflect to zero).
+    spacing = float(np.median(np.diff(centres))) if n_draw > 1 else span / max(1, n_cols)
+    deflect = max(abs(spacing), 1e-6) * float(wiggle_gain)
+    t = np.linspace(t0, t1, n_rows)
+    for j, xc in zip(cols, centres):
+        amp = np.clip(d[:, j] / vmax, -1.0, 1.0)
+        x = xc + amp * deflect
+        ax.plot(x, t, color=color, lw=lw, antialiased=True, zorder=6)
+        if va_fill:
+            # interpolate=True: matplotlib linearly interpolates the fill boundary
+            # at zero-crossings → mathematically clean vector paths in PDF/SVG
+            # (no raster-like stair-steps at the positive/negative transitions).
+            ax.fill_betweenx(t, xc, x, where=(amp > 0), color=color,
+                             linewidth=0, interpolate=True, zorder=6)
+    ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(t1, t0)            # time downward — matches the imshow extent
 
 
 # ── Profile figure ─────────────────────────────────────────────────────────────
@@ -659,9 +766,28 @@ def render_profile_figure(
     axis_font_size: float = 7.0,
     grid_alpha: float = 0.18,
     grid_lw: float = 0.5,
+    # ── layered rendering (density raster base + wiggle/VA overlay) ──
+    show_raster: bool = True,
+    style: str = "density",
+    layout_mode: str = "aspect",
+    va_fill: bool = True,
+    wiggle_gain: float = 1.0,
+    max_wiggles: int = WIGGLE_MAX_TRACES,
+    max_abs_pool: bool = False,
 ) -> Figure:
     """
     Render a seismic profile as a headless Matplotlib figure.
+
+    Layered rendering
+    -----------------
+    ``style`` selects the section style: ``"density"`` (raster only) or
+    ``"wiggle"`` (raster base + wiggle/variable-area overlay). ``show_raster``
+    gates the base raster — set it False with ``style="wiggle"`` for a 'Wiggle
+    Only' figure (density always keeps the raster regardless). ``va_fill`` toggles
+    the black positive-lobe fill; ``wiggle_gain`` scales the deflection;
+    ``max_wiggles`` budgets the drawn trace count. ``layout_mode`` is applied
+    upstream via ``figsize`` (see ``_render.figsize_for_scale``) and accepted here
+    for interface symmetry.
 
     ``x_axis`` selects the bottom-axis mode (see the module-level X-axis helpers):
     ``"distance"`` (default, km extent — historical), ``"trace"`` (one column per
@@ -691,12 +817,11 @@ def render_profile_figure(
     clip_pct   = params.get("clip", 99.6)
     clip_lo_   = params.get("clip_lo", clip_lo)
     vmin, vmax = _vmin_vmax(d, clip_pct, clip_lo_)
+    if params.get("amp_range") == "diverging":     # signed → colormap centred on 0
+        vmin = -vmax
 
     cmap_base = CMAPS.get(params.get("cmap", "Viridis"), "viridis")
     cmap_name = cmap_base + "_r" if params.get("inv_cmap", False) else cmap_base
-
-    target  = (int(figsize[0] * dpi), int(figsize[1] * dpi))
-    resized = _colorize_for_target(d, cmap_name, vmin, vmax, target)
 
     fig = Figure(figsize=figsize, dpi=dpi, facecolor=C["panel"])
     ax  = fig.add_subplot(111)
@@ -706,8 +831,21 @@ def render_profile_figure(
         sp.set_edgecolor(C["accent"])
 
     x_lo, x_hi = _x_axis_extent(x_axis, sd.dist_km[0], sd.dist_km[-1], d.shape[1])
-    ax.imshow(resized, aspect="auto", interpolation="none",
-              extent=[x_lo, x_hi, t1, t0])
+    # Layered: raster base (density) + optional wiggle/VA overlay. Density always
+    # keeps the raster; 'Wiggle Only' (show_raster=False) applies in wiggle style.
+    draw_raster = show_raster or style != "wiggle"
+    if draw_raster:
+        target  = (int(figsize[0] * dpi), int(figsize[1] * dpi))
+        resized = _colorize_for_target(d, cmap_name, vmin, vmax, target,
+                                       max_abs_pool=max_abs_pool)
+        # rasterized=True: the base stays a single embedded raster in vector
+        # output (PDF/SVG); the wiggle/VA overlay above remains true vector paths.
+        ax.imshow(resized, aspect="auto", interpolation="none",
+                  extent=[x_lo, x_hi, t1, t0], rasterized=True)
+    if style == "wiggle":
+        _draw_wiggle_overlay(ax, d, x_lo, x_hi, t0, t1, vmax=vmax,
+                             va_fill=va_fill, wiggle_gain=wiggle_gain,
+                             max_traces=max_wiggles, color="#000000")
 
     # km x-ticks only make sense on the km extent; the per-trace modes get their
     # own ticks via _label_x_axis below.
@@ -717,7 +855,7 @@ def render_profile_figure(
                         axis_font_size=axis_font_size,
                         grid_alpha=grid_alpha, grid_lw=grid_lw)
 
-    sm = plt.cm.ScalarMappable(cmap=cmap_name, norm=mcolors.Normalize(vmin, vmax))
+    sm = matplotlib.cm.ScalarMappable(cmap=cmap_name, norm=mcolors.Normalize(vmin, vmax))
     sm.set_array([])
     cb = fig.colorbar(sm, ax=ax, pad=0.01, fraction=0.015)
     cb.ax.yaxis.set_tick_params(color=C["sub"], labelsize=7)
@@ -786,6 +924,14 @@ def render_chain_figure(
     axis_font_size: float = 7.0,
     grid_alpha: float = 0.18,
     grid_lw: float = 0.5,
+    # ── layered rendering (density raster base + wiggle/VA overlay) ──
+    show_raster: bool = True,
+    style: str = "density",
+    layout_mode: str = "aspect",
+    va_fill: bool = True,
+    wiggle_gain: float = 1.0,
+    max_wiggles: int = WIGGLE_MAX_TRACES,
+    max_abs_pool: bool = False,
 ) -> Figure:
     """
     Render a ProfileChain as a headless Matplotlib figure.
@@ -793,6 +939,12 @@ def render_chain_figure(
     Per-segment vmax normalisation, boundary vlines, colorbar = median vmax.
     ``x_axis`` ("distance"|"trace"|"km") selects the bottom-axis mode — see the
     module-level X-axis helpers. Defaults to "distance" (historical behaviour).
+
+    Layered rendering (``show_raster`` / ``style`` / ``va_fill`` / ``wiggle_gain``
+    / ``max_wiggles`` / ``layout_mode``) mirrors :func:`render_profile_figure`:
+    a density raster base with an optional budgeted wiggle/variable-area overlay,
+    normalised by the median segment vmax. The per-segment raster is only built
+    when it will be shown (skipped for 'Wiggle Only').
     """
     C = colors if colors is not None else _C
 
@@ -825,20 +977,27 @@ def render_chain_figure(
     if seg_widths:
         seg_widths[-1] = target_w - sum(seg_widths[:-1])
 
+    # Density always keeps the raster; 'Wiggle Only' (show_raster=False) skips it.
+    draw_raster = show_raster or style != "wiggle"
+    diverging  = params.get("amp_range") == "diverging"
     rgba_segs  = []
     seg_vmaxes = []
     for i, (seg_start, seg_end) in enumerate(zip(seg_boundaries[:-1], seg_boundaries[1:])):
         seg_d = d[:, seg_start:seg_end]
         vm, vx = _vmin_vmax(seg_d, clip_pct, clip_lo_)
+        if diverging:                         # signed → colormap centred on 0
+            vm = -vx
         seg_vmaxes.append(vx)
-        seg_tgt = (max(1, seg_widths[i]), tgt_h)
-        rgba_segs.append(_colorize_for_target(seg_d, cmap_name, vm, vx, seg_tgt))
+        if draw_raster:                       # only build pixels we will show
+            seg_tgt = (max(1, seg_widths[i]), tgt_h)
+            rgba_segs.append(_colorize_for_target(seg_d, cmap_name, vm, vx, seg_tgt,
+                                                  max_abs_pool=max_abs_pool))
 
     vmax_cb = float(np.median(seg_vmaxes)) if seg_vmaxes else 1.0
-    vmin_cb = 0.0
+    vmin_cb = -vmax_cb if diverging else 0.0
     # Segments are already at their final pixel dimensions; concatenation
     # produces the complete (tgt_h, target_w, 4) array directly.
-    resized          = np.concatenate(rgba_segs, axis=1)
+    resized          = np.concatenate(rgba_segs, axis=1) if rgba_segs else None
     n_traces_native  = ch.n_traces   # trace count for axis labelling (≠ pixel width)
 
     fig = Figure(figsize=figsize, dpi=dpi, facecolor=C["panel"])
@@ -850,8 +1009,14 @@ def render_chain_figure(
 
     # Trace-axis extent uses the NATIVE trace count, not the (resized) pixel width.
     x_lo, x_hi = _x_axis_extent(x_axis, ch.dist_km[0], ch.dist_km[-1], n_traces_native)
-    ax.imshow(resized, aspect="auto", interpolation="none",
-              extent=[x_lo, x_hi, t1, t0])
+    if draw_raster and resized is not None:
+        # rasterized base raster; the wiggle/VA overlay stays vector in PDF/SVG.
+        ax.imshow(resized, aspect="auto", interpolation="none",
+                  extent=[x_lo, x_hi, t1, t0], rasterized=True)
+    if style == "wiggle":
+        _draw_wiggle_overlay(ax, d, x_lo, x_hi, t0, t1, vmax=vmax_cb,
+                             va_fill=va_fill, wiggle_gain=wiggle_gain,
+                             max_traces=max_wiggles, color="#000000")
 
     # File-seam (chain-join) boundary lines — drawn ONLY when explicitly
     # requested via params["draw_file_boundaries"]. The GUI export dialog
@@ -870,8 +1035,8 @@ def render_chain_figure(
                         axis_font_size=axis_font_size,
                         grid_alpha=grid_alpha, grid_lw=grid_lw)
 
-    sm = plt.cm.ScalarMappable(cmap=cmap_name,
-                                norm=mcolors.Normalize(vmin_cb, vmax_cb))
+    sm = matplotlib.cm.ScalarMappable(cmap=cmap_name,
+                                      norm=mcolors.Normalize(vmin_cb, vmax_cb))
     sm.set_array([])
     cb = fig.colorbar(sm, ax=ax, pad=0.01, fraction=0.015)
     cb.ax.yaxis.set_tick_params(color=C["sub"], labelsize=7)
@@ -1111,7 +1276,7 @@ def render_spectrum_figure(
                   color=_C["text"], fontsize=8)
     ax2.tick_params(colors=_C["text"], labelsize=7)
 
-    sm2 = plt.cm.ScalarMappable(cmap="inferno", norm=mcolors.Normalize(-50, 0))
+    sm2 = matplotlib.cm.ScalarMappable(cmap="inferno", norm=mcolors.Normalize(-50, 0))
     sm2.set_array([])
     cb2 = fig.colorbar(sm2, ax=ax2, pad=0.01, fraction=0.03)
     cb2.set_label("dB re. max", color=_C["sub"], fontsize=7)
@@ -1242,4 +1407,3 @@ def save_figure(
     if fmt:
         kwargs["format"] = fmt
     fig.savefig(path, **kwargs)
-    plt.close(fig)

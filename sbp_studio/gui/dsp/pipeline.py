@@ -158,7 +158,7 @@ def extract_visible_window(
     ``effective_dt_us`` and a stable token.
     """
     ns, n_traces = data.shape
-    dt_ms = dt_us / 1000.0
+    dt_ms = (dt_us or 1) / 1000.0  # guard: dt_us=0 (corrupt SEG-Y) must not produce ÷0
 
     # ── Distance → trace columns (dist_km is monotonic non-decreasing) ──────
     xmin, xmax = sorted(x_range)

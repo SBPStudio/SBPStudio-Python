@@ -30,7 +30,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QRectF, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QPainterPath
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from ..i18n import language_manager
@@ -72,6 +72,12 @@ class SeismicView(QWidget):
     # pan/zoom event, so dragging never triggers a pipeline run mid-gesture.
     SETTLE_MS = 300
 
+    # Max visible traces drawn as live wiggle before auto-falling back to the
+    # raster base (keeps pan/zoom fluid). Mirrors the export budget
+    # ``viz.render.WIGGLE_MAX_TRACES``; the PreviewController reads this as the
+    # guard threshold so the budget lives with the view.
+    WIGGLE_BUDGET = 1200
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         lay = QVBoxLayout(self)
@@ -80,6 +86,7 @@ class SeismicView(QWidget):
         self.glw = pg.GraphicsLayoutWidget()
         lay.addWidget(self.glw)
         self.plot = self.glw.addPlot(row=0, col=0)
+        self.plot.setMenuEnabled(False)   # suppress PyQtGraph's default ViewBox menu
         self.plot.invertY(True)  # time downward
         self.img = pg.ImageItem(autoDownsample=True)
         self.plot.addItem(self.img)
@@ -94,6 +101,11 @@ class SeismicView(QWidget):
         self._hq_item: Optional[pg.ImageItem] = None
         self._hq_active: bool = False
         self._hq_view_key: Optional[tuple] = None
+        # Batched wiggle/VA overlay: ONE PlotCurveItem for all visible trace lines
+        # (NaN-separated segments, connect='finite') → a single GPU draw call, plus
+        # ONE filled path item for the variable-area lobes (also batched).
+        self._wiggle_item: Optional[pg.PlotCurveItem] = None
+        self._va_item = None    # QGraphicsPathItem (lazy) — variable-area fill
         self._overlay_lines: List[pg.InfiniteLine] = []
         self._boundary_lines: List[pg.InfiniteLine] = []  # toggled live
         self._boundaries_visible: bool = True
@@ -107,8 +119,17 @@ class SeismicView(QWidget):
         # Display buffer state (set by show_image; used by _on_range_changed).
         self._arr: Optional[np.ndarray] = None   # (rows, cols) float32
         self._lut: Optional[np.ndarray] = None   # (256, 3) uint8
+        self._lut_dirty: bool = True             # True → upload LUT to GPU on next show_preview
+        self._img_levels: Optional[tuple] = None # (vmin, vmax) last applied to ImageItem
         self._vmax: float = 1.0
+        self._vmin: float = 0.0                  # 0 (sequential) or −vmax (diverging)
         self._cmap_name: str = "viridis"
+        # Cached wiggle pen/brush — rebuilt only when color changes (always black by
+        # default, so these hit every frame after the first construction).
+        self._wiggle_pen = None
+        self._wiggle_pen_col: str = ""
+        self._wiggle_brush = None
+        self._wiggle_brush_col: str = ""
         self._rect: tuple = (0.0, 1.0, 0.0, 1.0)   # (dist0, dist1, t0, t1)
         self._aspect: Optional[float] = None
         self._last_zoom_key: Optional[tuple] = None  # (c0, c1, stride) dedup
@@ -184,16 +205,26 @@ class SeismicView(QWidget):
         self.set_aspect(aspect)
 
     def set_aspect(self, aspect: Optional[float]) -> None:
-        """Lock the data box to a W:H ratio (None = free), then fit."""
+        """Lock the data box to a W:H ratio (None = free).
+
+        STRICT vertical preservation: when an aspect is set we anchor the VERTICAL
+        (time) extent to the full record and let the locked aspect derive the
+        horizontal window. This pins ms-per-pixel, so changing the horizontal
+        scale (traces/cm → a different aspect) compresses/spreads the traces
+        horizontally WITHOUT ever rescaling time. ``autoRange`` is used only in the
+        free (unlocked) case, since it would letterbox and shrink the vertical when
+        the figure is wide."""
         self._aspect = aspect
         vb = self.plot.getViewBox()
         d0, d1, t0, t1 = self._rect
         x_ext, y_ext = (d1 - d0), (t1 - t0)
         if aspect and x_ext > 0 and y_ext > 0:
             vb.setAspectLocked(True, ratio=aspect * y_ext / x_ext)
+            lo_t, hi_t = (t0, t1) if t1 >= t0 else (t1, t0)
+            vb.setYRange(lo_t, hi_t, padding=0)   # anchor time; X follows the lock
         else:
             vb.setAspectLocked(False)
-        self.plot.autoRange()
+            self.plot.autoRange()
 
     def has_image(self) -> bool:
         # True for both paths: the static display buffer (_arr) and the
@@ -252,6 +283,97 @@ class SeismicView(QWidget):
     def has_hq_overlay(self) -> bool:
         return self._hq_active
 
+    # ── Live wiggle / variable-area overlay ──────────────────────────────────
+
+    def within_wiggle_budget(self, count: int) -> bool:
+        """Whether ``count`` visible traces is within the live wiggle budget.
+
+        The PreviewController calls this BEFORE building a wiggle so an
+        over-budget window auto-falls back to the raster base (see
+        :meth:`disable_wiggle`). Owning the threshold here keeps the budget with
+        the view that draws it."""
+        return int(count) <= self.WIGGLE_BUDGET
+
+    def update_wiggle(self, xs: np.ndarray, ys: np.ndarray,
+                      xs_va: Optional[np.ndarray] = None,
+                      ys_va: Optional[np.ndarray] = None, *,
+                      show_raster: bool = True, va_fill: bool = True,
+                      color=None) -> None:
+        """Draw the batched wiggle line (``xs``/``ys``) and, when ``va_fill`` and
+        ``xs_va``/``ys_va`` are given, the variable-area fill (one batched filled
+        path), then set the raster base layer's visibility.
+
+        ``show_raster`` True keeps the density raster underneath (Raster +
+        Wiggle); False hides it (Wiggle Only). The raster is only HIDDEN, never
+        cleared, so a later transition re-shows it instantly (flicker-free).
+
+        Wiggle lines + variable-area fill render in BLACK by default (classic
+        seismic look); pass ``color`` to override."""
+        col = color or "#000000"
+
+        # Rebuild pen/brush only when the color changes (always black by default,
+        # so these objects are constructed once and reused on every subsequent frame).
+        # Flags are captured BEFORE updating so the item-level setPen guard below
+        # can still branch on whether the pen actually changed this frame.
+        pen_changed   = col != self._wiggle_pen_col
+        brush_changed = col != self._wiggle_brush_col
+        if pen_changed:
+            self._wiggle_pen     = pg.mkPen(col, width=1)
+            self._wiggle_pen_col = col
+        if brush_changed:
+            self._wiggle_brush     = pg.mkBrush(col)
+            self._wiggle_brush_col = col
+
+        # ── Variable-area fill (below the line, above the raster) ──
+        if va_fill and xs_va is not None and ys_va is not None:
+            try:
+                path = pg.arrayToQPath(np.asarray(xs_va, dtype=float),
+                                       np.asarray(ys_va, dtype=float),
+                                       connect="finite")
+                if self._va_item is None:
+                    from PyQt6.QtWidgets import QGraphicsItem, QGraphicsPathItem
+                    self._va_item = QGraphicsPathItem()
+                    self._va_item.setPen(pg.mkPen(None))
+                    self._va_item.setZValue(15)        # above raster, below line
+                    # Cache the rasterized path as a device-space pixmap so pan
+                    # gestures blit it instead of re-stroking millions of points.
+                    self._va_item.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+                    self.plot.getViewBox().addItem(self._va_item)
+                self._va_item.setBrush(self._wiggle_brush)
+                self._va_item.setPath(path)
+                self._va_item.setVisible(True)
+            except Exception:                          # fill is best-effort
+                if self._va_item is not None:
+                    self._va_item.setVisible(False)
+        elif self._va_item is not None:
+            self._va_item.setVisible(False)
+
+        # ── Wiggle line (on top of the fill) ──
+        if self._wiggle_item is None:
+            self._wiggle_item = pg.PlotCurveItem(
+                connect="finite", antialias=True, pen=self._wiggle_pen)
+            self._wiggle_item.setZValue(16)   # above the VA fill, below HQ (20)
+            self.plot.addItem(self._wiggle_item)
+        elif pen_changed:
+            self._wiggle_item.setPen(self._wiggle_pen)
+        self._wiggle_item.setData(xs, ys)
+        self._wiggle_item.setVisible(True)
+        self.img.setVisible(bool(show_raster))
+
+    def disable_wiggle(self) -> None:
+        """Hide the wiggle + VA fill and ensure the raster base is visible — the
+        density state. The raster is kept ready underneath so the transition never
+        flickers. Geometry is explicitly cleared so the NaN-separated float arrays
+        and QPainterPath are garbage-collected immediately rather than held until
+        the next wiggle draw."""
+        if self._wiggle_item is not None:
+            self._wiggle_item.setData(x=[], y=[])   # release NaN-separated float arrays
+            self._wiggle_item.setVisible(False)
+        if self._va_item is not None:
+            self._va_item.setPath(QPainterPath())   # release QPainterPath geometry
+            self._va_item.setVisible(False)
+        self.img.setVisible(True)
+
     def center_on_distance(self, km: float) -> None:
         """Scroll the ViewBox horizontally to centre on a distance (km), keeping
         the current zoom width. Used by the map's click-to-jump."""
@@ -277,22 +399,30 @@ class SeismicView(QWidget):
         idx = max(0, min(idx, dist.size - 1))
         self.trace_clicked.emit(idx)
 
-    def set_colormap(self, cmap_name: str, vmax: float) -> None:
-        """Set the LUT + colorbar for preview updates (cheap; no image reset)."""
+    def set_colormap(self, cmap_name: str, vmax: float, vmin: float = 0.0) -> None:
+        """Set the LUT + colorbar for preview updates (cheap; no image reset).
+
+        ``vmin`` is 0 for the sequential (0..1, |amp|) range or −vmax for the
+        diverging (−1..1, signed) range, so a diverging colormap centres on zero."""
+        cmap_changed = cmap_name != self._cmap_name
         self._cmap_name = cmap_name
         self._vmax = float(vmax) or 1.0
-        self._lut = self._build_lut()
+        self._vmin = float(vmin)
+        if cmap_changed:
+            self._lut = self._build_lut()
+            self._lut_dirty = True   # schedule GPU upload on next show_preview
         if self._cbar is None:
-            self._cbar = pg.ColorBarItem(values=(0.0, self._vmax),
+            self._cbar = pg.ColorBarItem(values=(self._vmin, self._vmax),
                                          colorMap=self._colormap(),
                                          label=self.tr("Amplitude"))
             self.glw.addItem(self._cbar, 0, 1)
         else:
-            self._cbar.setColorMap(self._colormap())
-            self._cbar.setLevels((0.0, self._vmax))
+            if cmap_changed:
+                self._cbar.setColorMap(self._colormap())
+            self._cbar.setLevels((self._vmin, self._vmax))
 
     def show_preview(self, arr: np.ndarray, dist0: float, dist1: float,
-                     t0: float, t1: float, *, vmax: float,
+                     t0: float, t1: float, *, vmax: float, vmin: float = 0.0,
                      fit: bool = False) -> None:
         """Lean image update for the live preview — NO autoRange unless ``fit``.
 
@@ -301,17 +431,22 @@ class SeismicView(QWidget):
         previews leave the user's viewport untouched.
         """
         self.clear_hq_overlay()   # a fresh preview supersedes any HQ overlay
-        self._vmax = float(vmax) or 1.0
+        vmax_f = float(vmax) or 1.0
+        vmin_f = float(vmin)
+        self._vmax = vmax_f
+        self._vmin = vmin_f
         self._rect = (float(dist0), float(dist1), float(t0), float(t1))
         self.img.setImage(arr, autoLevels=False)
-        self.img.setLevels([0.0, self._vmax])
-        if self._lut is not None:
+        new_levels = (vmin_f, vmax_f)
+        if new_levels != self._img_levels:
+            self.img.setLevels([vmin_f, vmax_f])
+            self._img_levels = new_levels
+        if self._lut_dirty and self._lut is not None:
             self.img.setLookupTable(self._lut)
+            self._lut_dirty = False
         self.img.setRect(QRectF(float(dist0), float(t0),
                                 float(dist1) - float(dist0),
                                 float(t1) - float(t0)))
-        if self._cbar is not None:
-            self._cbar.setLevels((0.0, self._vmax))
         if fit:
             self.set_aspect(self._aspect)   # autoRanges to fit the new section
 
@@ -469,8 +604,11 @@ class SeismicView(QWidget):
         return self._colormap().getLookupTable(0.0, 1.0, 256, alpha=False)
 
     def _update_colorbar(self) -> None:
-        if self._cbar is not None:
-            self.glw.removeItem(self._cbar)
+        old_cbar = self._cbar
+        if old_cbar is not None:
+            self.glw.removeItem(old_cbar)
+            old_cbar.setParentItem(None)  # detach from scene so Qt can reap the C++ object
+            old_cbar.deleteLater()
             self._cbar = None
         cm = self._colormap()
         self._lut = cm.getLookupTable(0.0, 1.0, 256, alpha=False)
@@ -484,6 +622,7 @@ class SeismicView(QWidget):
                        fixes: Sequence[FixMark]) -> None:
         for ln in self._overlay_lines:
             self.plot.removeItem(ln)
+            ln.deleteLater()  # destroy C++ InfiniteLine + its child TextItem label
         self._overlay_lines.clear()
         self._boundary_lines.clear()
 

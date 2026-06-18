@@ -10,7 +10,7 @@ per-profile / per-chain rendering.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from PyQt6.QtCore import QCoreApplication, Qt
 from PyQt6.QtWidgets import (
@@ -28,6 +28,9 @@ from ..state import AppState
 from ._render import (
     dpi_for_budget, effective_aspect, effective_export_dpi, figsize_for_scale,
 )
+
+if TYPE_CHECKING:  # type-only; avoids a runtime import cycle (_handlers ← _base)
+    from ._handlers import SourceHandler
 
 # Sub-tab indices.
 PROFILE, MAP, SPECTRUM, HEADERS = range(4)
@@ -137,7 +140,7 @@ def _crop_for_viewport(obj, proc, t0_full, x_range, y_range):
 
 
 def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
-                          is_chain, cancel):
+                          handler, cancel):
     """Shared per-item export render — used by BOTH the single export and every
     batch item so their quality can never drift.
 
@@ -148,9 +151,7 @@ def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     applies the WYSIWYG aspect fit. Returns ``(fig, render_dpi)``; the caller
     saves and closes the figure.
     """
-    from sbp_studio.viz.render import (
-        build_theme, render_chain_figure, render_profile_figure,
-    )
+    from sbp_studio.viz.render import build_theme
     # Full-resolution DSP pipeline (alignment + nodes) — shared with the viewport
     # HQ export so the crop is processed identically.
     data, _t0_full = _process_full_array(
@@ -184,9 +185,20 @@ def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
         fix_bbox_alpha=cfg["fix_bbox_alpha"], fix_color=cfg["fix_color"],
         axis_font_size=cfg.get("axis_font_size", 7.0),
         grid_alpha=cfg.get("grid_alpha", 0.18), grid_lw=cfg.get("grid_lw", 0.5),
-        colors=build_theme(theme=cfg["theme"]))
-    render = render_chain_figure if is_chain else render_profile_figure
-    fig = render(obj, data, params, figsize=figsize, dpi=render_dpi, **render_opts)
+        colors=build_theme(theme=cfg["theme"]),
+        # Layered render style from the live controls (display_params / scale_cfg),
+        # so the export honours Density vs Wiggle + raster underlay regardless of
+        # whether wiggles are currently on screen. These bind to render_figure's
+        # explicit show_raster / style / layout_mode kwargs (not **kwargs).
+        show_raster=bool(params.get("show_raster", True)),
+        style=params.get("style", "density"),
+        layout_mode=scale_cfg.get("layout_mode", "aspect"),
+        # Reflector-safe downscale: when the export must shrink below native
+        # (RAM-capped DPI), pool by max-|amplitude| instead of bilinear so thin
+        # high-amplitude reflectors are preserved. Default on.
+        max_abs_pool=bool(cfg.get("max_abs_pool", True)))
+    fig = handler.render_figure(obj, data, params, figsize=figsize, dpi=render_dpi,
+                                **render_opts)
     # WYSIWYG aspect fit: grow the figure so the DATA box hits the mode's effective
     # aspect at full size (decorations take a fixed inch margin) — restores pixels.
     aspect = eff_aspect
@@ -216,6 +228,12 @@ class SubTabbedTab(QWidget):
         super().__init__(parent)
         self.state = state
         self.tasks = tasks  # task service (MainWindow.run_task / notify / show_error)
+        # The active source strategy (ProfileHandler / ChainHandler), assigned by
+        # the subclass on selection. Declared here so the base — which calls
+        # _update_dpi_estimate() → _active_object() during construction — and the
+        # export/HQ/batch paths can drive everything through the handler interface
+        # without ever knowing the concrete source type.
+        self._handler: "Optional[SourceHandler]" = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -322,10 +340,6 @@ class SubTabbedTab(QWidget):
         if obj is None or getattr(obj, "error", None) or getattr(obj, "data", None) is None:
             return None
         return obj
-
-    def _is_chain(self) -> bool:
-        """True if the active object is a ProfileChain (Chains tab)."""
-        return False
 
     def _on_scale_changed(self) -> None:
         """Apply the selected scale mode's effective aspect to the on-screen
@@ -498,9 +512,12 @@ class SubTabbedTab(QWidget):
             return
         dlg = ExportDialog(self, source=obj, scale_cfg=self.controls.scale_config(),
                            velocity=1500.0)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        cfg = dlg.config()
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            cfg = dlg.config()
+        finally:
+            dlg.deleteLater()
         # RAM validation: if the requested memory budget exceeds the machine's
         # actual free RAM, alert before rendering so the user can cancel and lower
         # it rather than risk an out-of-memory crash.
@@ -514,7 +531,7 @@ class SubTabbedTab(QWidget):
         if not out:
             return
 
-        is_chain = self._is_chain()
+        handler = self._handler
         scale_cfg = self.controls.scale_config()  # aspect / VE / hybrid mode + values
         params = dict(self.controls.display_params())  # presentation only (cmap/clip/fix)
         params["clip_lo"] = 0.0
@@ -537,26 +554,18 @@ class SubTabbedTab(QWidget):
         params["align"] = align_enabled
 
         def job(progress, cancel) -> str:
-            import matplotlib.pyplot as plt
-            from sbp_studio.core import load_profile as _lp
             from sbp_studio.viz.render import save_figure
             # Lazy-load safety: profiles are header-only stubs and CHAINS assemble
-            # their matrix lazily. Load/assemble JIT on the worker thread so the
-            # export never fails (race, or chain never viewed).
-            _obj = obj
-            if getattr(_obj, "data", None) is None:
+            # their matrix lazily. The handler loads/assembles JIT on the worker
+            # thread so the export never fails (race, or chain never viewed).
+            if getattr(obj, "data", None) is None:
                 progress(float("nan"), "Loading traces for export…")
-                if is_chain:
-                    _obj.load_chain_traces(cancel=cancel)
-                else:
-                    _obj = _lp(_obj.path, load_traces=True)
-                    if getattr(_obj, "error", None):
-                        raise RuntimeError(f"Cannot load {_obj.name}: {_obj.error}")
+            _obj = handler.load_full(obj, cancel)
             progress(float("nan"), "")
             # Shared render pipeline (identical to every batch item): full-res DSP
             # + decimation-free DPI floor + WYSIWYG aspect fit.
             fig, render_dpi = _render_export_figure(
-                _obj, cfg, params, node_cfg, scale_cfg, align_enabled, is_chain, cancel)
+                _obj, cfg, params, node_cfg, scale_cfg, align_enabled, handler, cancel)
             try:
                 save_figure(fig, out, dpi=render_dpi, fmt=fmt, pdf_page=cfg["pdf_page"])
             except OSError as exc:
@@ -580,9 +589,7 @@ class SubTabbedTab(QWidget):
                 err.title = QCoreApplication.translate("SubTabbedTab", "Export failed")
                 raise err from exc
             finally:
-                # Rule 7 (Matplotlib memory): release the figure every job.
-                fig.clear()
-                plt.close(fig)
+                fig.clear()   # releases imshow raster; Figure() is unmanaged — plt.close is a no-op
             return out
 
         self.tasks.run_task(
@@ -624,23 +631,16 @@ class SubTabbedTab(QWidget):
         node_cfg = [(n.KEY, dict(n.params)) for n in self.pipeline_panel.nodes()]
         align_enabled = self.controls.align_enabled()
         params["align"] = align_enabled
-        is_chain = self._is_chain()
+        handler = self._handler
         ppt = max(self._HQ_MIN_PX_PER_TRACE, float(self.controls.px_per_trace()))
 
         def job(progress, cancel) -> tuple:
             import numpy as np
-            from sbp_studio.core import load_profile as _lp
             from sbp_studio.core.constants import CMAPS
             from sbp_studio.viz.render import _colorize_for_target, _vmin_vmax
-            _obj = obj
-            if getattr(_obj, "data", None) is None:
+            if getattr(obj, "data", None) is None:
                 progress(float("nan"), "Loading traces…")
-                if is_chain:
-                    _obj.load_chain_traces(cancel=cancel)
-                else:
-                    _obj = _lp(_obj.path, load_traces=True)
-                    if getattr(_obj, "error", None):
-                        raise RuntimeError(f"Cannot load {_obj.name}: {_obj.error}")
+            _obj = handler.load_full(obj, cancel)
             progress(float("nan"), "")
             # Full-resolution DSP (identical to the export), then crop to the view.
             proc, t0_full = _process_full_array(
@@ -679,7 +679,7 @@ class SubTabbedTab(QWidget):
 
     # ── Batch export (many profiles / chains in one background pass) ──────────
 
-    def export_batch(self, items: list, cfg: dict) -> None:
+    def export_batch(self, items: list, cfg: dict, handler: "SourceHandler") -> None:
         """Export every item in *items* to its own source folder, in ONE worker.
 
         Inherits THIS tab's current DSP/filter settings (controls + pipeline) and
@@ -688,8 +688,13 @@ class SubTabbedTab(QWidget):
         and identical. Each output lands in the item's source directory, named
         after that folder (``<folder>/<folder>.<fmt>``). Memory-safe: heavy data is
         loaded JIT and released after each item; the figure is closed every step.
+
+        ``handler`` is the source strategy for the BATCH items, supplied by the
+        caller (which sidebar list the batch came from). It is decoupled from the
+        live view's current handler — a batch of profiles always exports as
+        profiles even if a chain is on screen — and it is the ONLY thing that
+        knows the source kind here: this method itself is fully type-agnostic.
         """
-        is_chain = self._is_chain()
         fmt = cfg["format"]
         # Snapshot the side-panel DSP/presentation state on the GUI thread (Qt
         # widgets are not thread-safe) — applied uniformly to every batch item.
@@ -710,8 +715,6 @@ class SubTabbedTab(QWidget):
             return
 
         def job(progress, cancel) -> tuple:
-            import matplotlib.pyplot as plt
-            from sbp_studio.core import load_profile as _lp
             from sbp_studio.core.tasks import Cancelled
             from sbp_studio.viz.render import save_figure
 
@@ -727,25 +730,19 @@ class SubTabbedTab(QWidget):
 
                 # Source dir → folder-named output, de-duped so two items from the
                 # same folder never silently overwrite each other.
-                src_path = obj.profiles[0].path if is_chain else obj.path
-                out = _batch_output_path(src_path, fmt, used)
+                out = _batch_output_path(handler.source_path(obj), fmt, used)
                 used.add(str(out))
 
                 was_loaded = getattr(obj, "data", None) is not None
-                render_obj = obj
                 fig = None
                 try:
-                    if not was_loaded:                       # JIT lazy-load
-                        if is_chain:
-                            obj.load_chain_traces(cancel=cancel)
-                        else:
-                            render_obj = _lp(obj.path, load_traces=True)
-                            if getattr(render_obj, "error", None):
-                                failed.append((name, render_obj.error))
-                                continue
+                    # JIT lazy-load via the handler (idempotent; returns the object
+                    # carrying .data — a fresh copy for profiles, in-place for
+                    # chains). A failed load raises → caught below as a failed item.
+                    render_obj = handler.load_full(obj, cancel)
                     fig, render_dpi = _render_export_figure(
                         render_obj, cfg, params, node_cfg, scale_cfg,
-                        align_enabled, is_chain, cancel)
+                        align_enabled, handler, cancel)
                     save_figure(fig, str(out), dpi=render_dpi, fmt=fmt,
                                 pdf_page=cfg["pdf_page"])
                     saved.append(str(out))
@@ -755,16 +752,12 @@ class SubTabbedTab(QWidget):
                     failed.append((name, str(exc)))
                 finally:
                     if fig is not None:
-                        # CRITICAL: free the figure every step. render.py builds
-                        # UNMANAGED Figure() objects, so plt.close alone is a no-op
-                        # for them — fig.clear() releases the heavy imshow raster.
-                        fig.clear()
-                        plt.close(fig)
-                    # Release JIT-loaded heavy data → batch stays RAM-flat. Chains
-                    # mutate in place, so revert to a stub; transient profiles GC.
-                    if not was_loaded and is_chain:
-                        obj.data = None
-                        obj.clip_p99 = None
+                        fig.clear()  # releases imshow raster; Figure() is unmanaged by pyplot
+                    # Release JIT-loaded heavy data → batch stays RAM-flat. The
+                    # handler knows how (chains revert in place; profiles GC the
+                    # transient copy). Only when WE loaded it this iteration.
+                    if not was_loaded:
+                        handler.release_after_batch(obj)
             progress(1.0, "")
             return saved, failed
 

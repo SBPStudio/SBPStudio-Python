@@ -1,6 +1,6 @@
 # GUI_REPORT — SBP Studio Desktop Interface
 
-> Last updated: 2026-06-16
+> Last updated: 2026-06-18
 > Stack: **PyQt6** (Qt 6) + **PyQtGraph** (OpenGL-accelerated) on top of the headless `sbp_studio` core.
 > Entry point: `python -m sbp_studio.gui` (or `applications/SBPStudio_GUI.py`).
 > See [`CORE_REPORT.md`](CORE_REPORT.md) for the computation/CLI layer this GUI drives.
@@ -35,11 +35,13 @@
 
 | Tab | Class | Purpose |
 |-----|-------|---------|
-| Visualizer | `VisualizerTab` | Single-profile inspection with the live DSP preview. |
-| Chains | `ChainsTab` | Detected multi-file chains; lazy stitched-matrix assembly. |
-| Reprojector | `ReprojectorTab` | CRS reprojection + navline/FIX geometry export (128-preset CRS catalog). |
-| — | `SubTabbedTab` | Shared base: the controls column + a four-view sub-notebook (Profile / Spectrum / Map / Headers) and the full Render/Export dispatch. |
+| Visualizer | `VisualizerTab` | **Unified** live viewer for *both* an individual profile **and** a detected chain. The sidebar's two lists (Loaded profiles / Detected chains) both feed this one tab. It holds a single `self._handler` (a `SourceHandler` strategy) reassigned on selection — there is **no** boolean `_mode` / `_is_chain` dispatch. The selection slots set the handler and delegate the state→preview transition to it; `_active_object()` / `_export_basename()` resolve through it. "Last selection wins" falls out of which slot fired last. |
+| Reprojector | `ReprojectorTab` | CRS reprojection + navline/FIX geometry export (128-preset CRS catalog). Subclasses `QWidget` directly (not `SubTabbedTab`). |
+| — | `SubTabbedTab` | **100 % type-agnostic** shared base: the controls column + a four-view sub-notebook (Profile / Spectrum / Map / Headers) and the full Render/Export dispatch. It never references `SegyProfile` / `ProfileChain` — every divergent operation (transition, load, render, basename, batch output path, post-batch release) goes through the `SourceHandler` interface. Map/Spectrum/Header signals are wired once here and operate on `_active_object()`. `export_batch(items, cfg, handler)` takes the **handler** for the batch's kind (resolved by the caller from the originating sidebar list), so a batch exports correctly regardless of what is on screen. |
+| — | `_handlers.py` | The **`SourceHandler`** strategy interface (ABC) + `ProfileHandler` / `ChainHandler`. Each concrete handler encapsulates the one kind's divergent behaviour: `active_object()` (Adapter), `on_selected()`, `load_full()`, `render_figure()`, `basename()`, `source_path()`, `release_after_batch()`. |
 | — | `_render.py` | Shared figure-size maths (`compute_figsize`, `figsize_for_scale`, `effective_aspect`, `effective_export_dpi`, `dpi_for_budget`) + the decimated display-buffer builder. |
+
+> **Source-kind architecture (Disciplined Strategy + Adapter):** the profile and chain pipelines are **fundamentally decoupled** behind the `SourceHandler` interface — a profile is *never* wrapped as a "chain of length 1", so chain-level logic (stitching, spatial union) can never touch a single file. `VisualizerTab` selects the strategy; `SubTabbedTab` runs it knowing only the interface. See §10 for the maintenance contract.
 
 ### Components (`gui/components/`)
 
@@ -138,7 +140,8 @@ file-boundary lines, and the live output-size/DPI status.
 
 Source strings are **English** literals via `self.tr(...)`. Spanish translations live in
 `gui/translations/sbp_studio_es.ts` (Qt Linguist XML), regenerated with
-`pylupdate6 sbp_studio/gui/**/*.py -ts sbp_studio/gui/translations/sbp_studio_es.ts`.
+`python tools/update_translations.py` (a `pylupdate6` merge over `gui/**/*.py` that preserves
+existing translations, adds new strings as `unfinished`, and marks removed ones `vanished`).
 ES is loaded by default; EN = no translator. No `.qm` is required — `TsTranslator` parses the
 `.ts` directly (and prefers a `.qm` if one is ever dropped in). Gotcha: literals defined in a
 base class but called from a subclass instance must use the explicit
@@ -177,3 +180,63 @@ display (or `offscreen`) and are exercised on the developer desktop.
 
 Installed by `env/environment.yml` (see `env/setup_env.sh` / `env/setup_env.ps1`). The core and
 CLI do **not** require any of these.
+
+---
+
+## 10. Source-kind architecture (`SourceHandler`) & maintenance
+
+### The pattern — Disciplined Strategy + Adapter
+
+The unified `VisualizerTab` renders either a `SegyProfile` or a `ProfileChain` in one
+UI space. The two kinds diverge in only a handful of operations; everything else (map,
+spectrum, headers, DSP preview, scale, DPI) is already type-agnostic and driven by
+duck-typed attributes. Those divergences are isolated behind one interface:
+
+```
+SourceHandler (ABC, _handlers.py)
+├─ active_object()            # ADAPTER: hands views the current object (no concrete type leaks)
+├─ on_selected(obj)           # GUI-thread: the type-specific state→preview transition
+├─ load_full(obj, cancel)     # worker: ensure traces loaded; return the object carrying .data
+├─ render_figure(obj, …)      # worker: pick the core Matplotlib renderer
+├─ basename(obj)              # export filename stem
+├─ source_path(obj)           # disk path for batch output naming
+└─ release_after_batch(obj)   # free a JIT-loaded matrix between batch items
+        ▲                               ▲
+   ProfileHandler                  ChainHandler
+```
+
+`VisualizerTab` holds one `self._handler`, reassigned on selection; `SubTabbedTab` calls
+`self._handler.<op>(...)` and **never knows** which kind it is driving. The profile and
+chain pipelines are therefore fundamentally decoupled — a profile is never represented as
+a "chain of length 1", so chain-only logic (stitching, spatial-union QC) cannot reach an
+individual file. Worker-thread handler methods touch no Qt and are safe off-thread; the
+caller snapshots a stable `handler` reference before each background job.
+
+### Refactoring history (v0.5.0)
+
+1. **Tab merge.** The standalone **Chains** tab (`ChainsTab`, `tabs/chains_tab.py`) was
+   removed and folded into `VisualizerTab`; the central tab stack is now **Visualizer +
+   Reprojector**. `MainWindow` clears the *inactive* sidebar list's highlight (under
+   `blockSignals`) when the other list drives the view, so the source is never ambiguous.
+2. **Boolean dispatch eliminated.** An interim `self._mode` flag + a base-class
+   `_is_chain()` predicate were the first cut. Both were **deleted**: `_is_chain()` is gone
+   from `SubTabbedTab`, and the four `if is_chain` branches (render-figure choice, lazy
+   load, batch output path, post-batch release) were replaced by `SourceHandler` calls.
+3. **Pipeline decoupling.** `_render_export_figure(...)` now takes a `handler` and calls
+   `handler.render_figure(...)`; the single-export, HQ-preview, and batch worker jobs all
+   load via `handler.load_full(...)`. `export_batch(items, cfg, handler)` receives the
+   batch's handler from the caller (resolved via `VisualizerTab.source_handler(is_chain=…)`)
+   so the batch kind is decoupled from the live view's kind.
+
+### Maintenance guide — adding a new source type
+
+To add a new object type (e.g. a *Survey* or *Composite*):
+
+1. **Implement a new `SourceHandler` subclass** in `_handlers.py` providing the seven
+   interface methods for the new kind.
+2. **Register it in the sidebar selection logic** — instantiate it in
+   `VisualizerTab.__init__` (`self._handlers[...]`), add a selection slot that assigns it,
+   and (if it can be batch-exported) add its key to `source_handler()`.
+
+**No changes to `SubTabbedTab` are required** — the base is closed to type knowledge and
+open to new strategies. That is the whole point of the pattern.
