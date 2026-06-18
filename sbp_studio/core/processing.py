@@ -522,18 +522,33 @@ def apply_delay_alignment(data: np.ndarray, delays: np.ndarray,
     ns, n_traces = data.shape
     dt_ms   = dt_us / 1000.0
     offsets = np.round((np.asarray(delays) - min_delay) / dt_ms).astype(int)
-    # Guard against corrupt DelayRecordingTime headers: a single bad value can
-    # make extra = millions of rows → OOM. Cap at ns samples (one full record
-    # length); any larger shift is physically impossible for valid SBP data.
-    if offsets.size:
-        bad = offsets > ns
-        if bad.any():
+    # Despike corrupt DelayRecordingTime headers: a single bad byte produces an
+    # offset that spikes and *immediately returns* to baseline.  Detect by the
+    # 3-condition neighbor-agreement test — valid step-changes (fault scarps,
+    # deep-water canyons, operator window shifts) are preserved by construction
+    # because at a real step the right neighbor already holds the new value, so
+    # |mid − hi| ≈ 0 and the spike mask is never set.
+    if offsets.size >= 3:
+        lo  = offsets[:-2].astype(np.int64)
+        mid = offsets[1:-1].astype(np.int64)
+        hi  = offsets[2:].astype(np.int64)
+        spike_mask = (
+            (np.abs(mid - lo) > ns) &
+            (np.abs(mid - hi) > ns) &
+            (np.abs(lo  - hi) <= ns)
+        )
+        n_spikes = int(spike_mask.sum())
+        if n_spikes:
+            idx = np.where(spike_mask)[0] + 1   # +1: mid starts at index 1
+            offsets[idx] = (
+                (offsets[idx - 1].astype(np.int64) +
+                 offsets[idx + 1].astype(np.int64)) // 2
+            ).astype(int)
             _LOG.warning(
-                "apply_delay_alignment: %d trace(s) have delay offsets > record "
-                "length (%d samples max); clamping to %d. Max corrupt value: %d.",
-                int(bad.sum()), ns, ns, int(offsets[bad].max()),
+                "apply_delay_alignment: %d isolated delay spike(s) removed "
+                "(corrupt SEG-Y header bytes); valid step-changes preserved.",
+                n_spikes,
             )
-            offsets = np.clip(offsets, 0, ns)
     extra   = int(offsets.max()) if offsets.size else 0
     aligned = np.full((ns + extra, n_traces), fill_value, dtype=np.float32)
     row_idx = np.arange(ns)[:, None] + offsets[None, :]

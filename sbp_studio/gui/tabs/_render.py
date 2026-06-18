@@ -132,14 +132,59 @@ def compute_figsize(source: Any, dpi: int, x_scale: Optional[float],
 GUI_X_SCALE = 2.0
 GUI_PX_PER_TRACE = 20.0
 
+# Horizontal-scale control: figure width derives from the physical trace spacing
+# (traces per cm), DPI-independent. Default chosen to land near the historical
+# px/trace width for a typical line; the slider lets the user stretch/compress.
+DEFAULT_TRACES_PER_CM = 40.0
+_CM_PER_IN = 2.54
+
 
 def figsize_for_scale(source: Any, scale_cfg: dict, dpi: int,
                       velocity: float) -> tuple:
     """Resolve (width_in, height_in) for a GUI scale-mode config dict.
 
-    ``scale_cfg`` = {mode: 'aspect'|'ve'|'hybrid', ratio, ve, max_aspect}. This is
-    the single place the GUI maps its three radio modes onto ``compute_figsize``.
+    ``scale_cfg`` keys:
+      mode          : 'aspect'|'ve'|'hybrid'  (the height sub-mode in aspect layout)
+      ratio/ve/max_aspect : the sub-mode values
+      traces_per_cm : horizontal scale — figure WIDTH = n_traces / tpc / 2.54
+      layout_mode   : 'aspect'|'decoupled'
+
+    Layout modes
+    ------------
+    * ``decoupled`` — width from ``traces_per_cm``, height from VE against a FIXED
+      reference (``GUI_X_SCALE``). The two axes are independent: changing the trace
+      spacing never rescales time ('vertical untouched').
+    * ``aspect``    — width from ``traces_per_cm``; height follows the radio
+      sub-mode (ratio, or VE relative to THIS width, capped in hybrid) so the two
+      stay locked/proportional (the historical behaviour, now width-driven by tpc).
+
+    Legacy: if ``traces_per_cm`` is absent (UI not yet upgraded) the old
+    px/trace-based path is used so nothing breaks mid-migration.
     """
+    tpc = scale_cfg.get("traces_per_cm")
+    if tpc is None:
+        return _legacy_figsize_for_scale(source, scale_cfg, dpi, velocity)
+    tpc = float(tpc) or DEFAULT_TRACES_PER_CM
+    n_tr = int(getattr(source, "n_traces", 0) or 0)
+    record_ms = source.ns * source.dt_us / 1000.0
+    depth_km = record_ms * velocity / 2_000_000.0
+
+    # STRICT horizontal decoupling (the Layout-mode selector was removed):
+    #   • WIDTH  comes ONLY from traces/cm        → w = n_traces / tpc / 2.54
+    #   • HEIGHT comes ONLY from VE vs a FIXED reference (GUI_X_SCALE)
+    # Because the height never references the width, changing traces/cm cannot
+    # rescale the vertical (time) axis — under ANY value. The aspect-ratio radios
+    # remain valid but, by this rule, only the VE value drives the vertical.
+    w = max(2.0, n_tr / tpc / _CM_PER_IN)
+    ve = scale_cfg.get("ve") or 1.0
+    h = max(0.5, ve * depth_km / GUI_X_SCALE)
+    return (w, h)
+
+
+def _legacy_figsize_for_scale(source: Any, scale_cfg: dict, dpi: int,
+                              velocity: float) -> tuple:
+    """Pre-traces-per-cm figure sizing (px/trace based). Retained as the fallback
+    until the controls panel supplies ``traces_per_cm`` / ``layout_mode``."""
     mode = scale_cfg.get("mode", "aspect")
     ppt = scale_cfg.get("px_per_trace") or GUI_PX_PER_TRACE
     if mode == "aspect":
@@ -158,9 +203,21 @@ def effective_aspect(source: Any, scale_cfg: dict,
     line — drives the live PyQtGraph preview so the on-screen proportions match
     the PDF. ``None`` means 'free / fill the panel'.
 
-    aspect mode → the fixed ratio. ve/hybrid → total_km / (VE·depth_km), which
-    adapts to the line's length & TWT (and is clamped to max_aspect in hybrid).
+    With ``traces_per_cm`` present this is simply ``width/height`` from
+    :func:`figsize_for_scale` (covers both layout modes). Falls back to the legacy
+    formula when the new key is absent.
     """
+    if scale_cfg.get("traces_per_cm") is None:
+        return _legacy_effective_aspect(source, scale_cfg, velocity)
+    if source is None:
+        return scale_cfg.get("ratio") or None
+    w, h = figsize_for_scale(source, scale_cfg, 100, velocity)
+    return (w / h) if h > 0 else None
+
+
+def _legacy_effective_aspect(source: Any, scale_cfg: dict,
+                             velocity: float = 1500.0) -> Optional[float]:
+    """Pre-traces-per-cm aspect resolution (mode-based). Fallback only."""
     mode = scale_cfg.get("mode", "aspect")
     ratio = scale_cfg.get("ratio") or None
     if mode == "aspect" or source is None:

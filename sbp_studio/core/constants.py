@@ -13,6 +13,9 @@ from typing import Dict
 # the params dict carries no explicit "clip" key.
 DEFAULT_CLIP_PCT: float = 99.6
 
+# Internal name used to register the custom Petrel cmap with matplotlib.
+_PETREL_CMAP_NAME = "petrel_seismic"
+
 # Colormap palette: human-readable label → matplotlib cmap name.
 CMAPS: Dict[str, str] = {
     "Blanco / Negro": "Greys",
@@ -20,6 +23,8 @@ CMAPS: Dict[str, str] = {
     "Inferno":        "inferno",
     "Jet":            "jet",
     "Terrain":        "terrain",
+    "Blue-White-Red": "bwr",
+    "Petrel Seismic": _PETREL_CMAP_NAME,
 }
 
 # SEG-Y CoordinateUnits field values.
@@ -100,3 +105,47 @@ FILTER_DESCRIPTIONS: Dict[str, str] = {
     "integral":     "Integración temporal acumulada. "
                     "Suaviza la señal, útil para visualizar tendencias de baja frecuencia.",
 }
+
+# ── Petrel Seismic custom colormap ───────────────────────────────────────────
+# Diverging cool→warm palette that mimics the Petrel workstation default.
+# Amplitude is symmetric (−1 → +1); normalised position 0.0 ≡ trough (−1.0),
+# 0.5 ≡ zero-crossing (white), 1.0 ≡ peak (+1.0).
+#
+# The warm side carries an extra orange stop (0.875) that the pure red→yellow
+# linear interpolation would miss — this reproduces the distinct yellow band
+# visible at the peak in the original Petrel palette.
+_PETREL_STOPS: tuple = (
+    (0.000, (  0, 191, 255)),   # #00BFFF — bright sky-cyan   (trough  −1.0)
+    (0.250, (  0,   0, 255)),   # #0000FF — solid blue        (−0.5)
+    (0.500, (255, 255, 255)),   # #FFFFFF — white             (zero-crossing)
+    (0.750, (255,   0,   0)),   # #FF0000 — solid red         (+0.5)
+    (0.875, (255, 128,   0)),   # #FF8000 — orange            (+0.75)
+    (1.000, (255, 255,   0)),   # #FFFF00 — yellow            (peak    +1.0)
+)
+
+
+def _register_petrel_cmap() -> None:
+    """Register the Petrel seismic colormap with matplotlib at import time.
+
+    ``SeismicView._colormap()`` calls ``pg.colormap.get(name, source="matplotlib")``,
+    which falls back to matplotlib's registry — so registering here makes the
+    palette available to both the interactive PyQtGraph LUT and the PDF/SVG
+    matplotlib export path without any further wiring.
+    """
+    try:
+        import matplotlib.colors as _mc
+        import matplotlib as _mpl
+        _cmap = _mc.LinearSegmentedColormap.from_list(
+            _PETREL_CMAP_NAME,
+            [(pos, tuple(c / 255.0 for c in rgb)) for pos, rgb in _PETREL_STOPS],
+        )
+        try:
+            _mpl.colormaps.register(_cmap, force=True)          # matplotlib ≥ 3.7
+        except AttributeError:
+            import matplotlib.cm as _cm
+            _cm.register_cmap(name=_PETREL_CMAP_NAME, cmap=_cmap)  # matplotlib < 3.7
+    except Exception:
+        pass  # matplotlib absent or registration failed; fall back to viridis
+
+
+_register_petrel_cmap()

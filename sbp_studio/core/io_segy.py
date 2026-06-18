@@ -296,7 +296,16 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
     """
     prof.n_traces = f.tracecount
     prof.ns       = f.samples.size
-    prof.dt_us    = int(f.bin[segyio.BinField.Interval])
+    _dt = int(f.bin[segyio.BinField.Interval])
+    if _dt <= 0:
+        import warnings
+        warnings.warn(
+            f"SEG-Y binary header has Interval={_dt} µs (corrupt/missing); "
+            "defaulting to 1 µs to prevent division-by-zero downstream.",
+            RuntimeWarning, stacklevel=4,
+        )
+        _dt = 1
+    prof.dt_us = _dt
 
     h0 = f.header[0]
     # Coordinate + elevation scalars: 16-bit SIGNED (>h). Force the sign so a

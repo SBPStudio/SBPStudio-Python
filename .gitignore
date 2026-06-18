@@ -10,8 +10,12 @@ examples/_demo_in/
 examples/_demo_out/
 examples/_real_out/
 
+
 # Proprietary SEG-Y survey data — NEVER commit (provided by the authorised user)
 examples/_real_in/
+examples\_real_in\L073A
+examples\_real_in\MCS7
+examples\_real_in\L001A
 
 # Generated SEG-Y and images
 *_REPROY*
@@ -21,6 +25,7 @@ examples/_real_in/
 *.pdf
 *.png
 *.jpg
+*.docx
 # Keep run_demos scripts (they are source, not generated)
 !examples/run_demos.ps1
 !examples/run_demos.sh
@@ -43,6 +48,18 @@ TopasSUITE_qt.py
 # OS
 .DS_Store
 Thumbs.db
+
+# GIS / geospatial data files
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qpj
+*.sbn
+*.sbx
+*.fbn
+*.fbx
 
 #Crash report log
 app.log
