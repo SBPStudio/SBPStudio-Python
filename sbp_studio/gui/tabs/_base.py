@@ -314,6 +314,10 @@ class SubTabbedTab(QWidget):
         self.controls.boundaries_toggled.connect(self._on_boundaries_toggled)
         self.controls.align_toggled.connect(lambda *_: self.preview.alignment_changed())
         self.controls.display_changed.connect(self.preview.display_changed)
+        # Live raster pixel-scaling (nearest/bilinear) — a paint-time hint on the
+        # view, not a data change, so it's applied directly (no DSP refresh).
+        self.controls.interp_changed.connect(self._seismic.set_image_interpolation)
+        self._seismic.set_image_interpolation(self.controls.interp_mode())
         # Live export-DPI readout (Part 2): refresh when the scale settings OR the
         # active source change, so the user always sees the resolution that will be
         # generated for the current configuration.
@@ -705,7 +709,8 @@ class SubTabbedTab(QWidget):
                 cmap_name += "_r"
             tw = int(np.clip(clone.n_traces * ppt, 1000, self._HQ_MAX_PX))
             th = int(np.clip(clone.ns * 2, 1000, self._HQ_MAX_PX))
-            rgba = _colorize_for_target(crop, cmap_name, vmin, vmax, (tw, th))
+            rgba = _colorize_for_target(crop, cmap_name, vmin, vmax, (tw, th),
+                                       interp=params.get("interp", "nearest"))
 
             # Crop bounds (snapped to the data grid) for an exact setRect mapping.
             dt_ms = clone.dt_us / 1000.0

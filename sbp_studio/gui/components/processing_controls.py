@@ -92,6 +92,7 @@ class ProcessingControls(QWidget):
     boundaries_toggled = pyqtSignal(bool)  # show/hide file-seam lines (live)
     align_toggled = pyqtSignal(bool)  # delay-alignment geometry toggled (rebuild base)
     display_changed = pyqtSignal()  # cmap / clip / FIX changed → recolour preview
+    interp_changed = pyqtSignal(str)  # 'nearest' | 'bilinear' → live ImageItem paint hint
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -386,6 +387,37 @@ class ProcessingControls(QWidget):
         render_row.addWidget(self.btn_render_viewport, 1)
         v.addLayout(render_row)
 
+        # ── Pixel interpolation for HQ Render / Image Export (and, live, the
+        # on-screen raster) — nearest keeps hard pixel edges (historical look);
+        # bilinear/bicubic smooth the upsampled raster. Nearest is the default so
+        # existing renders are unaffected until the user opts in. Compact pill
+        # toggles (QRadioButton, indicator-less per theme.py's segmented-control
+        # style) — same look as the amplitude-range / scale-mode rows above.
+        interp_row = QHBoxLayout()
+        interp_row.setContentsMargins(0, 0, 0, 0)
+        interp_row.setSpacing(4)
+        self.rb_interp_nearest = QRadioButton()
+        self.rb_interp_bilinear = QRadioButton()
+        self.rb_interp_bicubic = QRadioButton()
+        self.rb_interp_nearest.setChecked(True)
+        self._interp_group = QButtonGroup(self)
+        self._interp_group.addButton(self.rb_interp_nearest)
+        self._interp_group.addButton(self.rb_interp_bilinear)
+        self._interp_group.addButton(self.rb_interp_bicubic)
+        interp_row.addWidget(self.rb_interp_nearest)
+        interp_row.addWidget(self.rb_interp_bilinear)
+        interp_row.addWidget(self.rb_interp_bicubic)
+        interp_row.addStretch(1)
+        v.addLayout(interp_row)
+        for rb in (self.rb_interp_nearest, self.rb_interp_bilinear, self.rb_interp_bicubic):
+            rb.toggled.connect(lambda *_: self.display_changed.emit())
+            # Only the button that just became checked carries the new mode —
+            # the other(s) in the exclusive group fire toggled(False) too, but
+            # interp_mode() at that instant would already report the new
+            # selection, so only emit on the checked=True transition.
+            rb.toggled.connect(lambda checked: self.interp_changed.emit(self.interp_mode())
+                               if checked else None)
+
         # ── Export ── (high-quality matplotlib export via a dedicated dialog)
         self.sec_export = self._section()
         self.btn_export_img = QPushButton()
@@ -479,11 +511,23 @@ class ProcessingControls(QWidget):
                        else "sequential"),
             # A/B Compare: raw|processed split render (see PreviewController).
             ab_compare=self.ab_compare.isChecked(),
+            # Pixel-scaling mode for HQ Render / Image Export rasters.
+            interp=self.interp_mode(),
         )
 
     def align_enabled(self) -> bool:
         """Whether the static delay-alignment correction is on."""
         return self.align_delays.isChecked()
+
+    def interp_mode(self) -> str:
+        """'nearest' | 'bilinear' | 'bicubic' — the pixel-scaling mode for HQ
+        Render / Image Export (and the live raster); see the toggle row under
+        the render buttons."""
+        if self.rb_interp_bicubic.isChecked():
+            return "bicubic"
+        if self.rb_interp_bilinear.isChecked():
+            return "bilinear"
+        return "nearest"
 
     def set_dsp_sections_visible(self, visible: bool) -> None:
         """Hide the static DSP FILTER sections (superseded by the node pipeline).
@@ -718,6 +762,9 @@ class ProcessingControls(QWidget):
         self.btn_render_viewport.setToolTip(self.tr(
             "Render the visible (zoomed-in) area at high quality and overlay it on "
             "the live view. Pan or zoom to dismiss it."))
+        self.rb_interp_nearest.setText(self.tr("Nearest"))
+        self.rb_interp_bilinear.setText(self.tr("Bilinear"))
+        self.rb_interp_bicubic.setText(self.tr("Bicubic"))
         self.sec_export.setText(self.tr("EXPORT"))
         self.btn_export_img.setText(self.tr("💾  Export image"))
         self.btn_export_fix.setText(self.tr("🗺  Export FIX → SHP / GeoJSON / CSV"))
