@@ -129,6 +129,71 @@
         <source>Max shift</source>
         <translation>Desplazamiento máx.</translation>
     </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="36" />
+        <source>Spectral Whitening</source>
+        <translation>Blanqueo espectral</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="37" />
+        <source>F-K Dip Filter</source>
+        <translation>Filtro F-K (buzamiento)</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="38" />
+        <source>Seabed Multiple Suppression</source>
+        <translation>Supresión de múltiple de fondo</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="39" />
+        <source>Notch Filter</source>
+        <translation>Filtro Notch (banda eliminada)</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="55" />
+        <source>Smooth window</source>
+        <translation>Ventana de suavizado</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="56" />
+        <source>Reject dip</source>
+        <translation>Buzamiento a rechazar</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="57" />
+        <source>Fan half-width</source>
+        <translation>Semiancho del abanico</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="58" />
+        <source>Mode</source>
+        <translation>Modo</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="59" />
+        <source>Seabed threshold</source>
+        <translation>Umbral del fondo</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="60" />
+        <source>Period (0=auto)</source>
+        <translation>Período (0=auto)</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="61" />
+        <source>Max gain</source>
+        <translation>Ganancia máx.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="62" />
+        <source>Notch frequency</source>
+        <translation>Frecuencia del notch</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="63" />
+        <source>Q factor</source>
+        <translation>Factor Q</translation>
+    </message>
 </context><context>
     <name>ExportDialog</name>
     <message>
@@ -331,11 +396,145 @@
         <translation type="vanished">Mostrar rejilla</translation>
     </message>
 </context><context>
+    <name>HelpDialog</name>
+    <message>
+        <location filename="..\components\help_dialog.py" line="654" />
+        <source>Documentation</source>
+        <translation>Documentación</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="50" />
+        <source>Overview</source>
+        <translation>Resumen</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="51" />
+        <source>Visualizer · Seismic</source>
+        <translation>Visualizador · Sísmica</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="52" />
+        <source>Visualizer · Filters / DSP</source>
+        <translation>Visualizador · Filtros / DSP</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="53" />
+        <source>Visualizer · Map</source>
+        <translation>Visualizador · Mapa</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="54" />
+        <source>Visualizer · Spectrum</source>
+        <translation>Visualizador · Espectro</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="55" />
+        <source>Visualizer · Headers</source>
+        <translation>Visualizador · Cabeceras</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="56" />
+        <source>Reprojector</source>
+        <translation>Reproyector</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="57" />
+        <source>CLI &amp; Batch processing</source>
+        <translation>CLI y procesamiento por lotes</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="79" />
+        <source>(choice)</source>
+        <translation>(opción)</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="80" />
+        <source>PRE-CROP</source>
+        <translation>PRE-RECORTE</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="95" />
+        <source>Node</source>
+        <translation>Nodo</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="96" />
+        <source>Parameters</source>
+        <translation>Parámetros</translation>
+    </message>
+</context><context>
     <name>HeaderView</name>
     <message>
         <location filename="..\components\header_view.py" line="169" />
         <source>Traces: {0} (cleaned from {1} original — {2} duplicate timestamps purged)</source>
         <translation>Trazas: {0} (depuradas de {1} originales — {2} marcas de tiempo duplicadas purgadas)</translation>
+    </message>
+    <message>
+        <location filename="..\components\header_view.py" line="943" />
+        <location filename="..\components\header_view.py" line="227" />
+        <source>ASCII</source>
+        <translation>ASCII</translation>
+    </message>
+    <message>
+        <location filename="..\components\header_view.py" line="944" />
+        <location filename="..\components\header_view.py" line="228" />
+        <source>EBCDIC</source>
+        <translation>EBCDIC</translation>
+    </message>
+    <message>
+        <location filename="..\components\header_view.py" line="945" />
+        <location filename="..\components\header_view.py" line="229" />
+        <source>Latin-1</source>
+        <translation>Latin-1</translation>
+    </message>
+    <message>
+        <location filename="..\components\header_view.py" line="954" />
+        <location filename="..\components\header_view.py" line="277" />
+        <source>Samples per Trace:</source>
+        <translation>Muestras por Traza:</translation>
+    </message>
+    <message>
+        <location filename="..\components\header_view.py" line="948" />
+        <location filename="..\components\header_view.py" line="292" />
+        <source>Apply</source>
+        <translation>Aplicar</translation>
+    </message>
+    <message>
+        <location filename="..\components\header_view.py" line="949" />
+        <location filename="..\components\header_view.py" line="294" />
+        <source>Undo</source>
+        <translation>Deshacer</translation>
+    </message>
+    <message>
+        <location filename="..\components\header_view.py" line="950" />
+        <location filename="..\components\header_view.py" line="297" />
+        <source>Help</source>
+        <translation>Ayuda</translation>
+    </message>
+    <message>
+        <location filename="..\components\header_view.py" line="940" />
+        <source>Save As Copy…</source>
+        <translation>Guardar como Copia…</translation>
+    </message>
+    <message>
+        <location filename="..\components\header_view.py" line="941" />
+        <source>Textual Header (3200 bytes)</source>
+        <translation>Cabecera de Texto (3200 bytes)</translation>
+    </message>
+    <message>
+        <location filename="..\components\header_view.py" line="946" />
+        <source>Binary Header Overrides</source>
+        <translation>Sobrescrituras de Cabecera Binaria</translation>
+    </message>
+    <message>
+        <location filename="..\components\header_view.py" line="947" />
+        <source>Trace Header Calculator</source>
+        <translation>Calculadora de Cabecera de Traza</translation>
+    </message>
+    <message>
+        <location filename="..\components\header_view.py" line="954" />
+        <source>Sample Interval (µs):</source>
+        <translation>Intervalo de Muestreo (µs):</translation>
     </message>
 </context><context>
     <name>MainWindow</name>
@@ -659,6 +858,383 @@ Interfaz PyQt6, desacoplada del núcleo de procesado.</translation>
         <source>Remove</source>
         <translation>Quitar</translation>
     </message>
+    <message>
+        <location filename="..\components\map_view.py" line="354" />
+        <source>World Basemap</source>
+        <translation>Mapa base mundial</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="410" />
+        <source>Export map</source>
+        <translation>Exportar mapa</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1167" />
+        <source>PNG image (*.png);;JPEG image (*.jpg);;TIFF image (*.tif);;PDF document (*.pdf)</source>
+        <translation>Imagen PNG (*.png);;Imagen JPEG (*.jpg);;Imagen TIFF (*.tif);;Documento PDF (*.pdf)</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="620" />
+        <source>Rename layer</source>
+        <translation>Renombrar capa</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="620" />
+        <source>Name:</source>
+        <translation>Nombre:</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="674" />
+        <source>Export</source>
+        <translation>Exportar</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="512" />
+        <source>Toggle Label on Map</source>
+        <translation>Mostrar/Ocultar etiqueta</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="657" />
+        <source>Edit legend entry</source>
+        <translation>Editar entrada de la leyenda</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="660" />
+        <source>Move to bottom-left</source>
+        <translation>Mover a la esquina inferior izquierda</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="661" />
+        <source>Move to bottom-right</source>
+        <translation>Mover a la esquina inferior derecha</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="675" />
+        <source>Text:</source>
+        <translation>Texto:</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="964" />
+        <source>Show Legend</source>
+        <translation>Mostrar leyenda</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1289" />
+        <source>Show Points</source>
+        <translation>Mostrar puntos</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="672" />
+        <source>Format Labels…</source>
+        <translation>Formato de etiquetas…</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="675" />
+        <source>Change Color…</source>
+        <translation>Cambiar color…</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="771" />
+        <source>Change Color</source>
+        <translation>Cambiar color</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="929" />
+        <source>Float on map</source>
+        <translation>Flotar sobre el mapa</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="932" />
+        <source>Dock to side panel</source>
+        <translation>Anclar al panel lateral</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="765" />
+        <source>Export as .shp…</source>
+        <translation>Exportar como .shp…</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1370" />
+        <source>Draw Point</source>
+        <translation>Punto</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1371" />
+        <source>Draw Polyline</source>
+        <translation>Línea</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1376" />
+        <source>Cancel Drawing</source>
+        <translation>Cancelar dibujo</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1452" />
+        <source>Drawn Point {0}</source>
+        <translation>Punto dibujado {0}</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1464" />
+        <source>Drawn Line {0}</source>
+        <translation>Línea dibujada {0}</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1487" />
+        <source>Export as Shapefile</source>
+        <translation>Exportar como Shapefile</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1488" />
+        <source>Shapefile (*.shp)</source>
+        <translation>Shapefile (*.shp)</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1506" />
+        <source>Export failed</source>
+        <translation>Error al exportar</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1487" />
+        <source>Draw Polygon</source>
+        <translation>Polígono</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1605" />
+        <source>Drawn Polygon {0}</source>
+        <translation>Polígono dibujado {0}</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1100" />
+        <source>Hide from legend</source>
+        <translation>Ocultar de la leyenda</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1106" />
+        <source>Hidden items…</source>
+        <translation>Ocultos…</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1521" />
+        <source>Measure Tool</source>
+        <translation>Regla</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1533" />
+        <source>Toggle Graphic Scale</source>
+        <translation>Mostrar escala gráfica</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1537" />
+        <source>Toggle North Arrow</source>
+        <translation>Mostrar flecha de norte</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1727" />
+        <source>Target EPSG</source>
+        <translation>EPSG de destino</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1727" />
+        <source>EPSG code:</source>
+        <translation>Código EPSG:</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="729" />
+        <source>POI {0}</source>
+        <translation>PDI {0}</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1145" />
+        <source>Show Properties…</source>
+        <translation>Ver propiedades…</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1188" />
+        <source>Layer Properties</source>
+        <translation>Propiedades de la capa</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1189" />
+        <source>{0}
+
+Area: {1}
+Perimeter: {2}</source>
+        <translation>{0}
+
+Área: {1}
+Perímetro: {2}</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1835" />
+        <source>Lon: {0:.5f}°  Lat: {1:.5f}°</source>
+        <translation>Lon: {0:.5f}°  Lat: {1:.5f}°</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1838" />
+        <source>X: {0:,.2f} m  Y: {1:,.2f} m</source>
+        <translation>X: {0:,.2f} m  Y: {1:,.2f} m</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1888" />
+        <source>Toggle Grid</source>
+        <translation>Mostrar cuadrícula</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="2189" />
+        <source>Set Scale</source>
+        <translation>Establecer escala</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="2189" />
+        <source>Scale (e.g. 1:50000):</source>
+        <translation>Escala (p. ej. 1:50000):</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="2196" />
+        <source>Invalid scale</source>
+        <translation>Escala no válida</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="2197" />
+        <source>Enter a scale like 1:50000.</source>
+        <translation>Introduzca una escala como 1:50000.</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="2158" />
+        <source>Z: {0:,.3f}</source>
+        <translation>Z: {0:,.3f}</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="2646" />
+        <source>North Arrow Size</source>
+        <translation>Tamaño de la flecha de norte</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="2646" />
+        <source>Size (pixels):</source>
+        <translation>Tamaño (píxeles):</translation>
+    </message>
+</context><context>
+    <name>_ScaleBarItem</name>
+    <message>
+        <location filename="..\components\map_view.py" line="412" />
+        <source>Scale Style</source>
+        <translation>Estilo de escala</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="413" />
+        <source>Simple Line</source>
+        <translation>Línea simple</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="414" />
+        <source>Segmented Line</source>
+        <translation>Línea segmentada</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="415" />
+        <source>Alternating Black/White Blocks</source>
+        <translation>Bloques alternos blanco/negro</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="422" />
+        <source>Zoom Behavior</source>
+        <translation>Comportamiento de zoom</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="423" />
+        <source>Dynamic Size (fixed value)</source>
+        <translation>Tamaño dinámico (valor fijo)</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="424" />
+        <source>Dynamic Value (fixed width)</source>
+        <translation>Valor dinámico (ancho fijo)</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="432" />
+        <source>Set Scale (1:X)…</source>
+        <translation>Establecer escala (1:X)…</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="445" />
+        <source>Reset Scale Lock</source>
+        <translation>Restablecer escala</translation>
+    </message>
+</context><context>
+    <name>_NorthArrowItem</name>
+    <message>
+        <location filename="..\components\map_view.py" line="601" />
+        <source>Position</source>
+        <translation>Posición</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="603" />
+        <source>Top-Right</source>
+        <translation>Arriba derecha</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="604" />
+        <source>Top-Left</source>
+        <translation>Arriba izquierda</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="609" />
+        <source>Style</source>
+        <translation>Estilo</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="610" />
+        <source>Simple N↑</source>
+        <translation>N↑ simple</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="611" />
+        <source>Compass Rose</source>
+        <translation>Rosa de los vientos</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="612" />
+        <source>Minimalist</source>
+        <translation>Minimalista</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="613" />
+        <source>Filled Triangle</source>
+        <translation>Triángulo relleno</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="619" />
+        <source>Size…</source>
+        <translation>Tamaño…</translation>
+    </message>
+</context><context>
+    <name>_LabelFormatDialog</name>
+    <message>
+        <location filename="..\components\map_view.py" line="172" />
+        <source>Format Labels</source>
+        <translation>Formato de etiquetas</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="180" />
+        <source>Rotation (angle):</source>
+        <translation>Rotación (ángulo):</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="190" />
+        <source>Offset X (left / right):</source>
+        <translation>Desplazamiento X (izquierda / derecha):</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="196" />
+        <source>Offset Y (down / up):</source>
+        <translation>Desplazamiento Y (abajo / arriba):</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="201" />
+        <source>Font size:</source>
+        <translation>Tamaño de fuente:</translation>
+    </message>
 </context><context>
     <name>PipelinePanel</name>
     <message>
@@ -685,6 +1261,31 @@ Interfaz PyQt6, desacoplada del núcleo de procesado.</translation>
         <location filename="..\components\pipeline_panel.py" line="282" />
         <source>✖ Remove</source>
         <translation>✖ Quitar</translation>
+    </message>
+    <message>
+        <location filename="..\components\pipeline_panel.py" line="436" />
+        <source>Save Preset</source>
+        <translation>Guardar preajuste</translation>
+    </message>
+    <message>
+        <location filename="..\components\pipeline_panel.py" line="437" />
+        <source>Load preset…</source>
+        <translation>Cargar preajuste…</translation>
+    </message>
+    <message>
+        <location filename="..\components\pipeline_panel.py" line="370" />
+        <source>Preset name:</source>
+        <translation>Nombre del preajuste:</translation>
+    </message>
+    <message>
+        <location filename="..\components\pipeline_panel.py" line="380" />
+        <source>Save failed</source>
+        <translation>Error al guardar</translation>
+    </message>
+    <message>
+        <location filename="..\components\pipeline_panel.py" line="400" />
+        <source>Load failed</source>
+        <translation>Error al cargar</translation>
     </message>
 </context><context>
     <name>ProcessingControls</name>
@@ -789,34 +1390,34 @@ Interfaz PyQt6, desacoplada del núcleo de procesado.</translation>
         <translation>Rango de amplitud secuencial (0..1) — paletas para |amplitud|.</translation>
     </message>
     <message>
-        <location filename="..\components\processing_controls.py" line="639" />
-        <source>Wiggle</source>
-        <translation>Traza (wiggle)</translation>
+        <location filename="..\components\processing_controls.py" line="653" />
+        <source>Show Wiggles</source>
+        <translation>Mostrar Wiggles</translation>
     </message>
     <message>
-        <location filename="..\components\processing_controls.py" line="640" />
-        <source>Draw traces as black wiggle lines over the raster (zoom in for more native detail).</source>
-        <translation>Dibuja las trazas como líneas wiggle negras sobre el ráster (acerca el zoom para más detalle nativo).</translation>
+        <location filename="..\components\processing_controls.py" line="654" />
+        <source>Draw traces as black wiggle lines over the raster (zoom in for more native detail). Independent of Show Variable Area — either can be on while the other is off.</source>
+        <translation>Dibuja las trazas como líneas wiggle negras sobre el ráster (acerca el zoom para más detalle nativo). Independiente de Mostrar Área Variable: cualquiera de los dos puede estar activo sin el otro.</translation>
     </message>
     <message>
-        <location filename="..\components\processing_controls.py" line="643" />
-        <source>Variable area</source>
-        <translation>Área variable</translation>
+        <location filename="..\components\processing_controls.py" line="658" />
+        <source>Show Variable Area</source>
+        <translation>Mostrar Área Variable</translation>
     </message>
     <message>
-        <location filename="..\components\processing_controls.py" line="644" />
-        <source>Fill the positive lobes of each wiggle (classic variable-area look).</source>
-        <translation>Rellena los lóbulos positivos de cada traza (aspecto clásico de área variable).</translation>
+        <location filename="..\components\processing_controls.py" line="659" />
+        <source>Fill the positive lobes of each wiggle (classic variable-area look). Independent of Show Wiggles — either can be on while the other is off.</source>
+        <translation>Rellena los lóbulos positivos de cada traza (aspecto clásico de área variable). Independiente de Mostrar Wiggles: cualquiera de los dos puede estar activo sin el otro.</translation>
     </message>
     <message>
-        <location filename="..\components\processing_controls.py" line="646" />
+        <location filename="..\components\processing_controls.py" line="662" />
         <source>Raster</source>
         <translation>Ráster</translation>
     </message>
     <message>
-        <location filename="..\components\processing_controls.py" line="647" />
-        <source>Show the colour raster underneath the wiggles (only with Wiggle on; off = wiggle only).</source>
-        <translation>Muestra el ráster de color bajo las trazas (solo con Wiggle activo; desactivado = solo wiggle).</translation>
+        <location filename="..\components\processing_controls.py" line="663" />
+        <source>Show the colour raster underneath the wiggle/variable-area overlay (only while one of them is on; off = overlay only).</source>
+        <translation>Muestra el ráster de color bajo la superposición de wiggle/área variable (solo mientras uno de los dos esté activo; desactivado = solo superposición).</translation>
     </message>
     <message>
         <location filename="..\components\processing_controls.py" line="650" />
@@ -858,6 +1459,16 @@ Interfaz PyQt6, desacoplada del núcleo de procesado.</translation>
         <location filename="..\components\processing_controls.py" line="657" />
         <source>Show file boundaries (red lines)</source>
         <translation>Mostrar límites de archivo (líneas rojas)</translation>
+    </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="684" />
+        <source>A/B Compare</source>
+        <translation>Comparador A/B</translation>
+    </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="685" />
+        <source>Split the section: raw data on the left, the DSP pipeline output on the right, with a labeled divider.</source>
+        <translation>Divide la sección: datos sin procesar a la izquierda, salida del flujo DSP a la derecha, con un divisor etiquetado.</translation>
     </message>
     <message>
         <location filename="..\components\processing_controls.py" line="659" />
@@ -1238,6 +1849,16 @@ Interfaz PyQt6, desacoplada del núcleo de procesado.</translation>
         <translation>Amplitud</translation>
     </message>
     <message>
+        <location filename="..\components\seismic_view.py" line="760" />
+        <source>A (raw)</source>
+        <translation>A (sin procesar)</translation>
+    </message>
+    <message>
+        <location filename="..\components\seismic_view.py" line="761" />
+        <source>B (filtered)</source>
+        <translation>B (filtrado)</translation>
+    </message>
+    <message>
         <location filename="..\components\seismic_view.py" line="619" />
         <source>Distance (km)</source>
         <translation>Distancia (km)</translation>
@@ -1246,6 +1867,21 @@ Interfaz PyQt6, desacoplada del núcleo de procesado.</translation>
         <location filename="..\components\seismic_view.py" line="620" />
         <source>Time (ms)</source>
         <translation>Tiempo (ms)</translation>
+    </message>
+    <message>
+        <location filename="..\components\seismic_view.py" line="754" />
+        <source>Measure</source>
+        <translation>Medir</translation>
+    </message>
+    <message>
+        <location filename="..\components\seismic_view.py" line="755" />
+        <source>Hide Ruler</source>
+        <translation>Ocultar regla</translation>
+    </message>
+    <message>
+        <location filename="..\components\seismic_view.py" line="939" />
+        <source>Add Anomaly to Map</source>
+        <translation>Añadir anomalía al mapa</translation>
     </message>
 </context><context>
     <name>SpectrumView</name>
@@ -1557,6 +2193,16 @@ Continue anyway?</source>
     <message>
         <source>Controls (pending)</source>
         <translation type="vanished">Controles (pendiente)</translation>
+    </message>
+    <message>
+        <location filename="..\tabs\_base.py" line="924" />
+        <source>Link Views</source>
+        <translation>Sincronizar vistas</translation>
+    </message>
+    <message>
+        <location filename="..\tabs\_base.py" line="927" />
+        <source>When active: hovering the seismic section shows a live cursor on the map, and double-clicking adds a Point of Interest marker.</source>
+        <translation>Si está activo: al pasar el cursor sobre la sección sísmica se muestra un cursor en vivo en el mapa, y al hacer doble clic se añade un punto de interés.</translation>
     </message>
 </context><context>
     <name>VisualizerTab</name>

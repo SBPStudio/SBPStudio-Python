@@ -13,8 +13,14 @@ from typing import Dict
 # the params dict carries no explicit "clip" key.
 DEFAULT_CLIP_PCT: float = 99.6
 
-# Internal name used to register the custom Petrel cmap with matplotlib.
-_PETREL_CMAP_NAME = "petrel_seismic"
+# Internal name used to register the custom seismic cmap with matplotlib.
+# NOTE: matplotlib ships its OWN built-in cmap literally named "seismic" (a
+# stock blue-white-red diverging palette) and refuses to let force=True
+# override a builtin name — so the registration name here must differ from
+# the UI label to avoid silently resolving to matplotlib's palette instead
+# of ours. The dropdown still shows the plain "seismc" label (see CMAPS) —
+# intentionally spelled without the second "i" (not a typo).
+_SEISMIC_CMAP_NAME = "sbp_seismic"
 
 # Colormap palette: human-readable label → matplotlib cmap name.
 CMAPS: Dict[str, str] = {
@@ -24,7 +30,7 @@ CMAPS: Dict[str, str] = {
     "Jet":            "jet",
     "Terrain":        "terrain",
     "Blue-White-Red": "bwr",
-    "Petrel Seismic": _PETREL_CMAP_NAME,
+    "seismc":         _SEISMIC_CMAP_NAME,
 }
 
 # SEG-Y CoordinateUnits field values.
@@ -106,26 +112,24 @@ FILTER_DESCRIPTIONS: Dict[str, str] = {
                     "Suaviza la señal, útil para visualizar tendencias de baja frecuencia.",
 }
 
-# ── Petrel Seismic custom colormap ───────────────────────────────────────────
+# ── Seismic custom colormap ───────────────────────────────────────────────────
 # Diverging cool→warm palette that mimics the Petrel workstation default.
 # Amplitude is symmetric (−1 → +1); normalised position 0.0 ≡ trough (−1.0),
-# 0.5 ≡ zero-crossing (white), 1.0 ≡ peak (+1.0).
-#
-# The warm side carries an extra orange stop (0.875) that the pure red→yellow
-# linear interpolation would miss — this reproduces the distinct yellow band
-# visible at the peak in the original Petrel palette.
-_PETREL_STOPS: tuple = (
-    (0.000, (  0, 191, 255)),   # #00BFFF — bright sky-cyan   (trough  −1.0)
-    (0.250, (  0,   0, 255)),   # #0000FF — solid blue        (−0.5)
-    (0.500, (255, 255, 255)),   # #FFFFFF — white             (zero-crossing)
-    (0.750, (255,   0,   0)),   # #FF0000 — solid red         (+0.5)
-    (0.875, (255, 128,   0)),   # #FF8000 — orange            (+0.75)
-    (1.000, (255, 255,   0)),   # #FFFF00 — yellow            (peak    +1.0)
+# 0.5 ≡ zero-crossing (light gray), 1.0 ≡ peak (+1.0).
+_SEISMIC_STOPS: tuple = (
+    (0.00, (100, 200, 255)),   # light blue / cyan   (trough  −1.0)
+    (0.15, (  0,   0, 180)),   # dark blue            (−0.7)
+    (0.35, ( 40,  40,  40)),   # dark gray            (−0.3)
+    (0.50, (180, 180, 180)),   # light gray           (zero-crossing)
+    (0.65, (130,  90,  50)),   # brown                (+0.3)
+    (0.80, (200,   0,   0)),   # red                  (+0.6)
+    (0.90, (255, 120,   0)),   # orange               (+0.8)
+    (1.00, (255, 255,   0)),   # yellow               (peak    +1.0)
 )
 
 
-def _register_petrel_cmap() -> None:
-    """Register the Petrel seismic colormap with matplotlib at import time.
+def _register_seismic_cmap() -> None:
+    """Register the custom seismic colormap with matplotlib at import time.
 
     ``SeismicView._colormap()`` calls ``pg.colormap.get(name, source="matplotlib")``,
     which falls back to matplotlib's registry — so registering here makes the
@@ -136,16 +140,16 @@ def _register_petrel_cmap() -> None:
         import matplotlib.colors as _mc
         import matplotlib as _mpl
         _cmap = _mc.LinearSegmentedColormap.from_list(
-            _PETREL_CMAP_NAME,
-            [(pos, tuple(c / 255.0 for c in rgb)) for pos, rgb in _PETREL_STOPS],
+            _SEISMIC_CMAP_NAME,
+            [(pos, tuple(c / 255.0 for c in rgb)) for pos, rgb in _SEISMIC_STOPS],
         )
         try:
             _mpl.colormaps.register(_cmap, force=True)          # matplotlib ≥ 3.7
         except AttributeError:
             import matplotlib.cm as _cm
-            _cm.register_cmap(name=_PETREL_CMAP_NAME, cmap=_cmap)  # matplotlib < 3.7
+            _cm.register_cmap(name=_SEISMIC_CMAP_NAME, cmap=_cmap, force=True)  # matplotlib < 3.7
     except Exception:
         pass  # matplotlib absent or registration failed; fall back to viridis
 
 
-_register_petrel_cmap()
+_register_seismic_cmap()

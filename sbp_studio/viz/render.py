@@ -694,10 +694,20 @@ def _colorize_for_target(d: np.ndarray, cmap_name: str,
 # so the wiggle stays legible and the export (and any vector PDF) stays light.
 WIGGLE_MAX_TRACES = 1200
 
+# Default deflection gain — < 1.0, not 1.0: at gain=1.0 a fully-saturated sample
+# (amp clipped to ±vmax) deflects by EXACTLY one full inter-trace spacing,
+# landing precisely on the neighbouring trace's own anchor — zero margin. Near
+# a strong reflector (several consecutive near-saturated samples) that fill
+# visibly bleeds past where the neighbour's own data would justify any fill,
+# reading as a "blob" with no local VA data. 0.9 keeps deflection strong/
+# legible while guaranteeing a gap between adjacent traces' max excursions.
+WIGGLE_GAIN_DEFAULT = 0.9
+
 
 def _draw_wiggle_overlay(ax, d: np.ndarray, x_lo: float, x_hi: float,
                          t0: float, t1: float, *, vmax: float,
-                         va_fill: bool = True, wiggle_gain: float = 1.0,
+                         va_fill: bool = True, show_wiggle_line: bool = True,
+                         wiggle_gain: float = WIGGLE_GAIN_DEFAULT,
                          max_traces: int = WIGGLE_MAX_TRACES,
                          color: str = "#000000", lw: float = 0.4) -> None:
     """Overlay budgeted wiggle (+ optional variable-area fill) traces onto ``ax``.
@@ -707,8 +717,10 @@ def _draw_wiggle_overlay(ax, d: np.ndarray, x_lo: float, x_hi: float,
     and fast regardless of the native trace count (the raster base layer, if
     drawn, still carries full detail). Each drawn trace is plotted as a horizontal
     deflection x = centre + (amp/vmax)·spacing·gain; positive lobes are filled
-    (classic variable-area look) when ``va_fill``. Also pins the axes limits so a
-    'Wiggle Only' figure (no imshow) is framed correctly (time downward)."""
+    (classic variable-area look) when ``va_fill``; the deflection line itself is
+    drawn when ``show_wiggle_line`` (the two are independent visibility toggles —
+    either, both, or neither may be on). Also pins the axes limits so a 'Wiggle
+    Only' figure (no imshow) is framed correctly (time downward)."""
     n_rows, n_cols = d.shape
     if n_cols < 1 or n_rows < 2:
         return
@@ -726,7 +738,8 @@ def _draw_wiggle_overlay(ax, d: np.ndarray, x_lo: float, x_hi: float,
     for j, xc in zip(cols, centres):
         amp = np.clip(d[:, j] / vmax, -1.0, 1.0)
         x = xc + amp * deflect
-        ax.plot(x, t, color=color, lw=lw, antialiased=True, zorder=6)
+        if show_wiggle_line:
+            ax.plot(x, t, color=color, lw=lw, antialiased=True, zorder=6)
         if va_fill:
             # interpolate=True: matplotlib linearly interpolates the fill boundary
             # at zero-crossings → mathematically clean vector paths in PDF/SVG
@@ -771,7 +784,8 @@ def render_profile_figure(
     style: str = "density",
     layout_mode: str = "aspect",
     va_fill: bool = True,
-    wiggle_gain: float = 1.0,
+    show_wiggle_line: bool = True,
+    wiggle_gain: float = WIGGLE_GAIN_DEFAULT,
     max_wiggles: int = WIGGLE_MAX_TRACES,
     max_abs_pool: bool = False,
 ) -> Figure:
@@ -844,7 +858,8 @@ def render_profile_figure(
                   extent=[x_lo, x_hi, t1, t0], rasterized=True)
     if style == "wiggle":
         _draw_wiggle_overlay(ax, d, x_lo, x_hi, t0, t1, vmax=vmax,
-                             va_fill=va_fill, wiggle_gain=wiggle_gain,
+                             va_fill=va_fill, show_wiggle_line=show_wiggle_line,
+                             wiggle_gain=wiggle_gain,
                              max_traces=max_wiggles, color="#000000")
 
     # km x-ticks only make sense on the km extent; the per-trace modes get their
@@ -929,7 +944,8 @@ def render_chain_figure(
     style: str = "density",
     layout_mode: str = "aspect",
     va_fill: bool = True,
-    wiggle_gain: float = 1.0,
+    show_wiggle_line: bool = True,
+    wiggle_gain: float = WIGGLE_GAIN_DEFAULT,
     max_wiggles: int = WIGGLE_MAX_TRACES,
     max_abs_pool: bool = False,
 ) -> Figure:
@@ -1015,7 +1031,8 @@ def render_chain_figure(
                   extent=[x_lo, x_hi, t1, t0], rasterized=True)
     if style == "wiggle":
         _draw_wiggle_overlay(ax, d, x_lo, x_hi, t0, t1, vmax=vmax_cb,
-                             va_fill=va_fill, wiggle_gain=wiggle_gain,
+                             va_fill=va_fill, show_wiggle_line=show_wiggle_line,
+                             wiggle_gain=wiggle_gain,
                              max_traces=max_wiggles, color="#000000")
 
     # File-seam (chain-join) boundary lines — drawn ONLY when explicitly

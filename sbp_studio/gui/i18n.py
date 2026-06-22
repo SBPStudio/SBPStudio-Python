@@ -103,8 +103,14 @@ class TsTranslator(QTranslator):
         hit = self._map.get(key)
         if hit is None and disambiguation:
             hit = self._map.get((context or "", sourceText or "", ""))
-        # Returning "" makes Qt fall back to the (English) source text.
-        return hit or ""
+        # IMPORTANT: must return None (a null QString), not "". Qt's
+        # QCoreApplication::translate() falls back to the English source text
+        # only when the translator returns a NULL string (isNull()); an empty
+        # Python "" becomes a non-null-but-empty QString, which Qt treats as a
+        # genuine (blank) translation — this was the cause of blank widgets
+        # (e.g. the ASCII/EBCDIC/Latin-1 radio buttons) for any source string
+        # with no .ts entry.
+        return hit
 
 
 class LanguageManager(QObject):

@@ -20,22 +20,31 @@ fully generic, so Phase 2 nodes appear automatically once added to
 """
 from __future__ import annotations
 
+import json
+import re
+from pathlib import Path
 from typing import List, Optional
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView, QComboBox, QDoubleSpinBox, QFormLayout, QFrame,
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu, QPushButton,
-    QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem, QMenu,
+    QMessageBox, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from ..dsp import (
-    NODE_REGISTRY, ChoiceSpec, DSPNode, ParamSpec, tr_node, tr_param,
+    NODE_REGISTRY, ChoiceSpec, DSPNode, ParamSpec, make_node, tr_node, tr_param,
 )
 from ..i18n import language_manager
 
 _NODE_ROLE = Qt.ItemDataRole.UserRole
+
+# User preset store: one JSON file per saved pipeline under ~/.sbp_studio/presets.
+# A preset is a flat list of {"key", "params", "enabled"} — exactly what
+# make_node() needs to rebuild each stage, plus its mute state.
+_PRESET_DIR = Path.home() / ".sbp_studio" / "presets"
+_PRESET_EXT = ".json"
 
 
 class _ParamRow(QWidget):
@@ -148,6 +157,10 @@ class PipelinePanel(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
 
+        # Guards the itemChanged handler while we programmatically set a row's
+        # check state / style (so mute toggles only react to real user clicks).
+        self._suppress_item_changed = False
+
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(self.DEBOUNCE_MS)
@@ -161,24 +174,45 @@ class PipelinePanel(QWidget):
         self._hdr_pipeline.setObjectName("section")
         root.addWidget(self._hdr_pipeline)
 
-        # ── Node list (drag-drop reorder) ──
+        # ── Preset bar (load dropdown + Save) ──
+        preset_row = QHBoxLayout()
+        preset_row.setContentsMargins(0, 0, 0, 0)
+        preset_row.setSpacing(4)
+        self.preset_combo = QComboBox()
+        self.preset_combo.activated.connect(self._on_preset_selected)
+        self.btn_save_preset = QPushButton()
+        self.btn_save_preset.clicked.connect(self._save_preset)
+        preset_row.addWidget(self.preset_combo, 1)
+        preset_row.addWidget(self.btn_save_preset, 0)
+        root.addLayout(preset_row)
+
+        # ── Node list (drag-drop reorder; per-row mute checkbox) ──
         self.list = QListWidget()
         self.list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.list.currentItemChanged.connect(lambda *_: self._rebuild_editor())
+        # Per-row checkbox = node mute/bypass (see _on_item_changed). itemChanged
+        # also fires on text edits, but we only ever change text via setText with
+        # the check-state preserved, so the handler simply re-syncs node.enabled.
+        self.list.itemChanged.connect(self._on_item_changed)
         # rowsMoved fires after a drag-drop reorder completes.
         self.list.model().rowsMoved.connect(self._on_reordered)
         root.addWidget(self.list, 1)
 
-        # ── Add / Remove ──
+        # ── Add / Remove / Clear (mirrors the Loaded Profiles tree's button row:
+        # same QHBoxLayout margins, same Add/Remove-stretch-Clear order) ──
         btns = QHBoxLayout()
+        btns.setContentsMargins(6, 0, 6, 0)
         self.btn_add = QPushButton()
         self.btn_remove = QPushButton()
+        self.btn_clear = QPushButton()
         self.btn_add.clicked.connect(self._show_add_menu)
         self.btn_remove.clicked.connect(self._remove_selected)
+        self.btn_clear.clicked.connect(self._clear_pipeline)
         btns.addWidget(self.btn_add)
         btns.addWidget(self.btn_remove)
         btns.addStretch(1)
+        btns.addWidget(self.btn_clear)
         root.addLayout(btns)
 
         line = QFrame()
@@ -205,11 +239,13 @@ class PipelinePanel(QWidget):
         language_manager.language_changed.connect(self.retranslate_ui)
         self.retranslate_ui()
         self._rebuild_editor()
+        self._refresh_presets()
 
     # ── Public API ──────────────────────────────────────────────────────────
 
     def nodes(self) -> List[DSPNode]:
-        """Current ordered node list (top of the QListWidget = first applied)."""
+        """EVERY ordered node, including muted ones (top = first applied).
+        Used for serialization / save-preset, which must persist mute state."""
         out: List[DSPNode] = []
         for i in range(self.list.count()):
             node = self.list.item(i).data(_NODE_ROLE)
@@ -217,12 +253,50 @@ class PipelinePanel(QWidget):
                 out.append(node)
         return out
 
+    def active_nodes(self) -> List[DSPNode]:
+        """Only the ENABLED nodes, in order — the chain that actually executes.
+        Both the live preview and the export read this, so a muted node is
+        bypassed everywhere (Node Mute / bypass)."""
+        return [n for n in self.nodes() if getattr(n, "enabled", True)]
+
     def add_node(self, node: DSPNode) -> None:
         item = QListWidgetItem(tr_node(node.KEY, node.DISPLAY))
         item.setData(_NODE_ROLE, node)
+        # Checkable row = mute toggle. setData/flags BEFORE setCheckState so the
+        # itemChanged that setCheckState fires already sees the node payload.
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        self._suppress_item_changed = True
+        item.setCheckState(Qt.CheckState.Checked if node.enabled
+                           else Qt.CheckState.Unchecked)
+        self._suppress_item_changed = False
+        self._apply_muted_style(item, node.enabled)
         self.list.addItem(item)
         self.list.setCurrentItem(item)
         self.pipeline_changed.emit()   # structural → immediate
+
+    # ── Node mute (bypass) ────────────────────────────────────────────────────
+
+    def _on_item_changed(self, item: QListWidgetItem) -> None:
+        """A row's checkbox toggled → mute/unmute its node and re-run."""
+        if getattr(self, "_suppress_item_changed", False):
+            return
+        node = item.data(_NODE_ROLE)
+        if node is None:
+            return
+        enabled = item.checkState() == Qt.CheckState.Checked
+        if bool(getattr(node, "enabled", True)) == enabled:
+            return                     # no real change (e.g. text-only update)
+        node.enabled = enabled
+        self._apply_muted_style(item, enabled)
+        self.pipeline_changed.emit()   # active node set changed → recompute
+
+    def _apply_muted_style(self, item: QListWidgetItem, enabled: bool) -> None:
+        """Grey + strike-through a muted row so it reads as 'bypassed'."""
+        font = item.font()
+        font.setStrikeOut(not enabled)
+        item.setFont(font)
+        item.setForeground(QColor(Qt.GlobalColor.gray) if not enabled
+                           else QColor())
 
     # ── Structural actions ──────────────────────────────────────────────────
 
@@ -242,9 +316,144 @@ class PipelinePanel(QWidget):
         self._rebuild_editor()
         self.pipeline_changed.emit()   # structural → immediate
 
+    def _clear_pipeline(self) -> None:
+        if self.list.count() == 0:
+            return
+        self.list.clear()
+        self._rebuild_editor()
+        self.pipeline_changed.emit()   # structural → immediate
+
     def _on_reordered(self, *_) -> None:
         # Drag-drop reorder changes order → pipeline differs → immediate.
         self.pipeline_changed.emit()
+
+    # ── Save / Load presets ───────────────────────────────────────────────────
+
+    def _serialize(self) -> list:
+        """The current stack as a JSON-ready list (key + params + mute state)."""
+        return [{"key": n.KEY, "params": dict(n.params),
+                 "enabled": bool(getattr(n, "enabled", True))}
+                for n in self.nodes()]
+
+    def set_pipeline(self, spec: list) -> None:
+        """Rebuild the node stack from a serialized spec (load preset).
+
+        Fully VALIDATED before any mutation: a malformed/hand-edited preset
+        file (wrong field types, foreign/unknown keys) must never wipe the
+        user's current pipeline. Each entry is checked independently — one
+        bad entry is skipped, not fatal — and ``self.list`` is only cleared
+        once every entry has been turned into a real node. Emits
+        ``pipeline_changed`` once at the end (only if anything was built)."""
+        if not isinstance(spec, list):
+            QMessageBox.warning(
+                self, self.tr("Load failed"),
+                self.tr("Preset is not a valid pipeline (expected a list of modules)."))
+            return
+
+        built: List[DSPNode] = []
+        for entry in spec:
+            if not isinstance(entry, dict):
+                continue
+            key = entry.get("key", "")
+            params = entry.get("params") or {}
+            if not isinstance(key, str) or not isinstance(params, dict):
+                continue
+            try:
+                node = make_node(key, params, enabled=bool(entry.get("enabled", True)))
+            except (KeyError, TypeError, ValueError):
+                continue          # unknown node type / malformed params — skip gracefully
+            built.append(node)
+
+        # A non-empty spec that yields ZERO usable nodes is corruption, not an
+        # intentionally empty preset — treat it as a failed load and keep the
+        # current pipeline intact rather than silently wiping it.
+        if spec and not built:
+            QMessageBox.warning(
+                self, self.tr("Load failed"),
+                self.tr("Preset contains no valid modules — keeping the current pipeline."))
+            return
+
+        self.list.blockSignals(True)
+        self.list.clear()
+        self.list.blockSignals(False)
+        for node in built:
+            item = QListWidgetItem(tr_node(node.KEY, node.DISPLAY))
+            item.setData(_NODE_ROLE, node)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            self._suppress_item_changed = True
+            item.setCheckState(Qt.CheckState.Checked if node.enabled
+                               else Qt.CheckState.Unchecked)
+            self._suppress_item_changed = False
+            self.list.addItem(item)
+            self._apply_muted_style(item, node.enabled)
+        self._rebuild_editor()
+        self.pipeline_changed.emit()
+
+    @staticmethod
+    def _safe_name(name: str) -> str:
+        """Filesystem-safe stem for a preset (collapse non-word chars)."""
+        return re.sub(r"[^\w\- ]+", "_", name).strip() or "preset"
+
+    def _refresh_presets(self) -> None:
+        """Repopulate the load dropdown from the presets folder."""
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem(self.tr("Load preset…"), None)
+        try:
+            files = sorted(_PRESET_DIR.glob(f"*{_PRESET_EXT}"))
+        except OSError:
+            files = []
+        for f in files:
+            self.preset_combo.addItem(f.stem, str(f))
+        self.preset_combo.setCurrentIndex(0)
+        self.preset_combo.blockSignals(False)
+
+    def _save_preset(self) -> None:
+        name, ok = QInputDialog.getText(
+            self, self.tr("Save Preset"), self.tr("Preset name:"))
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        _PRESET_DIR.mkdir(parents=True, exist_ok=True)
+        path = _PRESET_DIR / f"{self._safe_name(name)}{_PRESET_EXT}"
+        if path.exists():
+            reply = QMessageBox.question(
+                self, self.tr("Overwrite preset?"),
+                self.tr("A preset named “{0}” already exists. Overwrite it?")
+                    .format(path.stem),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"name": name, "nodes": self._serialize()}, fh, indent=2)
+        except OSError as exc:
+            QMessageBox.warning(self, self.tr("Save failed"), str(exc))
+            return
+        self._refresh_presets()
+        idx = self.preset_combo.findData(str(path))
+        if idx >= 0:
+            self.preset_combo.blockSignals(True)
+            self.preset_combo.setCurrentIndex(idx)
+            self.preset_combo.blockSignals(False)
+
+    def _on_preset_selected(self, index: int) -> None:
+        path = self.preset_combo.itemData(index)
+        if not path:
+            return           # the "Load preset…" placeholder row
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                raise ValueError(self.tr("Preset file is not a valid pipeline (expected an object)."))
+            nodes = data.get("nodes")
+            if nodes is not None and not isinstance(nodes, list):
+                raise ValueError(self.tr("Preset 'nodes' field is not a list."))
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            QMessageBox.warning(self, self.tr("Load failed"), str(exc))
+            return
+        self.set_pipeline(nodes or [])
 
     # ── Property editor ─────────────────────────────────────────────────────
 
@@ -280,10 +489,17 @@ class PipelinePanel(QWidget):
         self._hdr_props.setText(self.tr("MODULE PARAMETERS"))
         self.btn_add.setText(self.tr("＋ Add module"))
         self.btn_remove.setText(self.tr("✖ Remove"))
-        # Refresh visible node labels + current editor labels.
+        self.btn_clear.setText(self.tr("✖✖ Clear"))
+        self.btn_save_preset.setText(self.tr("Save Preset"))
+        # The placeholder row text (index 0) is language-dependent; refresh it.
+        if self.preset_combo.count() > 0 and self.preset_combo.itemData(0) is None:
+            self.preset_combo.setItemText(0, self.tr("Load preset…"))
+        # Refresh visible node labels + current editor labels (preserve check state).
+        self._suppress_item_changed = True
         for i in range(self.list.count()):
             it = self.list.item(i)
             node = it.data(_NODE_ROLE)
             if node is not None:
                 it.setText(tr_node(node.KEY, node.DISPLAY))
+        self._suppress_item_changed = False
         self._rebuild_editor()

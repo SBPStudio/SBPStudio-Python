@@ -389,7 +389,8 @@ class TestNodeMigration:
         """Registry holds the reorderable DSP FILTERS only — NOT static geometry."""
         from sbp_studio.gui.dsp import NODE_REGISTRY
         keys = {c.KEY for c in NODE_REGISTRY}
-        assert keys == {"swell", "water_mute", "decon", "bandpass", "preset", "tvg", "agc"}
+        assert keys == {"swell", "fk", "water_mute", "demultiple", "decon",
+                        "bandpass", "notch", "whiten", "preset", "tvg", "agc"}
         assert "align" not in keys
 
 

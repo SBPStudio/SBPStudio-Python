@@ -27,6 +27,10 @@ from ..core import (
     compute_fix_positions,
     write_fix_points_shp, write_fix_points_geojson, write_fix_points_csv,
     write_navline_shp, write_navline_geojson, write_navline_csv,
+    patch_segy_headers,
+    apply_bandpass, apply_spectral_whitening, apply_agc, apply_tvg,
+    apply_predictive_decon, apply_filter_preset,
+    apply_swell_filter, apply_water_mute, apply_delay_alignment,
     CancelToken, Cancelled, ReprojectionError, CRSError,
     CMAPS,
 )
@@ -327,6 +331,448 @@ def cmd_join_chain(args) -> None:
             sys.exit(1)
         except (CRSError, ReprojectionError) as exc:
             _err(str(exc))
+
+
+# ── check ───────────────────────────────────────────────────────────────────────
+
+def _scan_anomalies(prof) -> List[str]:
+    """Heuristic QC scan over a loaded SegyProfile → list of human-readable
+    warnings. Catches the metadata problems the Headers editor exists to fix:
+    a zero/implausible sample interval, missing geometry, an undetected CRS,
+    duplicate-timestamp purging, and dead (all-zero) trace data."""
+    issues: List[str] = []
+
+    dt = int(getattr(prof, "dt_us", 0) or 0)
+    if dt <= 0:
+        issues.append("sample interval dt is 0 µs (binary header field unset) — "
+                      "fix with `patch-header --dt <µs>`")
+    elif dt > 20000:
+        issues.append(f"sample interval dt={dt} µs is unusually large "
+                      "(verify the header is in microseconds)")
+
+    ns = int(getattr(prof, "ns", 0) or 0)
+    if ns <= 0:
+        issues.append("samples-per-trace ns is 0 — this cannot be safely patched "
+                      "in place (it would corrupt trace boundaries); reprocess/"
+                      "rewrite the file with the correct sample count instead")
+
+    if not getattr(prof, "detected_crs", None):
+        issues.append("no CRS detected from the coordinate headers — set one "
+                      "before reprojecting (`reproject --src …`)")
+
+    purged = int(getattr(prof, "n_purged", 0) or 0)
+    if purged > 0:
+        issues.append(f"{purged} consecutive duplicate-timestamp trace(s) were "
+                      "auto-purged on load (acquisition double-stamping)")
+
+    lons = np.asarray(getattr(prof, "lons", []), dtype=float)
+    if lons.size == 0 or np.allclose(lons, 0.0):
+        issues.append("source coordinates are all zero / missing — the navigation "
+                      "track and map will be empty")
+
+    data = getattr(prof, "data", None)
+    if data is not None:
+        if not np.any(np.isfinite(data)) or np.allclose(np.nan_to_num(data), 0.0):
+            issues.append("trace data is entirely zero / non-finite (dead section)")
+        elif np.isnan(data).any():
+            issues.append("trace data contains NaN samples")
+
+    return issues
+
+
+def cmd_check(args) -> None:
+    """
+    check FILE... [--full-text]
+
+    Diagnostic scan: prints the EBCDIC textual header, the key binary-header
+    fields, basic statistics, and a heuristic list of detected anomalies. The
+    headless counterpart of the GUI Headers tab.
+    """
+    for path in args.files:
+        prof = load_profile(path, load_traces=not getattr(args, "no_stats", False))
+        print("\n" + "=" * 70)
+        print(f"FILE: {prof.name}")
+        print("=" * 70)
+
+        if prof.error:
+            print(f"  ERROR: {prof.error}")
+            continue
+
+        # ── EBCDIC textual header (3200 bytes / 40 cards) ─────────────────────
+        text = getattr(prof, "text_header", "") or ""
+        if text:
+            print("\n-- Textual header (EBCDIC 3200) " + "-" * 38)
+            if getattr(args, "full_text", False):
+                for line in text.split("\n"):
+                    print(f"  {line}")
+            else:
+                # First 6 cards is plenty to recognise the survey; --full-text dumps all.
+                for line in text.split("\n")[:6]:
+                    print(f"  {line}")
+                print("  …  (use --full-text for all 40 cards)")
+
+        # ── Binary / file-level fields ────────────────────────────────────────
+        print("\n-- Binary header & stats " + "-" * 45)
+        print(f"  Traces (kept)     : {prof.n_traces}")
+        if int(getattr(prof, "n_purged", 0) or 0) > 0:
+            print(f"  Traces (original) : {prof.original_n_traces}  "
+                  f"({prof.n_purged} purged)")
+        print(f"  Samples / trace   : {prof.ns}")
+        print(f"  Sample interval   : {prof.dt_us} µs  "
+              f"({1e6 / prof.dt_us:.0f} Hz)" if prof.dt_us else
+              f"  Sample interval   : {prof.dt_us} µs")
+        print(f"  Record length     : {prof.dur_ms:.1f} ms")
+        print(f"  Track length      : {prof.total_km:.2f} km")
+        print(f"  Delay (first)     : {prof.delay_ms} ms")
+        print(f"  CRS detected      : {prof.detected_crs or '(none)'}")
+        print(f"  Coord unit / scal : {prof.coord_unit} / {prof.scalar_coord}")
+
+        data = getattr(prof, "data", None)
+        if data is not None:
+            finite = np.nan_to_num(data)
+            print(f"  Amplitude range   : [{finite.min():.4g}, {finite.max():.4g}]")
+            print(f"  Amplitude RMS     : {np.sqrt(np.mean(finite ** 2)):.4g}")
+
+        # ── Anomalies ─────────────────────────────────────────────────────────
+        issues = _scan_anomalies(prof)
+        print("\n-- Anomaly scan " + "-" * 54)
+        if not issues:
+            print("  OK — no anomalies detected.")
+        else:
+            for msg in issues:
+                print(f"  ⚠ {msg}")
+
+
+# ── patch-header ─────────────────────────────────────────────────────────────────
+
+def cmd_patch_header(args) -> None:
+    """
+    patch-header FILE --dt µs [--text FILE] [--dry-run]
+
+    In-place (segyio r+) patch of the binary header. Mirrors the GUI Headers
+    editor's safe writer: changing --dt also mass-propagates the new sample
+    interval to EVERY trace header (TRACE_SAMPLE_INTERVAL). MODIFIES THE FILE.
+
+    ns (samples/trace) is intentionally NOT patchable here: changing it
+    without resizing every trace's data block would corrupt the file (every
+    trace boundary would misalign for any reader).
+    """
+    import segyio
+
+    path = args.file
+    md = load_metadata(path)
+    if md.error:
+        _err(f"Cannot read {path}: {md.error}")
+
+    binary_updates: dict = {}
+    if getattr(args, "dt", None) is not None:
+        binary_updates[int(segyio.BinField.Interval)] = int(args.dt)
+
+    text_header = None
+    if getattr(args, "text", None):
+        try:
+            with open(args.text, "r", encoding="utf-8", errors="replace") as fh:
+                text_header = fh.read()
+        except OSError as exc:
+            _err(f"Cannot read --text file: {exc}")
+
+    if not binary_updates and text_header is None:
+        _err("Nothing to patch. Provide --dt and/or --text FILE.")
+
+    md_dict = md.to_dict()
+    print(f"\nPatching header of {md_dict['name']}")
+    print(f"  Current : dt={md_dict['dt_us']} µs, ns={md_dict['ns']}")
+    if args.dt is not None:
+        print(f"  → dt    : {args.dt} µs  (also propagated to all "
+              f"{md_dict['n_traces']} trace headers)")
+    if text_header is not None:
+        print(f"  → text  : replaced from {Path(args.text).name}")
+
+    if getattr(args, "dry_run", False):
+        print("  DRY-RUN — no changes written.")
+        return
+
+    ok, errmsg = patch_segy_headers(
+        path, text_header=text_header, binary_updates=binary_updates or None)
+    if not ok:
+        _err(f"Patch failed: {errmsg}")
+    print(f"  ✔ {Path(path).name} patched in place.")
+
+
+# ── process (headless DSP pipeline) ──────────────────────────────────────────────
+
+# pipeline-token → (n_args, callable(data, obj, float_args) -> data). Each op
+# delegates to the SAME core.apply_* function the GUI DSP nodes wrap, so the
+# headless pipeline is bit-identical to the interactive one.
+def _op_bandpass(data, obj, a):
+    return apply_bandpass(data, a[0], a[1], obj.dt_us)
+
+def _op_whiten(data, obj, a):
+    return apply_spectral_whitening(data, obj.dt_us, a[0], a[1], a[2])
+
+def _op_agc(data, obj, a):
+    return apply_agc(data, a[0], obj.dt_us)
+
+def _op_tvg(data, obj, a):
+    return apply_tvg(data, a[0], obj.dt_us)
+
+def _op_decon(data, obj, a):
+    return apply_predictive_decon(data, obj.dt_us, a[0], a[1], a[2])
+
+def _op_swell(data, obj, a):
+    return apply_swell_filter(data, int(a[0]), a[1], obj.dt_us)
+
+def _op_water_mute(data, obj, a):
+    return apply_water_mute(data, a[0], a[1], obj.dt_us)
+
+def _op_align(data, obj, a):
+    return apply_delay_alignment(data, obj.delays, obj.min_delay, obj.dt_us,
+                                 fill_value=0.0)
+
+# name → (expected_arg_count, fn, signature_help)
+_PIPELINE_OPS = {
+    "bandpass":   (2, _op_bandpass,   "bandpass(flo_hz,fhi_hz)"),
+    "whiten":     (3, _op_whiten,     "whiten(flo_hz,fhi_hz,smooth_hz)"),
+    "agc":        (1, _op_agc,        "agc(window_ms)"),
+    "tvg":        (1, _op_tvg,        "tvg(alpha)"),
+    "decon":      (3, _op_decon,      "decon(op_ms,gap_ms,white_pct)"),
+    "swell":      (2, _op_swell,      "swell(window_traces,max_shift_ms)"),
+    "water_mute": (2, _op_water_mute, "water_mute(threshold_pct,margin_ms)"),
+    "align":      (0, _op_align,      "align()"),
+}
+
+
+def _parse_pipeline(spec: str) -> list:
+    """Parse ``"bandpass(1000,8000),whiten(...),agc(200)"`` into an ordered list
+    of ``(name, [float, …], fn)`` tuples. Raises ValueError on any problem."""
+    import re
+    spec = (spec or "").strip()
+    if not spec:
+        raise ValueError("empty --pipeline string")
+
+    ops = []
+    # Match name(args) groups; preset is handled separately (string arg).
+    for m in re.finditer(r"(\w+)\s*\(([^)]*)\)", spec):
+        name = m.group(1).lower()
+        raw  = m.group(2).strip()
+
+        if name == "preset":
+            key = raw.strip().strip("'\"")
+            ops.append((name, key, None))
+            continue
+
+        if name not in _PIPELINE_OPS:
+            raise ValueError(
+                f"unknown pipeline op {name!r}. Known: "
+                + ", ".join(sorted(list(_PIPELINE_OPS) + ['preset'])))
+        n_args, fn, sig = _PIPELINE_OPS[name]
+        nums = [p for p in (x.strip() for x in raw.split(",")) if p != ""]
+        if len(nums) != n_args:
+            raise ValueError(f"{name}: expected {n_args} argument(s) — use {sig}")
+        try:
+            vals = [float(x) for x in nums]
+        except ValueError:
+            raise ValueError(f"{name}: arguments must be numeric — use {sig}")
+        ops.append((name, vals, fn))
+
+    if not ops:
+        raise ValueError(
+            "could not parse any op from --pipeline. Example: "
+            "\"bandpass(1000,8000),whiten(1000,8000,300),agc(200)\"")
+    return ops
+
+
+def _apply_pipeline(data, obj, ops, progress=None) -> np.ndarray:
+    """Run a parsed pipeline over ``data`` (ns × n_traces), returning a new array."""
+    n = len(ops)
+    for i, (name, arg, fn) in enumerate(ops):
+        if progress:
+            progress(i / max(1, n), f"{name}")
+        if name == "preset":
+            data = apply_filter_preset(data, arg, obj.dt_us)
+        else:
+            data = fn(data, obj, arg)
+    if progress:
+        progress(1.0, "done")
+    return np.asarray(data, dtype=np.float32)
+
+
+def _compute_keep_idx(src_f):
+    """Re-derive the timestamp-dedup keep indices for a segyio handle, reusing the
+    SAME core mask so a processed output stays aligned with the cleaned section.
+    Returns a 1-D int array of kept trace indices, or None when nothing is purged."""
+    import segyio
+    from ..core.io_segy import _timestamp_dedup_mask
+    TF = segyio.TraceField
+    attr = src_f.attributes
+    keep = _timestamp_dedup_mask(
+        attr(TF.DayOfYear)[:], attr(TF.HourOfDay)[:],
+        attr(TF.MinuteOfHour)[:], attr(TF.SecondOfMinute)[:],
+        attr(TF.SourceX)[:], attr(TF.SourceY)[:])
+    if keep is None:
+        return None
+    return np.nonzero(keep)[0]
+
+
+def _write_processed_segy(src_path: str, out_path: str, processed: np.ndarray,
+                          progress=None) -> None:
+    """Write a processed (ns × n_traces) matrix to a new SEG-Y, preserving all
+    geometry/headers. Two paths:
+
+      * no duplicate-timestamp purge → copy the source byte-for-byte then
+        overwrite trace samples in place (every header preserved exactly);
+      * purge occurred → create a fresh file with only the kept traces, copying
+        each kept trace's header from the source (keeps data ↔ header aligned).
+    """
+    import shutil
+    import segyio
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    n_out = processed.shape[1]
+
+    # First, resolve the keep-mask and (if purging) write the deduped file — all
+    # while the source handle is open. The fast path defers the copy until the
+    # handle is released, so Windows never blocks on an open read handle.
+    with segyio.open(src_path, ignore_geometry=True) as src:
+        keep_idx = _compute_keep_idx(src)
+        if keep_idx is not None:
+            spec = segyio.tools.metadata(src)
+            spec.tracecount = n_out
+            with segyio.create(out_path, spec) as dst:
+                dst.text[0] = src.text[0]
+                dst.bin.update(src.bin)
+                for j, si in enumerate(keep_idx[:n_out]):
+                    dst.header[j] = src.header[int(si)]
+                    dst.trace[j] = np.ascontiguousarray(
+                        processed[:, j].astype(np.float32))
+            return
+
+    # Fast path: structural copy (source handle now closed), then overwrite samples.
+    shutil.copyfile(src_path, out_path)
+    with segyio.open(out_path, mode="r+", ignore_geometry=True) as f:
+        for i in range(n_out):
+            if progress and (i % 256 == 0):
+                progress(i / max(1, n_out), "writing")
+            f.trace[i] = np.ascontiguousarray(processed[:, i].astype(np.float32))
+        f.flush()
+
+
+def cmd_process(args) -> None:
+    """
+    process INPUT OUTPUT --pipeline "op(args),op(args),…"
+
+    Runs the headless DSP pipeline end-to-end on one SEG-Y file and writes a new
+    SEG-Y with the processed samples (all geometry/headers preserved). The
+    pipeline string uses the SAME stages as the GUI nodes.
+    """
+    tok = _make_cancel_token()
+    timer = PhasedTimer(enabled=getattr(args, "timeit", False))
+
+    try:
+        ops = _parse_pipeline(args.pipeline)
+    except ValueError as exc:
+        _err(str(exc))
+
+    print(f"\nPipeline: {args.pipeline}", file=sys.stderr)
+    for name, arg, _fn in ops:
+        print(f"  • {name}({arg if name == 'preset' else ', '.join(f'{v:g}' for v in arg)})",
+              file=sys.stderr)
+
+    with timer.phase("loading"):
+        prof = load_profile(args.input, load_traces=True)
+    if prof.error:
+        _err(f"Cannot load {args.input}: {prof.error}")
+
+    with timer.phase("processing"):
+        processed = _apply_pipeline(prof.data, prof, ops, progress=_progress)
+        print("", file=sys.stderr)
+
+    with timer.phase("writing"):
+        print(f"Writing {Path(args.output).name}…", file=sys.stderr)
+        _write_processed_segy(args.input, args.output, processed, progress=_progress)
+        print("", file=sys.stderr)
+
+    print(f"  ✔ {Path(args.output).name}  "
+          f"({processed.shape[1]} traces × {processed.shape[0]} samples)",
+          file=sys.stderr)
+    if getattr(args, "timeit", False):
+        print(timer.report(prefix="\n  "), file=sys.stderr)
+
+
+# ── batch-export ─────────────────────────────────────────────────────────────────
+
+_SEGY_EXTS = (".sgy", ".segy", ".seg")
+
+
+def _expand_segy_inputs(paths: List[str]) -> List[str]:
+    """Expand a mix of directories and files into a sorted list of SEG-Y files.
+    A directory contributes every *.sgy/*.segy/*.seg it directly contains."""
+    out: List[str] = []
+    for p in paths:
+        pp = Path(p)
+        if pp.is_dir():
+            for ext in _SEGY_EXTS:
+                out.extend(str(x) for x in sorted(pp.glob(f"*{ext}")))
+                out.extend(str(x) for x in sorted(pp.glob(f"*{ext.upper()}")))
+        elif pp.is_file():
+            out.append(str(pp))
+        else:
+            print(f"  WARNING: no such path: {p}", file=sys.stderr)
+    # De-duplicate while preserving order.
+    seen, uniq = set(), []
+    for f in out:
+        k = os.path.normcase(os.path.abspath(f))
+        if k not in seen:
+            seen.add(k)
+            uniq.append(f)
+    return uniq
+
+
+def cmd_batch_export(args) -> None:
+    """
+    batch-export DIR_OR_FILES… --out DIR [--format pdf] [--cmap …] [--ve …] …
+
+    Convenience wrapper over the export-image engine: expands directories into
+    SEG-Y files and renders each one into --out using the SAME vectorised
+    max-abs-pooling renderer (custom colormaps, fixed VE, RAM safety, vector
+    interpolation). One file's failure is reported but does not abort the batch.
+    """
+    files = _expand_segy_inputs(args.inputs)
+    if not files:
+        _err("No SEG-Y files found in the given path(s).")
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fmt = args.format or "pdf"
+
+    print(f"\nBatch export: {len(files)} file(s) → {out_dir}  "
+          f"[format={fmt}, cmap={args.cmap or 'Viridis'}]", file=sys.stderr)
+
+    ok = fail = 0
+    for idx, f in enumerate(files, 1):
+        stem = Path(f).stem
+        out_path = out_dir / f"{stem}.{fmt}"
+        print(f"\n[{idx}/{len(files)}] {Path(f).name}", file=sys.stderr)
+
+        # Drive the existing single-file engine: one file, explicit output path.
+        args.files = [f]
+        args.out   = str(out_path)
+        args.chain = False
+        try:
+            cmd_export_image(args)
+            ok += 1
+        except SystemExit as exc:               # per-file _err()/exit → keep going
+            if exc.code not in (0, None):
+                print(f"  SKIP {Path(f).name}: export failed (exit {exc.code})",
+                      file=sys.stderr)
+                fail += 1
+        except Exception as exc:
+            print(f"  SKIP {Path(f).name}: {exc}", file=sys.stderr)
+            fail += 1
+
+    print(f"\nBatch complete: {ok} ok, {fail} failed → {out_dir}", file=sys.stderr)
+    if fail and not ok:
+        sys.exit(1)
 
 
 # ── Quality presets ────────────────────────────────────────────────────────────

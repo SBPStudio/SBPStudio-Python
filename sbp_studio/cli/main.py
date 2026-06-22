@@ -6,9 +6,13 @@ Usage:
 
 Subcommands:
     info          Print SEG-Y metadata
+    check         Inspect headers + scan a SEG-Y file for anomalies
+    patch-header  Patch the dt binary header field in place (segyio r+)
+    process       Run a headless DSP pipeline on a file → new SEG-Y
     reproject     Reproject one or more SEG-Y files to a new CRS
     join-chain    Reproject and join a chain of profiles into one SEG-Y
     export-image  Export seismic profile(s) or chain as an image
+    batch-export  Render many SEG-Y files/dirs into one output folder
     spectrum      Compute and export the frequency spectrum figure
     navline       Export the navigation track as SHP/GeoJSON/CSV
     fix           Export FIX-point marks as SHP/GeoJSON/CSV
@@ -33,6 +37,31 @@ def build_parser() -> argparse.ArgumentParser:
     pi = sub.add_parser("info", help="Print SEG-Y file metadata")
     pi.add_argument("files", nargs="+", metavar="FILE")
     pi.add_argument("--json", action="store_true", help="Output as JSON array")
+
+    # ── check ────────────────────────────────────────────────────────────────
+    pc = sub.add_parser("check",
+                        help="Inspect headers + scan a SEG-Y file for anomalies")
+    pc.add_argument("files", nargs="+", metavar="FILE")
+    pc.add_argument("--full-text", action="store_true", dest="full_text",
+                    help="Print all 40 EBCDIC cards (default: first 6).")
+    pc.add_argument("--no-stats", action="store_true", dest="no_stats",
+                    help="Header-only: skip loading traces (no amplitude stats).")
+
+    # ── patch-header ─────────────────────────────────────────────────────────
+    pp = sub.add_parser("patch-header",
+                        help="Patch the dt binary header field IN PLACE (segyio r+)")
+    pp.add_argument("file", metavar="FILE")
+    pp.add_argument("--dt", type=int, default=None, metavar="US",
+                    help="New sample interval in microseconds. Also mass-propagated "
+                         "to every trace header (TRACE_SAMPLE_INTERVAL). NOTE: ns "
+                         "(samples/trace) is intentionally NOT patchable here — "
+                         "changing it without resizing the trace data blocks would "
+                         "corrupt the file (every trace boundary would misalign).")
+    pp.add_argument("--text", metavar="TXTFILE", default=None,
+                    help="Replace the 3200-byte EBCDIC textual header from a UTF-8 "
+                         "text file (≤40 lines × 80 chars).")
+    pp.add_argument("--dry-run", action="store_true", dest="dry_run",
+                    help="Print what would change without modifying the file.")
 
     # ── reproject ─────────────────────────────────────────────────────────────
     pr = sub.add_parser("reproject", help="Reproject SEG-Y file(s) to a new CRS")
@@ -294,6 +323,92 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Print wall-clock timing breakdown for each stage "
                          "(loading / processing / rendering / saving).")
 
+    # ── process (headless DSP pipeline) ───────────────────────────────────────
+    ppr = sub.add_parser(
+        "process",
+        help="Run a headless DSP pipeline on a file and write a new SEG-Y",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Apply an ordered DSP pipeline to one SEG-Y file and write a new\n"
+            "SEG-Y with the processed samples (all geometry/headers preserved).\n\n"
+            "Pipeline ops (comma-separated, applied left→right):\n"
+            "  bandpass(flo_hz,fhi_hz)            Butterworth band-pass\n"
+            "  whiten(flo_hz,fhi_hz,smooth_hz)    spectral whitening (zero-phase)\n"
+            "  decon(op_ms,gap_ms,white_pct)      predictive deconvolution\n"
+            "  swell(window_traces,max_shift_ms)  swell / heave correction\n"
+            "  water_mute(threshold_pct,margin_ms) water-column mute\n"
+            "  tvg(alpha)                         time-variant exponential gain\n"
+            "  agc(window_ms)                     automatic gain control\n"
+            "  preset(key)                        attribute/preset (e.g. envelope)\n"
+            "  align()                            delay-recording-time alignment\n\n"
+            "Example:\n"
+            '  process in.sgy out.sgy --pipeline '
+            '"bandpass(1000,8000),whiten(1000,8000,300),agc(200)"'))
+    ppr.add_argument("input", metavar="INPUT")
+    ppr.add_argument("output", metavar="OUTPUT")
+    ppr.add_argument("--pipeline", required=True, metavar="SPEC",
+                     help='Comma-separated op list, e.g. '
+                          '"bandpass(1000,8000),agc(200)".')
+    ppr.add_argument("--timeit", action="store_true",
+                     help="Print a per-stage timing breakdown.")
+
+    # ── batch-export ──────────────────────────────────────────────────────────
+    pb = sub.add_parser(
+        "batch-export",
+        help="Render many SEG-Y files/dirs into one output folder")
+    pb.add_argument("inputs", nargs="+", metavar="PATH",
+                    help="SEG-Y files and/or directories (scanned for *.sgy/*.seg).")
+    pb.add_argument("--out", required=True, metavar="DIR",
+                    help="Output directory (one image per input file).")
+    pb.add_argument("--format", choices=["png", "pdf", "tif", "svg"],
+                    default="pdf", dest="format",
+                    help="Output format (default: pdf).")
+    pb.add_argument("--cmap", metavar="NAME", default=None,
+                    help="Colormap (e.g. seismc, bwr, Viridis, Greys).")
+    pb.add_argument("--ve", type=float, default=None, dest="ve", metavar="N",
+                    help="Fixed, length-independent vertical exaggeration "
+                         "(requires --x-scale).")
+    pb.add_argument("--x-scale", type=float, default=None, dest="x_scale",
+                    metavar="KM_PER_IN",
+                    help="Horizontal physical scale in km/inch (anchors --ve).")
+    pb.add_argument("--velocity", type=float, default=1500.0, dest="velocity",
+                    metavar="M_S", help="Sound velocity for depth/VE (default 1500).")
+    pb.add_argument("--preset", metavar="KEY", default=None,
+                    help="Filter preset / attribute key (e.g. 'envelope').")
+    pb.add_argument("--bandpass", nargs=2, type=float, metavar=("LO", "HI"),
+                    default=None, help="Band-pass low/high cutoff in Hz.")
+    pb.add_argument("--agc", action="store_true", help="Enable AGC.")
+    pb.add_argument("--align", action="store_true",
+                    help="Compensate delay recording times.")
+    pb.add_argument("--clip", type=float, default=99.6, metavar="P",
+                    help="Clip percentile for colour scaling (default 99.6).")
+    pb.add_argument("--invert", action="store_true", help="Invert the colormap.")
+    pb.add_argument("--quality", choices=["screen", "print", "high", "ultra"],
+                    default="print",
+                    help="DPI preset (default: print = 300 DPI).")
+    pb.add_argument("--dpi", type=int, default=None, metavar="N",
+                    help="Explicit DPI (overrides --quality).")
+    pb.add_argument("--theme", choices=["dark", "light", "print"], default="print",
+                    help="Colour theme (default: print).")
+    pb.add_argument("--no-axes", action="store_true", dest="no_axes",
+                    help="Save pure data pixels (no axes/labels/colorbar).")
+    pb.add_argument("--mem-budget-gb", type=float, default=6.0,
+                    dest="mem_budget_gb", metavar="GB",
+                    help="Peak rasteriser RAM budget (default 6).")
+    pb.add_argument("--timeit", action="store_true",
+                    help="Print per-stage timing for each file.")
+    # Fill every attribute cmd_export_image reads directly so the shared engine
+    # never hits an AttributeError on a flag batch-export does not expose.
+    pb.set_defaults(tvg=None, fill_zero=False, fix=None, chain=False,
+                    px_per_trace=2.0, figheight=None, auto_height=False,
+                    y_scale=None, ratio=None, max_aspect=None, x_axis="distance",
+                    pdf_page="auto", clip_lo=0.0,
+                    x_tick=None, t_tick=None, time_ticks=None, grid=False,
+                    title=None, margin_top=0.0, margin_bottom=0.0,
+                    time_fmt="hhmm", time_font_size=6.0, time_align="left",
+                    fix_font_size=5.0, fix_bbox_alpha=0.12, fix_color=None,
+                    bg_color=None, text_color=None, axes_bg_color=None)
+
     # ── spectrum ──────────────────────────────────────────────────────────────
     ps = sub.add_parser("spectrum",
                         help="Compute and export the frequency spectrum figure")
@@ -336,10 +451,23 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _force_utf8_console() -> None:
+    """Make stdout/stderr tolerate non-ASCII glyphs (µ, ✔, →, ⚠) on a Windows
+    console whose default code page is cp1252. Best-effort: reconfigure to UTF-8
+    with replacement so a stray glyph can never crash a command mid-run."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # py3.7+ TextIO
+        except Exception:
+            pass
+
+
 def main(argv=None) -> None:
+    _force_utf8_console()
     from .commands import (
-        cmd_info, cmd_reproject, cmd_join_chain,
-        cmd_export_image, cmd_spectrum, cmd_navline, cmd_fix,
+        cmd_info, cmd_check, cmd_patch_header, cmd_process,
+        cmd_reproject, cmd_join_chain,
+        cmd_export_image, cmd_batch_export, cmd_spectrum, cmd_navline, cmd_fix,
         cmd_accel,
     )
 
@@ -348,9 +476,13 @@ def main(argv=None) -> None:
 
     dispatch = {
         "info":         cmd_info,
+        "check":        cmd_check,
+        "patch-header": cmd_patch_header,
+        "process":      cmd_process,
         "reproject":    cmd_reproject,
         "join-chain":   cmd_join_chain,
         "export-image": cmd_export_image,
+        "batch-export": cmd_batch_export,
         "spectrum":     cmd_spectrum,
         "navline":      cmd_navline,
         "fix":          cmd_fix,

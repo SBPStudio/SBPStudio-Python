@@ -14,16 +14,26 @@ from .tasks import (
 )
 from .model import SegyMetadata, SegyProfile, ProfileChain
 from .io_segy import (load_metadata, load_profile, smooth_track,
-                      reproject_one, reproject_chain, join_profiles)
+                      reproject_one, reproject_chain, join_profiles,
+                      patch_segy_headers, decode_text_header,
+                      detect_text_header_encoding, read_raw_text_header,
+                      trace_field_names, trace_field_int_range,
+                      patch_trace_header_field)
+from .header_calc import (evaluate_header_expr, parse_assignment,
+                          validate_header_result, available_functions,
+                          HeaderExprError)
 from .processing import (
     apply_predictive_decon, apply_filter_preset, apply_agc,
     apply_bandpass, apply_tvg, apply_delay_alignment,
-    apply_water_mute, apply_swell_filter, compute_amplitude_spectrum,
+    apply_water_mute, apply_swell_filter, apply_spectral_whitening,
+    apply_fk_filter, apply_multiple_suppression, apply_notch,
+    compute_amplitude_spectrum,
     process_profile_data, process_chain_data, time_window,
 )
 from .spectrum import compute_spectrum, SpectrumResult
 from .coordinates import resolve_crs, validate_crs
-from .spatial import reproject_points, to_geographic, CRS_CATALOG, CRS_PRESETS
+from .spatial import (reproject_points, to_geographic, crs_produces_geographic,
+                      CRS_CATALOG, CRS_PRESETS)
 from .gis_io import (read_gis_layer, read_vector, read_geotiff,
                      VectorLayer, RasterLayer)
 from .chaining import detect_chains, import_chains_from_directory
@@ -48,17 +58,24 @@ __all__ = [
     "SegyMetadata", "SegyProfile", "ProfileChain",
     # I/O
     "load_metadata", "load_profile", "smooth_track", "reproject_one", "reproject_chain",
-    "join_profiles",
+    "join_profiles", "patch_segy_headers", "decode_text_header",
+    "detect_text_header_encoding", "read_raw_text_header",
+    "trace_field_names", "trace_field_int_range", "patch_trace_header_field",
+    # Header calculator (safe sandboxed expression evaluator)
+    "evaluate_header_expr", "parse_assignment", "validate_header_result",
+    "available_functions", "HeaderExprError",
     # Processing
     "apply_predictive_decon", "apply_filter_preset", "apply_agc",
     "apply_bandpass", "apply_tvg", "apply_delay_alignment",
-    "apply_water_mute", "apply_swell_filter", "compute_amplitude_spectrum",
+    "apply_water_mute", "apply_swell_filter", "apply_spectral_whitening",
+    "apply_fk_filter", "apply_multiple_suppression", "apply_notch",
+    "compute_amplitude_spectrum",
     "process_profile_data", "process_chain_data", "time_window",
     # Spectrum
     "compute_spectrum", "SpectrumResult",
     # Coordinates
     "resolve_crs", "validate_crs", "reproject_points", "to_geographic",
-    "CRS_CATALOG", "CRS_PRESETS",
+    "crs_produces_geographic", "CRS_CATALOG", "CRS_PRESETS",
     "read_gis_layer", "read_vector", "read_geotiff", "VectorLayer", "RasterLayer",
     # Chaining
     "detect_chains", "import_chains_from_directory",

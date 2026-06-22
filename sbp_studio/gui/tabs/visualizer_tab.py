@@ -45,6 +45,7 @@ class VisualizerTab(SubTabbedTab):
         self._handler: SourceHandler | None = None
         self.state.active_profile_changed.connect(self._on_profile_selected)
         self.state.active_chain_changed.connect(self._on_chain_selected)
+        self._headers.source_refreshed.connect(self._on_source_refreshed)
 
     def empty_message(self) -> str:
         return self.tr("Select a profile or chain in the list on the left")
@@ -94,6 +95,13 @@ class VisualizerTab(SubTabbedTab):
             return
         self._handler = self._handlers["chain"]
         self._handler.on_selected(chain)
+
+    def _on_source_refreshed(self, new_profile: object) -> None:
+        """HeaderView patched the active SEG-Y file and reloaded the profile.
+        Push the updated profile into AppState so every observer (map, seismic,
+        spectrum, DSP pipeline) picks up the corrected metadata immediately."""
+        if self._handler is self._handlers.get("profile"):
+            self.state.update_profile_data(new_profile)
 
     # ── Shared teardown ───────────────────────────────────────────────────────
 

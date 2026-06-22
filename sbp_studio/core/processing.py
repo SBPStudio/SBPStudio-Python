@@ -681,6 +681,314 @@ def apply_swell_filter(data: np.ndarray, window_traces: int,
     return out.astype(np.float32)
 
 
+# ── Spectral whitening (resolution enhancement) ────────────────────────────────
+
+def _ref_apply_spectral_whitening(
+    data: np.ndarray,
+    dt_us: int,
+    flo: float,
+    fhi: float,
+    smooth_hz: float,
+) -> np.ndarray:
+    """
+    Reference spectral whitening, trace by trace (vectorised over columns).
+
+    Algorithm (zero-phase):
+      1. rfft each column at its original length → complex spectrum X
+      2. Compute amplitude envelope A = |X|, smooth it along the frequency
+         axis with a uniform filter of width ``smooth_hz``
+      3. Inside [flo, fhi]: divide X by the smoothed envelope (normalise)
+      4. Outside [flo, fhi]: keep X unchanged so the node composes cleanly
+         before/after a BandpassNode without hard-cutting the flanks
+      5. irfft → output trace (same length, same phase, flattened amplitude)
+
+    Path: reference.  Parallelised over column blocks via ``_parallel_apply``.
+    """
+    from scipy.ndimage import uniform_filter1d
+
+    ns, _nt = data.shape
+    fs      = 1e6 / dt_us
+    nyquist = fs / 2.0
+    flo     = max(0.0, flo)
+    fhi     = min(nyquist - 1.0, fhi)
+    if flo >= fhi:
+        return data.copy()
+
+    # Frequency-axis metadata for a length-ns real FFT (computed once, shared
+    # across all column blocks via closure — bin count never changes for a
+    # fixed (ns, dt_us) pair).
+    freqs  = np.fft.rfftfreq(ns, d=dt_us / 1e6)          # (n_freqs,) Hz
+    bin_hz = float(freqs[1]) if freqs.size > 1 else 1.0   # Hz per bin
+    band   = (freqs >= flo) & (freqs <= fhi)              # (n_freqs,) bool
+
+    if not np.any(band):
+        return data.copy()
+
+    # Smoothing window in bins; odd so uniform_filter1d is symmetric.
+    smooth_b = max(3, int(smooth_hz / bin_hz))
+    if smooth_b % 2 == 0:
+        smooth_b += 1
+
+    def _whiten_block(block: np.ndarray) -> np.ndarray:
+        # rfft axis=0 (time axis) gives one spectrum per column — fully
+        # vectorised: no inner trace loop.
+        X   = np.fft.rfft(block.astype(np.float64), n=block.shape[0], axis=0)
+        amp = np.abs(X)                                    # (n_freqs, _nt_b)
+
+        # Smooth the amplitude envelope along the frequency axis (same
+        # uniform_filter1d approach as AGC uses on the time axis).
+        env = uniform_filter1d(amp, size=smooth_b, axis=0, mode='nearest')
+
+        # Per-trace in-band peak → adaptive eps floor that stays stable
+        # for quiet/all-zero traces without clamping real signal.
+        # peak shape (1, _nt_b) for broadcasting with (n_band, _nt_b).
+        peak = env[band, :].max(axis=0, keepdims=True)    # (1, _nt_b)
+        eps  = np.maximum(peak * 1e-9, 1e-30)
+
+        X_out = X.copy()
+        X_out[band, :] = X[band, :] / np.maximum(env[band, :], eps)
+
+        # Silent traces (peak ≤ eps floor) pass through unchanged so the
+        # node never amplifies numerical noise on dead channels.
+        silent = peak[0, :] <= 1e-30                      # (_nt_b,) bool
+        if np.any(silent):
+            X_out[:, silent] = X[:, silent]
+
+        return np.fft.irfft(X_out, n=block.shape[0], axis=0).astype(np.float32)
+
+    return _parallel_apply(_whiten_block, data)
+
+
+def apply_spectral_whitening(
+    data: np.ndarray,
+    dt_us: int,
+    flo: float,
+    fhi: float,
+    smooth_hz: float,
+) -> np.ndarray:
+    """
+    Spectral whitening (resolution enhancement), trace by trace.
+
+    Flattens the amplitude spectrum within [flo, fhi] by dividing each trace's
+    complex rfft by a smoothed version of its own amplitude envelope.  The
+    operation is strictly zero-phase: the complex phase is preserved exactly,
+    only the magnitude changes.  The net effect is broader effective bandwidth
+    and sharper temporal resolution — the primary resolution-enhancement step
+    for SBP / TOPAS sub-bottom profiler data, also applicable to high-frequency
+    MCS surveys.
+
+    Parameters
+    ----------
+    data      : (ns, n_traces) float32 — input NOT mutated
+    dt_us     : sample interval in microseconds
+    flo       : lower band limit (Hz) — whitening starts at this frequency
+    fhi       : upper band limit (Hz) — whitening ends at this frequency
+    smooth_hz : smoothing window applied to the spectral envelope (Hz).
+                Narrower values flatten more aggressively (wider effective
+                bandwidth); wider values apply gentle broad-band equalization.
+                Typical SBP range: 200–600 Hz.
+
+    Returns
+    -------
+    (ns, n_traces) float32 — new array
+
+    Notes
+    -----
+    The smoothed envelope is computed via ``scipy.ndimage.uniform_filter1d``
+    along the frequency axis — the same approach AGC uses on the time axis.
+    Outside [flo, fhi] the original spectrum is preserved unchanged, so this
+    node composes cleanly before or after a BandpassNode.  Dead traces (all-zero
+    amplitude in band) pass through unmodified.  Parallelised over trace-column
+    blocks via ``_parallel_apply``.
+
+    Path: reference (_ref_apply_spectral_whitening).
+    """
+    return _ref_apply_spectral_whitening(data, dt_us, flo, fhi, smooth_hz)
+
+
+# ── F-K (frequency–wavenumber) dip filter ───────────────────────────────────────
+
+def apply_fk_filter(data: np.ndarray, dt_us: int, dip_ms: float,
+                    width_ms: float, mode: str = "reject_both") -> np.ndarray:
+    """2-D frequency–wavenumber (F-K) dip filter — rejects (or isolates) a fan
+    of coherently DIPPING events (side-echoes, diffraction tails, towfish/
+    cable noise) by their apparent slope, leaving flat reflectors intact.
+
+    A linear event advancing ``p`` samples per trace maps in the 2-D FFT to the
+    radial line ``k = -p·f`` (normalised cycles/trace vs cycles/sample). For
+    every (f, k) bin the apparent dip is ``p = -k/f``; the fan
+    ``[dip-width, dip+width]`` (converted ms/trace → samples/trace) is the
+    reject (or, in ``pass`` mode, the keep) region. The mask is lightly
+    Gaussian-smoothed (wrap-around) to soften the cut and limit ringing.
+
+    Parameters
+    ----------
+    data     : (ns, n_traces) float32 — input NOT mutated. MUST be the true,
+               un-decimated viewport block: decimating the columns would
+               corrupt the wavenumber axis (the GUI runs this on full-res
+               viewport data, see PreviewController / DSPNode.NEEDS_FULL_RES).
+    dt_us    : sample interval (µs) — sets samples↔ms for the dip conversion.
+    dip_ms   : centre apparent dip of the fan (ms per trace; sign = direction).
+    width_ms : half-width of the fan (ms per trace).
+    mode     : "reject_both" (reject ±dip), "reject_one" (reject the signed
+               fan only), or "pass" (keep ONLY the fan, remove everything else).
+
+    Returns
+    -------
+    (ns, n_traces) float32 — new array.
+    """
+    ns, nt = data.shape
+    if ns < 4 or nt < 4:
+        return data.copy()
+    from scipy.fft import fft2, ifft2
+    from scipy.ndimage import gaussian_filter
+
+    dt_ms = (dt_us or 1) / 1000.0
+    # float32 throughout the mask build: at the 4096² cap a float64 (f, k, p,
+    # mask) intermediate would double the memory of the complex64 spectrum
+    # itself for no precision benefit (the mask is a soft 0..1 gate, not a
+    # value that accumulates error).
+    f = np.fft.fftfreq(ns).astype(np.float32)[:, None]   # cycles/sample (ns, 1)
+    k = np.fft.fftfreq(nt).astype(np.float32)[None, :]   # cycles/trace  (1, nt)
+    p_c = dip_ms / dt_ms                                  # centre dip, samples/trace
+    p_w = max(abs(width_ms), 1e-6) / dt_ms               # half-width, samples/trace
+    p_lo, p_hi = p_c - p_w, p_c + p_w
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p = -k / f                                       # (ns, nt); ±inf on the f=0 row
+    fan = (p >= p_lo) & (p <= p_hi)
+    if mode == "reject_both":
+        fan = fan | ((p >= -p_hi) & (p <= -p_lo))
+
+    if mode == "pass":
+        keep = fan.copy()
+        keep[0, :] = True       # always keep the f=0 (time-DC) row …
+        keep[:, 0] = True       # … and the k=0 (zero-dip) column → preserve flat events
+        mask = keep.astype(np.float32)
+    else:
+        mask = (~fan).astype(np.float32)
+    mask = gaussian_filter(mask, sigma=1.5, mode="wrap")  # soften the cut (anti-ring)
+
+    spec = fft2(data.astype(np.float32))                  # complex64 (scipy preserves dtype)
+    spec *= mask                                          # in-place: no extra complex64 buffer
+    del mask
+    out = ifft2(spec).real
+    del spec                                              # release before the final copy below
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
+# ── Seabed (water-bottom) multiple suppression ──────────────────────────────────
+
+def apply_multiple_suppression(data: np.ndarray, dt_us: int,
+                               threshold_pct: float, period_ms: float = 0.0,
+                               max_gain: float = 1.0) -> np.ndarray:
+    """Suppress the first water-bottom MULTIPLE by adaptive predictive
+    subtraction at the seabed period (critical for shallow SBP, where the
+    seabed multiple masks the sub-bottom).
+
+    The first multiple is a delayed copy of the primary arriving one seabed
+    two-way-time later, so a 1-tap predictor at lag = seabed sample removes it:
+    for each trace the best-fit scalar gain ``g = Σ x·x₋ₗ / Σ x₋ₗ²`` (the
+    least-squares match of the lag-shifted trace to itself) predicts the
+    repeating event, and ``x − g·x₋ₗ`` cancels it. Fully vectorised over
+    traces (per-trace lag via ``take_along_axis``).
+
+    Parameters
+    ----------
+    data          : (ns, n_traces) float32 — input NOT mutated.
+    dt_us         : sample interval (µs).
+    threshold_pct : seabed pick threshold, % of each trace's peak |amp| — the
+                    seabed sample sets the per-trace prediction lag (the
+                    primary→multiple period). Ignored when ``period_ms`` > 0.
+    period_ms     : fixed prediction period (ms). 0 → auto-pick per trace.
+    max_gain      : clamp on the adaptive gain so a mis-pick can't over-subtract
+                    / invert a primary.
+
+    Returns
+    -------
+    (ns, n_traces) float32 — new array.
+    """
+    ns, nt = data.shape
+    if ns < 4:
+        return data.copy()
+    dt_ms = (dt_us or 1) / 1000.0
+
+    if period_ms and period_ms > 0:
+        lag = np.full(nt, max(1, int(round(period_ms / dt_ms))), dtype=int)
+    else:
+        abs_d = np.abs(data)
+        peak = np.nanmax(abs_d, axis=0)
+        thr = (threshold_pct / 100.0) * peak
+        onset = np.argmax(abs_d >= thr[None, :], axis=0)   # first seabed crossing
+        # The prediction period is the primary→multiple separation = the seabed
+        # PEAK two-way time, NOT the threshold onset (which precedes the peak by
+        # the wavelet rise and would mis-align the predictor). Refine each pick
+        # to the local |amplitude| peak in a short window after the onset.
+        w = max(5, int(round(5.0 / dt_ms)))                # ~5 ms search window
+        rows0 = np.arange(ns)[:, None]
+        inwin = (rows0 >= onset[None, :]) & (rows0 < (onset + w)[None, :])
+        sb = np.argmax(np.where(inwin, abs_d, -1.0), axis=0)
+        lag = np.maximum(sb.astype(int), 1)                # primary→multiple period (samples)
+
+    rows = np.arange(ns)[:, None]
+    src = rows - lag[None, :]                            # 'one period earlier' index
+    valid = src >= 0
+    shifted = np.take_along_axis(data, np.clip(src, 0, ns - 1), axis=0)
+    shifted = np.where(valid, shifted, 0.0).astype(np.float32)
+
+    # Estimate the gain ONLY within the first-multiple window [lag, 2.5·lag].
+    # The lag-shifted trace also carries a deeper "ghost" of the multiple
+    # itself (around 3·lag) that has no real event to match; including it in
+    # the least-squares denominator would dilute the gain and leave the
+    # multiple under-subtracted. Restricting to the first-multiple band makes
+    # the 1-tap predictor cancel it cleanly without touching deeper data.
+    win_hi = np.minimum(2 * lag + lag // 2, ns)
+    wmask = (rows >= lag[None, :]) & (rows < win_hi[None, :])
+    num = np.sum(data * shifted * wmask, axis=0)
+    den = np.sum(shifted * shifted * wmask, axis=0)
+    g = np.where(den > 1e-12, num / den, 0.0)
+    g = np.clip(g, -abs(max_gain), abs(max_gain))
+    out = data - g[None, :] * shifted
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
+# ── Notch (surgical band-stop) filter ───────────────────────────────────────────
+
+def apply_notch(data: np.ndarray, dt_us: int, freq: float,
+                q: float = 30.0) -> np.ndarray:
+    """Surgically remove a single narrow interference frequency (electrical
+    resonance, tow-cable/strumming tone) with a zero-phase IIR notch.
+
+    ``scipy.signal.iirnotch(freq, Q, fs)`` designs a 2nd-order notch; it is
+    applied with ``filtfilt`` (forward-backward → zero phase, no event shift)
+    along the time axis. Higher ``Q`` = narrower notch (surgical); lower Q
+    removes a wider band around ``freq``.
+
+    Parameters
+    ----------
+    data  : (ns, n_traces) float32 — input NOT mutated.
+    dt_us : sample interval (µs).
+    freq  : notch centre frequency (Hz). A no-op (copy) if ≤0 or ≥ Nyquist.
+    q     : quality factor (centre/bandwidth).
+
+    Returns
+    -------
+    (ns, n_traces) float32 — new array.
+    """
+    ns, _nt = data.shape
+    fs = 1e6 / (dt_us or 1)
+    if freq <= 0 or freq >= fs / 2 or ns < 4:
+        return data.copy()
+    b, a = sp_signal.iirnotch(freq, max(0.1, q), fs)
+    # filtfilt needs > 3*max(len(a),len(b)) samples; guard tiny windows.
+    if ns <= 3 * max(len(a), len(b)):
+        def _notch_blk(blk, _b=b, _a=a):
+            return sp_signal.lfilter(_b, _a, blk, axis=0).astype(np.float32)
+    else:
+        def _notch_blk(blk, _b=b, _a=a):
+            return sp_signal.filtfilt(_b, _a, blk, axis=0).astype(np.float32)
+    return _parallel_apply(_notch_blk, data)
+
+
 # ── Amplitude spectrum (FFT) ────────────────────────────────────────────────────
 
 def compute_amplitude_spectrum(data: np.ndarray, dt_us: int) -> tuple:

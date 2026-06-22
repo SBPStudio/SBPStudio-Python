@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 from typing import List
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QPoint, Qt, QTimer
 from PyQt6.QtGui import QAction, QActionGroup
 from PyQt6.QtWidgets import (
     QDialog, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
@@ -71,7 +71,9 @@ class MainWindow(QMainWindow):
         from .components.cli_console import CliConsole
         self._cli = CliConsole(self)
         self._cli.hide()
+        self._cli_positioned = False       # spawn at bottom-left only the first time
         self._cli_guide = None             # lazily built Command Guide dialog
+        self._help_dialog = None           # lazily built dynamic Help panel
 
         # Observe state → refresh the sidebar lists.
         self.state.profiles_changed.connect(self._refresh_profile_list)
@@ -136,24 +138,31 @@ class MainWindow(QMainWindow):
         self._menu_help.addSeparator()
         self._menu_help.addAction(self._act_help_about)
 
-    # ── CLI console (floating top-right overlay) ─────────────────────────────
+    # ── CLI console (floating, undockable top-level window) ──────────────────
 
     def _toggle_cli(self, checked: bool) -> None:
         if checked:
-            self._position_cli()
+            if not self._cli_positioned:
+                self._position_cli()
+                self._cli_positioned = True
             self._cli.show()
             self._cli.raise_()
+            self._cli.activateWindow()
             self._cli.focus_input()
         else:
             self._cli.hide()
 
     def _position_cli(self) -> None:
-        """Pin the console to the top-right corner of the content area."""
+        """Default spawn point: bottom-left corner of the main window's layout.
+
+        Only used the FIRST time the console is shown — once the user drags it,
+        its position is its own (real top-level window, not re-pinned on resize)."""
         w, h = 420, 300
         margin = 10
-        top = self.menuBar().height() + margin
-        x = max(margin, self.width() - w - margin)
-        self._cli.setGeometry(x, top, w, h)
+        x = margin
+        y = max(self.menuBar().height() + margin, self.height() - h - margin)
+        self._cli.resize(w, h)
+        self._cli.move(self.mapToGlobal(QPoint(x, y)))
 
     def _show_cli_guide(self) -> None:
         from .components.cli_console import CliGuideDialog
@@ -162,11 +171,6 @@ class MainWindow(QMainWindow):
         self._cli_guide.show()
         self._cli_guide.raise_()
         self._cli_guide.activateWindow()
-
-    def resizeEvent(self, ev) -> None:
-        super().resizeEvent(ev)
-        if getattr(self, "_cli", None) is not None and self._cli.isVisible():
-            self._position_cli()
 
     # ════════════════════════════════════════════════════════════════════════
     # Layout
@@ -290,13 +294,9 @@ class MainWindow(QMainWindow):
         self.chain_gap.setValue(2.0)
         self.chain_gap.setFixedWidth(64)
         ctrl.addWidget(self.chain_gap)
-        ctrl.addStretch(1)
-        self._btn_add_chains = QPushButton()
-        self._btn_add_chains.clicked.connect(self._add_chains_from_dir)
-        ctrl.addWidget(self._btn_add_chains)
         self._btn_detect = QPushButton()
         self._btn_detect.clicked.connect(self._detect_chains)
-        ctrl.addWidget(self._btn_detect)
+        ctrl.addWidget(self._btn_detect, 1)
         cl.addLayout(ctrl)
 
         self.chain_list = QListWidget()
@@ -307,6 +307,20 @@ class MainWindow(QMainWindow):
         self.chain_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.chain_list.customContextMenuRequested.connect(self._chain_context_menu)
         cl.addWidget(self.chain_list, 1)
+
+        chain_row = QHBoxLayout()
+        chain_row.setContentsMargins(6, 0, 6, 0)
+        self._btn_add_chains = QPushButton()
+        self._btn_chain_remove = QPushButton()
+        self._btn_chain_clear = QPushButton()
+        self._btn_add_chains.clicked.connect(self._add_chains_from_dir)
+        self._btn_chain_remove.clicked.connect(self._remove_chain)
+        self._btn_chain_clear.clicked.connect(self.state.clear_chains)
+        chain_row.addWidget(self._btn_add_chains)
+        chain_row.addWidget(self._btn_chain_remove)
+        chain_row.addStretch(1)
+        chain_row.addWidget(self._btn_chain_clear)
+        cl.addLayout(chain_row)
 
         self._btn_chain_to_map = QPushButton()
         self._btn_chain_to_map.setObjectName("addToMap")
@@ -332,6 +346,11 @@ class MainWindow(QMainWindow):
         self.tab_reprojector = ReprojectorTab(self.state, self)
         self.tabs.addTab(self.tab_visualizer, "")
         self.tabs.addTab(self.tab_reprojector, "")
+        # File Switching (Part 1): clicking an "Add to map" reference track
+        # activates that exact profile/chain, exactly as clicking its sidebar
+        # row would — see _on_map_layer_source_clicked.
+        self.tab_visualizer.map_view.layer_source_clicked.connect(
+            self._on_map_layer_source_clicked)
         return self.tabs
 
     # ── Status bar ────────────────────────────────────────────────────────────
@@ -567,6 +586,11 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(keys):
             self.state.remove_profile(keys[row])
 
+    def _remove_chain(self) -> None:
+        row = self.chain_list.currentRow()
+        if 0 <= row < len(self.state.chains):
+            self.state.remove_chain(row)
+
     # ── Batch 'Add to map' (navigation tracks → map layers) ───────────────────
     def _selected_profiles(self) -> list:
         """SegyProfiles for the highlighted rows, skipping errored ones."""
@@ -629,12 +653,12 @@ class MainWindow(QMainWindow):
         self.tab_visualizer.export_batch(items, cfg, handler)
 
     def _add_profiles_to_map(self) -> None:
-        self._tracks_to_map(self._selected_profiles(), self.tab_visualizer)
+        self._tracks_to_map(self._selected_profiles(), self.tab_visualizer, is_chain=False)
 
     def _add_chains_to_map(self) -> None:
-        self._tracks_to_map(self._selected_chains(), self.tab_visualizer)
+        self._tracks_to_map(self._selected_chains(), self.tab_visualizer, is_chain=True)
 
-    def _tracks_to_map(self, objs: list, tab) -> None:
+    def _tracks_to_map(self, objs: list, tab, *, is_chain: bool) -> None:
         """Extract the navigation tracks of *objs* (profiles or chains) and add
         them to *tab*'s map as managed layers — in ONE background pass.
 
@@ -642,6 +666,14 @@ class MainWindow(QMainWindow):
         header stubs (track_lons/track_lats); it never loads a trace matrix and
         never touches the LRU hot set. UX-safe: the active profile and the live
         seismic section are left completely undisturbed.
+
+        Each object becomes its OWN layer (one add_track_layer call per file/
+        chain) — gaps between unrelated files are never artificially stitched
+        into one polyline; only a chain's own (deliberately continuous) track
+        is drawn as a single line, since that's what loading it as a chain
+        means. ``source_id`` (profile path, or "chain:<label>") is carried
+        through so File Switching (clicking the layer on the map) can later
+        identify exactly which sidebar row to activate.
         """
         # Snapshot lightweight geometry on the GUI thread (trivial attribute
         # reads). Reprojection to WGS84 is the only real work → do it off-thread.
@@ -652,7 +684,8 @@ class MainWindow(QMainWindow):
             if lons is None or lats is None or len(lons) == 0:
                 continue
             name = getattr(obj, "label", None) or getattr(obj, "name", "track")
-            specs.append((name, lons, lats, getattr(obj, "detected_crs", None)))
+            source_id = f"chain:{name}" if is_chain else getattr(obj, "path", None)
+            specs.append((name, lons, lats, getattr(obj, "detected_crs", None), source_id))
         if not specs:
             self.status_lbl.setText(self.tr("No navigation tracks to add."))
             return
@@ -662,11 +695,11 @@ class MainWindow(QMainWindow):
             from sbp_studio.core import to_geographic
             out = []
             n = len(specs)
-            for i, (name, lons, lats, crs) in enumerate(specs):
+            for i, (name, lons, lats, crs, source_id) in enumerate(specs):
                 cancel.check()
                 progress(i / n, "")
                 x, y = to_geographic(lons, lats, crs)   # passthrough if geographic
-                out.append((name, x, y))
+                out.append((name, x, y, source_id))
             progress(1.0, "")
             return out
 
@@ -674,11 +707,132 @@ class MainWindow(QMainWindow):
 
     def _on_tracks_extracted(self, tracks: list, tab) -> None:
         tab.reveal_map()
-        for name, x, y in tracks:
-            tab.map_view.add_track_layer(name, x, y)
+        for name, x, y, source_id in tracks:
+            tab.map_view.add_track_layer(name, x, y, source_id=source_id)
         self.tabs.setCurrentWidget(tab)
         self.status_lbl.setText(
             self.tr("Added {0} track(s) to the map.").format(len(tracks)))
+
+    def _on_map_layer_source_clicked(self, source_id: str, idx: int) -> None:
+        """File Switching: activate the exact profile/chain whose "Add to
+        map" reference track was clicked — explicitly, not by merely nudging
+        the sidebar's current row and hoping currentRowChanged cascades —
+        then center the seismic view on the clicked trace once that
+        profile/chain's data has actually finished loading.
+
+        Bug fix: a bare ``setCurrentRow()`` does NOT clear an existing
+        multi-selection in ExtendedSelection mode (confirmed empirically —
+        Qt only changes the current index, leaving every previously
+        selected row still selected). Multi-selection is how the user picks
+        several tracks for a batch "Add to map" (see prof_list/chain_list's
+        ExtendedSelection mode), so after any such batch action the sidebar
+        is left with >1 row selected. _on_profile_row_changed's very first
+        line is "if len(selectedItems()) > 1: return" — a guard meant to
+        stop a multi-selection from disturbing the active profile — which
+        silently swallowed a setCurrentRow()-only activation. That's why
+        clicking a map track only "worked" when the target profile already
+        happened to be active: nothing-to-switch-to read as "it worked".
+
+        Fix: explicitly clear the stale selection AND call the row-changed
+        handler directly (not just rely on the signal) — this reuses the
+        EXACT same activation/lazy-load routine the sidebar itself uses
+        (set_active_profile/set_active_chain + _load_profile_traces/
+        _load_chain_traces for a not-yet-loaded stub), just invoked
+        deterministically instead of through a state-dependent signal."""
+        if source_id.startswith("chain:"):
+            label = source_id[len("chain:"):]
+            for i, chain in enumerate(self.state.chains):
+                if getattr(chain, "label", None) == label:
+                    self._activate_chain_row(i)
+                    self._jump_to_trace_when_ready(source_id, idx)
+                    return
+        else:
+            keys = list(self.state.profiles.keys())
+            if source_id in keys:
+                self._activate_profile_row(keys.index(source_id))
+                self._jump_to_trace_when_ready(source_id, idx)
+
+    def _clear_pending_jump(self) -> None:
+        """Disconnect any still-armed deferred file-switch jump closure
+        (Bug #8). A stale closure can linger when a profile/chain that was
+        activated-then-superseded finishes loading WITHOUT becoming active
+        again (so its active_*_changed never fires to self-disconnect).
+        Tracking the single pending (signal, slot) and tearing it down here
+        guarantees at most one is ever armed, and that rapid switching can't
+        leave a lingering callback that recentres on a later, unrelated
+        activation."""
+        pending = getattr(self, "_pending_jump", None)
+        if pending is not None:
+            signal, slot = pending
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass        # already disconnected / receiver gone — fine
+            self._pending_jump = None
+
+    def _jump_to_trace_when_ready(self, source_id: str, idx: int) -> None:
+        """Center the seismic view on trace ``idx`` once the profile/chain
+        just activated by _on_map_layer_source_clicked actually has its
+        trace data loaded — immediately if it was already hot, or deferred
+        (via a one-shot signal connection) if a lazy load was just kicked
+        off by _activate_profile_row/_activate_chain_row.
+
+        Bug #8: a second click before the first finishes loading replaces the
+        pending jump — _clear_pending_jump() below disconnects the prior
+        closure first, so only ONE deferred jump is ever armed and no stale
+        callback survives to fire on an unrelated later activation."""
+        self._clear_pending_jump()
+        obj = self.state.active_profile if not source_id.startswith("chain:") \
+            else self.state.active_chain
+        if obj is not None and getattr(obj, "data", None) is not None:
+            self.tab_visualizer._center_on_trace(idx)
+            return
+
+        if source_id.startswith("chain:"):
+            label = source_id[len("chain:"):]
+            signal = self.state.active_chain_changed
+
+            def _on_chain_ready(loaded, _idx=idx, _label=label) -> None:
+                if loaded is not None and getattr(loaded, "data", None) is not None \
+                        and getattr(loaded, "label", None) == _label:
+                    self.tab_visualizer._center_on_trace(_idx)
+                    self._clear_pending_jump()
+
+            signal.connect(_on_chain_ready)
+            self._pending_jump = (signal, _on_chain_ready)
+        else:
+            signal = self.state.active_profile_changed
+
+            def _on_profile_ready(loaded, _idx=idx, _sid=source_id) -> None:
+                if loaded is not None and getattr(loaded, "data", None) is not None \
+                        and getattr(loaded, "path", None) == _sid:
+                    self.tab_visualizer._center_on_trace(_idx)
+                    self._clear_pending_jump()
+
+            signal.connect(_on_profile_ready)
+            self._pending_jump = (signal, _on_profile_ready)
+
+    def _activate_profile_row(self, row: int) -> None:
+        """Force-activate sidebar profile row ``row``, regardless of any
+        stale multi-selection — see _on_map_layer_source_clicked."""
+        self.prof_list.blockSignals(True)
+        self.prof_list.clearSelection()
+        self.prof_list.setCurrentRow(row)
+        if 0 <= row < self.prof_list.count():
+            self.prof_list.item(row).setSelected(True)
+        self.prof_list.blockSignals(False)
+        self._on_profile_row_changed(row)
+
+    def _activate_chain_row(self, row: int) -> None:
+        """Force-activate sidebar chain row ``row``, regardless of any
+        stale multi-selection — see _on_map_layer_source_clicked."""
+        self.chain_list.blockSignals(True)
+        self.chain_list.clearSelection()
+        self.chain_list.setCurrentRow(row)
+        if 0 <= row < self.chain_list.count():
+            self.chain_list.item(row).setSelected(True)
+        self.chain_list.blockSignals(False)
+        self._on_chain_row_changed(row)
 
     # ── Task service (used by tabs to dispatch background renders) ────────────
     def run_task(self, job, on_success, message: str = "") -> None:
@@ -763,13 +917,28 @@ class MainWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════════════════
     # Help actions
     # ════════════════════════════════════════════════════════════════════════
+    def _ensure_help_dialog(self) -> "object":
+        """Lazily build the shared dynamic documentation panel."""
+        if getattr(self, "_help_dialog", None) is None:
+            from .components.help_dialog import HelpDialog
+            self._help_dialog = HelpDialog(self)
+        return self._help_dialog
+
     def _show_module_help(self) -> None:
-        title = self.tabs.tabText(self.tabs.currentIndex()).strip()
-        QMessageBox.information(self, self.tr("How this module works"), title)
+        """Open the docs panel at the section for the CURRENT tab."""
+        dlg = self._ensure_help_dialog()
+        dlg.show_for_tab(self.tabs.currentIndex())
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _show_docs(self) -> None:
-        QMessageBox.information(self, self.tr("Documentation"),
-                                "https://github.com/SBP-Studio/SBP-Studio")
+        """Open the full dynamic documentation panel (Overview)."""
+        dlg = self._ensure_help_dialog()
+        dlg.show_section("overview")
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _show_about(self) -> None:
         QMessageBox.about(
@@ -819,10 +988,12 @@ class MainWindow(QMainWindow):
             self.tr("Add the selected chains' navigation tracks to the map"))
         self._hdr_chains.setText(self.tr("DETECTED CHAINS"))
         self._lbl_threshold.setText(self.tr("Threshold (km):"))
+        self._btn_detect.setText(self.tr("🔍 Detect"))
         self._btn_add_chains.setText(self.tr("📂 Add chains"))
         self._btn_add_chains.setToolTip(
             self.tr("Import chains from a campaign directory (one folder per chain)"))
-        self._btn_detect.setText(self.tr("🔍 Detect"))
+        self._btn_chain_remove.setText(self.tr("✖ Remove"))
+        self._btn_chain_clear.setText(self.tr("✖✖ Clear"))
         if not self.state.chains:
             self._lbl_chain_hint.setText(self.tr('Load profiles and click "Detect".'))
 

@@ -7,6 +7,7 @@ preview. The core stays the single source of DSP truth.
 """
 from .nodes import (
     AGCNode, BandpassNode, ChoiceSpec, DSPContext, DSPNode,
+    FKFilterNode, MultipleSuppressionNode, NotchNode,
     NODE_REGISTRY, ParamSpec, PredictiveDeconNode, PresetNode, SwellFilterNode,
     TVGNode, WaterMuteNode, make_node,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "DSPNode", "DSPContext", "ParamSpec", "ChoiceSpec", "NODE_REGISTRY", "make_node",
     "AGCNode", "BandpassNode", "TVGNode", "PredictiveDeconNode", "PresetNode",
     "SwellFilterNode", "WaterMuteNode",
+    "FKFilterNode", "MultipleSuppressionNode", "NotchNode",
     "tr_node", "tr_param",
     "Pipeline", "VisibleWindow", "extract_visible_window",
     "PreviewController",
