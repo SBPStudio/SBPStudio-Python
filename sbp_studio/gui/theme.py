@@ -106,6 +106,7 @@ def build_qss(palette: Dict[str, str]) -> str:
         selection-background-color: {c['sel']};
         selection-color: {c['bright']};
     }}
+    QListWidget::item {{ color: {c['text']}; }}
     QListWidget::item:selected {{ background-color: {c['sel']}; color: {c['bright']}; }}
 
     QHeaderView::section {{

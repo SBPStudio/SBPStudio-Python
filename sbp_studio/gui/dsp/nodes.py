@@ -228,18 +228,23 @@ class PresetNode(DSPNode):
 
 
 class TVGNode(DSPNode):
-    """Time-variant exponential gain — wraps ``core.apply_tvg``."""
+    """Topography-aware ("Smart") time-variant exponential gain — wraps
+    ``core.apply_tvg``. The gain ramp starts at each trace's OWN picked
+    water-bottom time (same energy-threshold pick as WaterMuteNode), not a
+    global t=0; noisy/dead traces where the pick fails fall back to the
+    legacy global ramp automatically (see apply_tvg's docstring)."""
 
     KEY     = "tvg"
     DISPLAY = "TVG (Time-Variant Gain)"
+    PRECROP = True                # seabed pick needs the full trace → run pre-crop
     SPECS   = (
         ParamSpec("alpha", "Attenuation coef. alpha", 0.0, 150.0, 15.0, 1.0, 0),
+        ParamSpec("threshold_pct", "Seabed threshold", 0.0, 100.0, 30.0, 1.0, 0, "%"),
     )
 
-    # Pointwise multiply → no halo needed.
     def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
         from sbp_studio.core import apply_tvg
-        return apply_tvg(data, self.params["alpha"], ctx.dt_us)
+        return apply_tvg(data, self.params["alpha"], ctx.dt_us, self.params["threshold_pct"])
 
 
 class AGCNode(DSPNode):
@@ -273,6 +278,58 @@ class LogCompressionNode(DSPNode):
     def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
         from sbp_studio.core import apply_log_compression
         return apply_log_compression(data, self.params["k"])
+
+
+class CLAHENode(DSPNode):
+    """CLAHE (Adaptive Local Contrast) — 2-D, tile-based "Seismic HDR" —
+    wraps ``core.apply_clahe``. Unlike LogCompressionNode's single global
+    curve, this equalises contrast independently in local tiles. Requires
+    ``opencv-python-headless`` (cv2), lazily imported by the core function.
+    """
+
+    KEY     = "clahe"
+    DISPLAY = "CLAHE (Adaptive Local Contrast)"
+    SPECS   = (
+        ParamSpec("clip_limit", "Clip Limit",    1.0, 40.0, 2.0, 0.5, 1),
+        ParamSpec("tile_grid",  "Tile Grid Size", 2.0, 64.0, 8.0, 1.0, 0),
+    )
+
+    # Tile-relative normalisation (own peak amplitude, own tile grid over
+    # whatever window is fed in) → no halo, same contract as LogCompression.
+    def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
+        from sbp_studio.core import apply_clahe
+        return apply_clahe(data, self.params["clip_limit"], int(self.params["tile_grid"]))
+
+
+class DespikeNode(DSPNode):
+    """Impulsive-noise (spike) removal — rolling-median/MAD — wraps
+    ``core.apply_despike``. Replaces samples that exceed a robust local
+    threshold with the local median; everything else passes through.
+
+    Window stays NARROW by design: true impulsive noise is 1-2 samples wide,
+    while a real reflector wavelet spans many samples with smooth flanks. A
+    window much wider than the noise (but still narrow relative to a real
+    wavelet) keeps a genuine peak from looking like an outlier within its
+    own window — too wide a window re-introduces false positives on real
+    reflectors. Default threshold (6x the local robust std) sits comfortably
+    above a clean wavelet's own peak-vs-window ratio (~4-5x) while still
+    catching genuine spikes (typically 1-2 orders of magnitude above that)."""
+
+    KEY     = "despike"
+    DISPLAY = "Despike (Impulsive Noise Removal)"
+    SPECS   = (
+        ParamSpec("window_ms", "Window Size", 0.5, 20.0, 2.0, 0.5, 1, "ms"),
+        ParamSpec("threshold", "Threshold",    2.0, 15.0, 6.0, 0.5, 1),
+    )
+
+    def time_halo_samples(self, ctx: DSPContext) -> int:
+        win_s = max(3, int(self.params["window_ms"] / (ctx.dt_us / 1000.0)))
+        return win_s // 2 + 1
+
+    def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
+        from sbp_studio.core import apply_despike
+        win_s = max(3, int(round(self.params["window_ms"] / (ctx.dt_us / 1000.0))))
+        return apply_despike(data, win_s, self.params["threshold"])
 
 
 class SpectralWhiteningNode(DSPNode):
@@ -439,6 +496,7 @@ class NotchNode(DSPNode):
 # ── Registry (the Add menu reads this; order = a sensible default DSP order) ─────
 
 NODE_REGISTRY: List[type[DSPNode]] = [
+    DespikeNode,             # impulsive-noise cleanup first, before anything else
     SwellFilterNode,
     FKFilterNode,            # 2-D dip reject (spatial, full-res viewport)
     WaterMuteNode,
@@ -451,6 +509,7 @@ NODE_REGISTRY: List[type[DSPNode]] = [
     TVGNode,
     AGCNode,
     LogCompressionNode,
+    CLAHENode,
 ]
 
 

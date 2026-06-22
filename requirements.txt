@@ -1,0 +1,34 @@
+# TopasSuite / SBP Studio — runtime dependencies.
+#
+# GUI
+PyQt6>=6.11.0
+pyqtgraph>=0.14.0
+
+# Core numerics / DSP
+numpy>=2.2.4
+scipy>=1.16.2
+
+# Seismic I/O, geospatial, rendering
+segyio>=1.9.13
+pyproj>=3.7.2
+shapely>=2.1.2
+geopandas>=1.1.1
+tifffile>=2025.10.16
+matplotlib>=3.10.1
+Pillow>=11.2.1
+
+# CLAHE (Adaptive Local Contrast / "Seismic HDR") DSP node — headless build
+# avoids opencv-python's bundled Qt platform plugins, which can conflict with
+# PyQt6 at runtime ("could not find or load the Qt platform plugin"). Do NOT
+# install plain `opencv-python` alongside this for the same reason.
+opencv-python-headless>=4.13.0
+
+# Best-effort free-RAM probe for the export RAM-budget guard (optional at
+# runtime — code falls back to a conservative estimate if missing).
+psutil>=7.2.2
+
+# ── Optional acceleration (not required; core auto-detects and falls back) ──
+# pyfftw          # FFTW-backed FFTs via scipy.fft backend (CPU speedup)
+# cupy-cudaXXx    # GPU acceleration (pick the wheel matching your CUDA version)
+# img2pdf         # lossless raster-only PDF export path (--no-axes); falls
+#                 # back to Pillow PDF if not installed

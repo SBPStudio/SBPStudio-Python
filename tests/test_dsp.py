@@ -20,9 +20,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sbp_studio.core import apply_agc, apply_log_compression
+from sbp_studio.core import apply_agc, apply_clahe, apply_despike, apply_log_compression, apply_tvg
 from sbp_studio.gui.dsp import (
-    AGCNode, DSPContext, LogCompressionNode, Pipeline, extract_visible_window,
+    AGCNode, CLAHENode, DespikeNode, DSPContext, LogCompressionNode, Pipeline,
+    TVGNode, extract_visible_window,
 )
 
 
@@ -59,6 +60,79 @@ def synthetic_trace(ns: int = 1000, dt_us: int = 250, f0: float = 800.0,
 def as_matrix(trace: np.ndarray, n_traces: int = 8) -> np.ndarray:
     """Tile a 1-D trace into an (ns, n_traces) matrix (the core array contract)."""
     return np.repeat(trace[:, None], n_traces, axis=1).astype(np.float32)
+
+
+# ── 0. MATH: Smart TVG (topography-aware) correctness ───────────────────────────
+
+class TestSmartTVG:
+    DT_US = 250
+
+    def _two_seabed_matrix(self, ns=1000):
+        """Two traces with the SAME wavelet but at DIFFERENT seabed times —
+        a global-t=0 TVG would over-boost the deep trace and under-boost the
+        shallow one; a topography-aware TVG must boost both equally AT their
+        own pick."""
+        data = np.zeros((ns, 2), dtype=np.float32)
+        wav = np.array([1.0, .7, -.5, .4, -.3, .2, -.1, .05], dtype=np.float32)
+        data[100:108, 0] = wav     # shallow seabed
+        data[500:508, 1] = wav     # deep seabed
+        return data
+
+    def test_boost_is_equal_at_each_traces_own_pick(self):
+        data = self._two_seabed_matrix()
+        out = apply_tvg(data, alpha=10.0, dt_us=self.DT_US, threshold_pct=30.0)
+        ratio_shallow = out[100, 0] / data[100, 0]
+        ratio_deep    = out[500, 1] / data[500, 1]
+        assert ratio_shallow == pytest.approx(ratio_deep, rel=1e-4)
+
+    def test_legacy_global_curve_would_have_boosted_unequally(self):
+        """Sanity check that the OLD bug is real: disabling the pick
+        (threshold_pct=0) reproduces the old global-t=0 imbalance."""
+        data = self._two_seabed_matrix()
+        legacy = apply_tvg(data, alpha=10.0, dt_us=self.DT_US, threshold_pct=0.0)
+        ratio_shallow = legacy[100, 0] / data[100, 0]
+        ratio_deep    = legacy[500, 1] / data[500, 1]
+        assert ratio_deep > 2.0 * ratio_shallow
+
+    def test_water_column_above_pick_gets_unity_gain(self):
+        """Samples before the picked seabed must NOT be boosted — there is
+        nothing useful to gain in the water column."""
+        data = self._two_seabed_matrix()
+        out = apply_tvg(data, alpha=10.0, dt_us=self.DT_US, threshold_pct=30.0)
+        np.testing.assert_array_equal(out[:90, 1], data[:90, 1])   # before pick: untouched
+
+    def test_dead_noisy_trace_falls_back_to_legacy_curve(self):
+        """A trace whose peak sits at sample 0 (dead/noise-dominated) can't be
+        meaningfully picked; it must fall back to the legacy global ramp."""
+        data = np.zeros((200, 1), dtype=np.float32)
+        data[0, 0] = 0.5
+        out = apply_tvg(data, alpha=10.0, dt_us=self.DT_US, threshold_pct=30.0)
+        legacy = apply_tvg(data, alpha=10.0, dt_us=self.DT_US, threshold_pct=0.0)
+        np.testing.assert_allclose(out, legacy, rtol=1e-5)
+
+    def test_threshold_pct_zero_matches_pre_upgrade_behaviour(self):
+        data = as_matrix(synthetic_trace())
+        out = apply_tvg(data, alpha=8.0, dt_us=self.DT_US, threshold_pct=0.0)
+        t_sec = np.arange(data.shape[0], dtype=np.float32) * (self.DT_US / 1e6)
+        gain = np.clip(np.exp(8.0 * t_sec), 0.0, 1e9)
+        np.testing.assert_array_equal(out, (data * gain[:, None]).astype(np.float32))
+
+    def test_shape_dtype_and_no_mutation(self):
+        data = as_matrix(synthetic_trace())
+        out = apply_tvg(data, alpha=8.0, dt_us=self.DT_US)
+        assert out.shape == data.shape
+        assert out.dtype == np.float32
+        assert out is not data
+
+    def test_tvg_node_matches_core_and_is_precrop(self):
+        ctx = DSPContext(dt_us=self.DT_US, ns=1000, n_traces=8)
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        node = TVGNode({"alpha": 12.0, "threshold_pct": 25.0})
+        np.testing.assert_array_equal(
+            node.apply(data, ctx),
+            apply_tvg(data, 12.0, self.DT_US, 25.0))
+        # The pick needs the FULL trace, same reasoning as WaterMuteNode.
+        assert TVGNode.PRECROP is True
 
 
 # ── 1. MATH: AGC correctness ────────────────────────────────────────────────────
@@ -153,6 +227,123 @@ class TestLogCompressionMath:
         np.testing.assert_array_equal(
             node.apply(data, ctx),
             apply_log_compression(data, 25.0))
+
+
+class TestCLAHEMath:
+    """CLAHE is LOCAL (tile-based), unlike LogCompression's single GLOBAL curve —
+    these tests specifically probe that local, spatially-adaptive behaviour."""
+
+    DT_US = 250
+
+    def _two_region_matrix(self, ns=512, n_traces=16):
+        """A strong reflector dominating the GLOBAL peak amplitude, plus a
+        separate weak-ripple region whose LOCAL contrast is tiny relative to
+        that global peak — exactly the case a single global curve cannot
+        help but a local tile-based equaliser can."""
+        data = np.zeros((ns, n_traces), dtype=np.float32)
+        data[50:60, :] = 1.0
+        rng = np.random.default_rng(0)
+        data[300:320, :] += (rng.normal(0.0, 1.0, (20, n_traces)) * 0.01).astype(np.float32)
+        return data
+
+    def test_clahe_boosts_local_contrast_in_weak_region(self):
+        data = self._two_region_matrix()
+        out = apply_clahe(data, clip_limit=4.0, tile_grid=4)
+
+        std_in  = float(np.std(data[300:320, :]))
+        std_out = float(np.std(out[300:320, :]))
+        # The weak ripple sits in its own local tile -> locally equalised,
+        # so its contrast must grow far more than a global curve could give it.
+        assert std_out > 3.0 * std_in
+
+        # Polarity (sign) of every non-zero sample must be preserved.
+        region_in, region_out = data[300:320, :], out[300:320, :]
+        mask = region_in != 0.0
+        assert np.all(np.sign(region_in[mask]) == np.sign(region_out[mask]))
+
+    def test_clahe_preserves_shape_dtype_and_no_mutation(self):
+        data = as_matrix(synthetic_trace())
+        out = apply_clahe(data, clip_limit=2.0, tile_grid=8)
+        assert out.shape == data.shape
+        assert out.dtype == np.float32
+        assert out is not data            # never mutates input
+
+    def test_clahe_zero_input_safe(self):
+        """The 1e-12 epsilon on max_amp must keep all-zero input finite (and
+        a constant image has no histogram variance to redistribute, so it
+        must stay exactly zero, not introduce equalisation noise)."""
+        data = np.zeros((256, 4), dtype=np.float32)
+        out = apply_clahe(data, clip_limit=2.0, tile_grid=8)
+        assert np.all(np.isfinite(out))
+        assert np.all(out == 0.0)
+
+    def test_clahe_matches_core_reference(self):
+        """The node must produce EXACTLY the core's apply_clahe output."""
+        ctx = DSPContext(dt_us=self.DT_US, ns=1000, n_traces=8)
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        node = CLAHENode({"clip_limit": 3.0, "tile_grid": 8.0})
+        np.testing.assert_array_equal(
+            node.apply(data, ctx),
+            apply_clahe(data, 3.0, 8))
+
+
+class TestDespikeMath:
+    """The core challenge a median/MAD despike must get right: an isolated
+    1-sample spike and a genuine (wide, smooth-flanked) reflector peak can
+    have similar AMPLITUDE — only their WIDTH tells them apart. A window too
+    wide relative to the real wavelet re-introduces false positives on the
+    wavelet's own peak (verified empirically while tuning the defaults)."""
+
+    DT_US = 250
+
+    def _reflectors_with_spike(self, ns=1000, n_traces=4, spike_idx=650, spike_amp=2.0):
+        tr = synthetic_trace(ns=ns, dt_us=self.DT_US,
+                             reflectors=((200, 1.0), (500, -0.6), (800, 0.3)),
+                             noise_std=0.0)
+        clean = as_matrix(tr, n_traces=n_traces)
+        spiked = clean.copy()
+        spiked[spike_idx, :] += spike_amp
+        return spiked, clean
+
+    def test_despike_removes_isolated_spike(self):
+        data, clean = self._reflectors_with_spike()
+        out = apply_despike(data, window_size=11, threshold=6.0)
+        assert abs(float(out[650, 0]) - float(clean[650, 0])) < 1e-3
+
+    def test_despike_does_not_touch_genuine_reflector_peaks(self):
+        """The whole point of the robust design: real wavelet peaks (wide,
+        smooth flanks) must NOT be mistaken for spikes (narrow, isolated)."""
+        data, clean = self._reflectors_with_spike()
+        out = apply_despike(data, window_size=11, threshold=6.0)
+        np.testing.assert_array_equal(out[180:220, :], data[180:220, :])
+        np.testing.assert_array_equal(out[480:520, :], data[480:520, :])
+        np.testing.assert_array_equal(out[780:820, :], data[780:820, :])
+
+    def test_despike_preserves_shape_dtype_and_no_mutation(self):
+        data = as_matrix(synthetic_trace())
+        out = apply_despike(data, window_size=11, threshold=6.0)
+        assert out.shape == data.shape
+        assert out.dtype == np.float32
+        assert out is not data
+
+    def test_despike_zero_input_safe(self):
+        """The 1e-9 floor on the robust local std must keep an all-zero,
+        zero-variance trace finite and untouched (no false-positive spikes)."""
+        data = np.zeros((256, 4), dtype=np.float32)
+        out = apply_despike(data, window_size=11, threshold=6.0)
+        assert np.all(np.isfinite(out))
+        assert np.all(out == 0.0)
+
+    def test_despike_node_matches_core_reference(self):
+        """The node must produce EXACTLY the core's apply_despike output,
+        converting its window_ms parameter to samples via ctx.dt_us."""
+        ctx = DSPContext(dt_us=self.DT_US, ns=1000, n_traces=8)
+        data, _ = self._reflectors_with_spike(n_traces=8)
+        node = DespikeNode({"window_ms": 2.0, "threshold": 6.0})
+        win_s = max(3, int(round(2.0 / (self.DT_US / 1000.0))))
+        np.testing.assert_array_equal(
+            node.apply(data, ctx),
+            apply_despike(data, win_s, 6.0))
 
 
 # ── 2. PIPELINE: prefix memoization ─────────────────────────────────────────────
@@ -443,7 +634,7 @@ class TestNodeMigration:
         keys = {c.KEY for c in NODE_REGISTRY}
         assert keys == {"swell", "fk", "water_mute", "demultiple", "decon",
                         "bandpass", "notch", "whiten", "preset", "tvg", "agc",
-                        "log_compress"}
+                        "log_compress", "clahe", "despike"}
         assert "align" not in keys
 
 

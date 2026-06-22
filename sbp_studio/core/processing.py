@@ -472,26 +472,66 @@ def apply_bandpass(data: np.ndarray, flo: float, fhi: float, dt_us: int) -> np.n
 
 # ── TVG (time-variant exponential gain) ─────────────────────────────────────────
 
-def apply_tvg(data: np.ndarray, alpha: float, dt_us: int) -> np.ndarray:
+def apply_tvg(data: np.ndarray, alpha: float, dt_us: int,
+              threshold_pct: float = 30.0) -> np.ndarray:
     """
-    Time-variant gain: multiply each sample by ``exp(alpha · t)`` (t in seconds).
+    Topography-aware ("Smart") time-variant gain: multiply each sample by
+    ``exp(alpha · t_since_seabed)``, where ``t_since_seabed`` is measured from
+    each TRACE'S OWN picked water-bottom time — not a single global ``t=0``.
+    Above the pick (in the water column) the exponent is clamped to 0, so
+    those samples get unity gain instead of being boosted for no reason.
 
-    Standalone, composable form of the TVG stage inlined in
-    ``_process_data_generic`` (gain clipped to [0, 1e9]).
+    Water-bottom picking re-uses :func:`apply_water_mute`'s energy-threshold
+    logic (first sample whose envelope reaches ``threshold_pct`` % of that
+    trace's own peak), with one addition: the envelope is briefly smoothed
+    (~0.5 ms rolling RMS) first, so a single noise spike can't fool the pick
+    the way it could from raw per-sample amplitude — a lightweight STA-style
+    step, not a full STA/LTA ratio test.
+
+    Fallback for noisy/dead traces: if the pick lands on sample 0 (peak at
+    the very first sample — a dead trace, or noise dominating the whole
+    trace), ``t_since_seabed`` reduces exactly to the legacy global ``t``,
+    so that trace transparently falls back to the old globally-ramped
+    behaviour instead of producing a nonsensical pick. ``threshold_pct=0``
+    disables picking entirely for ALL traces (exact legacy behaviour).
 
     Parameters
     ----------
-    data  : (ns, n_traces) float32 — input NOT mutated
-    alpha : exponential attenuation-compensation coefficient
-    dt_us : sample interval in microseconds
+    data          : (ns, n_traces) float32 — input NOT mutated
+    alpha         : exponential attenuation-compensation coefficient
+    dt_us         : sample interval in microseconds
+    threshold_pct : seabed-pick threshold, % of per-trace peak envelope
+                    (0 ⇒ disable picking, identical to the pre-upgrade
+                    global-``t=0`` TVG)
 
     Returns
     -------
     (ns, n_traces) float32 — new array
     """
-    t_sec = np.arange(data.shape[0], dtype=np.float32) * (dt_us / 1e6)
-    gain_curve = np.clip(np.exp(alpha * t_sec), 0.0, 1e9)
-    return (data * gain_curve[:, np.newaxis]).astype(np.float32)
+    ns = data.shape[0]
+    dt_s = dt_us / 1e6
+    t_sec = np.arange(ns, dtype=np.float32) * dt_s
+
+    if threshold_pct <= 0.0:
+        gain_curve = np.clip(np.exp(alpha * t_sec), 0.0, 1e9)
+        return (data * gain_curve[:, np.newaxis]).astype(np.float32)
+
+    from scipy.ndimage import uniform_filter1d
+
+    smooth_n = max(3, int(round(0.0005 / dt_s)))   # ~0.5 ms noise-robust envelope
+    if smooth_n % 2 == 0:
+        smooth_n += 1
+    env = uniform_filter1d(np.abs(data), size=smooth_n, axis=0)
+
+    peak   = np.max(env, axis=0)                       # (n_traces,)
+    thresh = (threshold_pct / 100.0) * peak
+    exceed = env >= thresh[None, :]
+    pick   = np.argmax(exceed, axis=0)                  # (n_traces,); 0 ⇒ fallback
+
+    pick_t_sec = pick.astype(np.float32) * dt_s         # (n_traces,)
+    t_since_seabed = np.maximum(t_sec[:, np.newaxis] - pick_t_sec[np.newaxis, :], 0.0)
+    gain = np.clip(np.exp(alpha * t_since_seabed), 0.0, 1e9)
+    return (data * gain).astype(np.float32)
 
 
 # ── Log compression (HDR dynamic-range compression) ─────────────────────────────
@@ -519,6 +559,97 @@ def apply_log_compression(data: np.ndarray, k: float) -> np.ndarray:
     norm_data = data / max_amp
     comp_data = np.sign(norm_data) * (np.log1p(k * np.abs(norm_data)) / np.log1p(k))
     return (comp_data * max_amp).astype(np.float32)
+
+
+# ── CLAHE (adaptive local-contrast HDR) ──────────────────────────────────────────
+
+def apply_clahe(data: np.ndarray, clip_limit: float, tile_grid: int) -> np.ndarray:
+    """
+    CLAHE (Contrast Limited Adaptive Histogram Equalization) — 2-D, spatially
+    adaptive local contrast enhancement ("Seismic HDR", tile-based).
+
+    Unlike :func:`apply_log_compression` (one GLOBAL gain curve over time),
+    this equalises contrast independently within local (time x trace) tiles,
+    so a weak reflector sitting next to a strong one is boosted even where a
+    single global curve cannot serve both. Phase-preserving: ``sign(data)``
+    is carried through untouched; only the rectified magnitude is histogram-
+    equalised — same normalise-by-own-peak / restore contract as
+    ``apply_log_compression``, so ``clip_limit`` behaves consistently
+    regardless of the raw SEG-Y amplitude scale.
+
+    Requires ``opencv-python-headless`` (``cv2``), imported lazily here so the
+    rest of the core stays importable without it (same discipline as the
+    lazy matplotlib import in ``coloring.py``).
+
+    Parameters
+    ----------
+    data       : (ns, n_traces) float32 — input NOT mutated
+    clip_limit : OpenCV CLAHE clip limit (contrast strength; higher = stronger,
+                 also more noise amplification)
+    tile_grid  : side length, in tiles, of the square local window (e.g. 8 means
+                 an 8x8 grid of equalization tiles across the array)
+
+    Returns
+    -------
+    (ns, n_traces) float32 — new array
+    """
+    import cv2
+
+    sign = np.sign(data)
+    mag = np.abs(data)
+    max_amp = float(np.max(mag)) + 1e-12             # prevent division by zero
+
+    norm_u16 = np.ascontiguousarray((mag / max_amp * 65535.0).astype(np.uint16))
+    tiles = max(1, int(tile_grid))
+    clahe = cv2.createCLAHE(clipLimit=max(0.01, float(clip_limit)),
+                            tileGridSize=(tiles, tiles))
+    eq_u16 = clahe.apply(norm_u16)
+
+    out = sign * (eq_u16.astype(np.float32) / 65535.0) * max_amp
+    return out.astype(np.float32)
+
+
+# ── Despike (impulsive-noise removal) ────────────────────────────────────────────
+
+def apply_despike(data: np.ndarray, window_size: int, threshold: float) -> np.ndarray:
+    """
+    Impulsive-noise (spike) removal via a robust rolling-median filter.
+
+    For each trace independently, along time: a rolling MEDIAN gives a
+    spike-free local baseline; the rolling MEDIAN ABSOLUTE DEVIATION (MAD)
+    around that baseline gives a robust local noise-scale estimate — unlike
+    a rolling std, a single huge spike can't blow up the very statistic
+    meant to detect it. Any sample whose deviation from the local median
+    exceeds ``threshold`` times the local robust standard deviation
+    (``1.4826 * MAD``, the usual MAD→std factor for Gaussian noise) is
+    replaced by the local median; everything else passes through unchanged.
+
+    Parameters
+    ----------
+    data        : (ns, n_traces) float32 — input NOT mutated
+    window_size : rolling window length in SAMPLES (forced odd internally so
+                  the window is symmetric)
+    threshold   : spike threshold, in multiples of the local robust standard
+                  deviation (lower ⇒ more aggressive despiking)
+
+    Returns
+    -------
+    (ns, n_traces) float32 — new array
+    """
+    from scipy.ndimage import median_filter
+
+    win = max(3, int(window_size))
+    if win % 2 == 0:
+        win += 1
+
+    baseline  = median_filter(data, size=(win, 1), mode="nearest")
+    deviation = np.abs(data - baseline)
+    mad       = median_filter(deviation, size=(win, 1), mode="nearest")
+    robust_std = 1.4826 * mad
+
+    spike_mask = deviation > (threshold * np.maximum(robust_std, 1e-9))
+    out = np.where(spike_mask, baseline, data)
+    return out.astype(np.float32)
 
 
 # ── Delay alignment (geometry) ──────────────────────────────────────────────────

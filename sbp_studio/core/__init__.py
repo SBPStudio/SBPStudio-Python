@@ -25,6 +25,7 @@ from .header_calc import (evaluate_header_expr, parse_assignment,
 from .processing import (
     apply_predictive_decon, apply_filter_preset, apply_agc,
     apply_bandpass, apply_tvg, apply_delay_alignment, apply_log_compression,
+    apply_clahe, apply_despike,
     apply_water_mute, apply_swell_filter, apply_spectral_whitening,
     apply_fk_filter, apply_multiple_suppression, apply_notch,
     compute_amplitude_spectrum,
@@ -67,6 +68,7 @@ __all__ = [
     # Processing
     "apply_predictive_decon", "apply_filter_preset", "apply_agc",
     "apply_bandpass", "apply_tvg", "apply_delay_alignment", "apply_log_compression",
+    "apply_clahe", "apply_despike",
     "apply_water_mute", "apply_swell_filter", "apply_spectral_whitening",
     "apply_fk_filter", "apply_multiple_suppression", "apply_notch",
     "compute_amplitude_spectrum",

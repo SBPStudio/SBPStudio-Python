@@ -6,7 +6,7 @@ GUI-side orchestration only: nodes wrap CORE math (``sbp_studio.core``) and the
 preview. The core stays the single source of DSP truth.
 """
 from .nodes import (
-    AGCNode, BandpassNode, ChoiceSpec, DSPContext, DSPNode,
+    AGCNode, BandpassNode, ChoiceSpec, CLAHENode, DespikeNode, DSPContext, DSPNode,
     FKFilterNode, LogCompressionNode, MultipleSuppressionNode, NotchNode,
     NODE_REGISTRY, ParamSpec, PredictiveDeconNode, PresetNode, SwellFilterNode,
     TVGNode, WaterMuteNode, make_node,
@@ -18,7 +18,7 @@ from .preview import PreviewController
 __all__ = [
     "DSPNode", "DSPContext", "ParamSpec", "ChoiceSpec", "NODE_REGISTRY", "make_node",
     "AGCNode", "BandpassNode", "TVGNode", "PredictiveDeconNode", "PresetNode",
-    "SwellFilterNode", "WaterMuteNode", "LogCompressionNode",
+    "SwellFilterNode", "WaterMuteNode", "LogCompressionNode", "CLAHENode", "DespikeNode",
     "FKFilterNode", "MultipleSuppressionNode", "NotchNode",
     "tr_node", "tr_param",
     "Pipeline", "VisibleWindow", "extract_visible_window",

@@ -70,62 +70,62 @@
         <translation>Filtro Swell / Oleaje (corrección de cabeceo)</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="43" />
+        <location filename="..\dsp\node_i18n.py" line="50" />
         <source>Operator length</source>
         <translation>Longitud del operador</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="44" />
+        <location filename="..\dsp\node_i18n.py" line="51" />
         <source>Prediction gap</source>
         <translation>Gap de predicción</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="45" />
+        <location filename="..\dsp\node_i18n.py" line="52" />
         <source>Pre-whitening</source>
         <translation>Pre-blanqueado</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="46" />
+        <location filename="..\dsp\node_i18n.py" line="53" />
         <source>F low</source>
         <translation>F baja</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="47" />
+        <location filename="..\dsp\node_i18n.py" line="54" />
         <source>F high</source>
         <translation>F alta</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="48" />
+        <location filename="..\dsp\node_i18n.py" line="55" />
         <source>Type</source>
         <translation>Tipo</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="49" />
+        <location filename="..\dsp\node_i18n.py" line="56" />
         <source>Attenuation coef. alpha</source>
         <translation>Coef. atenuación α</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="50" />
+        <location filename="..\dsp\node_i18n.py" line="57" />
         <source>Window</source>
         <translation>Ventana</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="51" />
+        <location filename="..\dsp\node_i18n.py" line="58" />
         <source>Threshold</source>
         <translation>Umbral</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="52" />
+        <location filename="..\dsp\node_i18n.py" line="59" />
         <source>Margin</source>
         <translation>Margen</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="53" />
+        <location filename="..\dsp\node_i18n.py" line="60" />
         <source>Trace window</source>
         <translation>Ventana de trazas</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="54" />
+        <location filename="..\dsp\node_i18n.py" line="61" />
         <source>Max shift</source>
         <translation>Desplazamiento máx.</translation>
     </message>
@@ -155,54 +155,79 @@
         <translation>Compresión HDR (Logarítmica)</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="55" />
+        <location filename="..\dsp\node_i18n.py" line="41" />
+        <source>CLAHE (Adaptive Local Contrast)</source>
+        <translation>CLAHE (Contraste Local Adaptativo)</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="42" />
+        <source>Despike (Impulsive Noise Removal)</source>
+        <translation>Eliminación de Picos (Ruido Impulsivo)</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="62" />
         <source>Smooth window</source>
         <translation>Ventana de suavizado</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="56" />
+        <location filename="..\dsp\node_i18n.py" line="63" />
         <source>Reject dip</source>
         <translation>Buzamiento a rechazar</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="57" />
+        <location filename="..\dsp\node_i18n.py" line="64" />
         <source>Fan half-width</source>
         <translation>Semiancho del abanico</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="58" />
+        <location filename="..\dsp\node_i18n.py" line="65" />
         <source>Mode</source>
         <translation>Modo</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="59" />
+        <location filename="..\dsp\node_i18n.py" line="66" />
         <source>Seabed threshold</source>
         <translation>Umbral del fondo</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="60" />
+        <location filename="..\dsp\node_i18n.py" line="67" />
         <source>Period (0=auto)</source>
         <translation>Período (0=auto)</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="61" />
+        <location filename="..\dsp\node_i18n.py" line="68" />
         <source>Max gain</source>
         <translation>Ganancia máx.</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="62" />
+        <location filename="..\dsp\node_i18n.py" line="69" />
         <source>Notch frequency</source>
         <translation>Frecuencia del notch</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="63" />
+        <location filename="..\dsp\node_i18n.py" line="70" />
         <source>Q factor</source>
         <translation>Factor Q</translation>
     </message>
     <message>
-        <location filename="..\dsp\node_i18n.py" line="69" />
+        <location filename="..\dsp\node_i18n.py" line="71" />
         <source>Strength (k)</source>
         <translation>Fuerza (k)</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="72" />
+        <source>Clip Limit</source>
+        <translation>Límite de recorte</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="73" />
+        <source>Tile Grid Size</source>
+        <translation>Tamaño de cuadrícula</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="74" />
+        <source>Window Size</source>
+        <translation>Tamaño de ventana</translation>
     </message>
 </context><context>
     <name>ExportDialog</name>

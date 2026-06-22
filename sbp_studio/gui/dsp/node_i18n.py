@@ -38,6 +38,8 @@ def tr_node(key: str, fallback: str = "") -> str:
         "demultiple": QCoreApplication.translate("DSPNodes", "Seabed Multiple Suppression"),
         "notch":      QCoreApplication.translate("DSPNodes", "Notch Filter"),
         "log_compress": QCoreApplication.translate("DSPNodes", "Log Compression (Seismic HDR)"),
+        "clahe":      QCoreApplication.translate("DSPNodes", "CLAHE (Adaptive Local Contrast)"),
+        "despike":    QCoreApplication.translate("DSPNodes", "Despike (Impulsive Noise Removal)"),
     }
     return table.get(key, fallback or key)
 
@@ -67,5 +69,8 @@ def tr_param(label: str) -> str:
         "Notch frequency":         QCoreApplication.translate("DSPNodes", "Notch frequency"),
         "Q factor":                QCoreApplication.translate("DSPNodes", "Q factor"),
         "Strength (k)":            QCoreApplication.translate("DSPNodes", "Strength (k)"),
+        "Clip Limit":              QCoreApplication.translate("DSPNodes", "Clip Limit"),
+        "Tile Grid Size":          QCoreApplication.translate("DSPNodes", "Tile Grid Size"),
+        "Window Size":             QCoreApplication.translate("DSPNodes", "Window Size"),
     }
     return table.get(label, label)

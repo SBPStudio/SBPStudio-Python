@@ -37,6 +37,7 @@ from ..dsp import (
     NODE_REGISTRY, ChoiceSpec, DSPNode, ParamSpec, make_node, tr_node, tr_param,
 )
 from ..i18n import language_manager
+from ..theme import theme
 
 _NODE_ROLE = Qt.ItemDataRole.UserRole
 
@@ -291,12 +292,20 @@ class PipelinePanel(QWidget):
         self.pipeline_changed.emit()   # active node set changed → recompute
 
     def _apply_muted_style(self, item: QListWidgetItem, enabled: bool) -> None:
-        """Grey + strike-through a muted row so it reads as 'bypassed'."""
+        """Grey + strike-through a muted row so it reads as 'bypassed'.
+
+        BUG FIX: the enabled case used to reset the foreground to ``QColor()``
+        — an INVALID QColor, which Qt paints as black. That per-item
+        Qt::ForegroundRole override always wins over the stylesheet's
+        ``QListWidget { color: ... }`` rule, so every enabled row rendered as
+        unreadable black-on-dark-gray regardless of theme. Must use the
+        theme's actual text colour instead (live via ``theme.color``, so a
+        runtime theme switch still applies correctly)."""
         font = item.font()
         font.setStrikeOut(not enabled)
         item.setFont(font)
         item.setForeground(QColor(Qt.GlobalColor.gray) if not enabled
-                           else QColor())
+                           else QColor(theme.color("text")))
 
     # ── Structural actions ──────────────────────────────────────────────────
 
