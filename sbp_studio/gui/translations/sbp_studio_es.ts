@@ -1552,6 +1552,21 @@ Perímetro: {2}</translation>
     </message>
     <message>
         <location filename="..\components\processing_controls.py" line="692" />
+        <source>Nearest</source>
+        <translation>Cercano</translation>
+    </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="692" />
+        <source>Bilinear</source>
+        <translation>Bilineal</translation>
+    </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="692" />
+        <source>Bicubic</source>
+        <translation>Bicúbico</translation>
+    </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="692" />
         <source>EXPORT</source>
         <translation>EXPORTACIÓN</translation>
     </message>

@@ -350,6 +350,19 @@ class SeismicView(QWidget):
         avoid a clipping mismatch with what's on screen."""
         return self._vmin, self._vmax
 
+    def set_image_interpolation(self, mode: str) -> None:
+        """Toggle pixel-scaling smoothing for the live raster (and the HQ overlay)
+        to approximate the Render/Export interpolation choice. PyQtGraph's
+        ImageItem scales via QPainter.drawImage, which only offers an on/off
+        smoothing hint (no distinct bicubic mode) — so 'bilinear' AND 'bicubic'
+        both map to smooth=True here; the EXACT mode ('nearest'/'bilinear'/
+        'bicubic') is still passed verbatim to Matplotlib for HQ/Export, which
+        does support all three. This is a paint-time hint, not a data change,
+        so it's cheap to flip on every toggle."""
+        from PyQt6.QtGui import QPainter
+        smooth = mode in ("bilinear", "bicubic")
+        self.glw.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, smooth)
+
     # ── Ephemeral HQ render overlay ──────────────────────────────────────────
 
     def show_hq_overlay(self, rgba: np.ndarray,

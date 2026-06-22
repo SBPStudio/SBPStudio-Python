@@ -575,17 +575,28 @@ def _add_time_axis(ax,
         sp.set_edgecolor(C["accent"])
 
 
-def _resize_rgba(rgba: np.ndarray, target_px: tuple) -> np.ndarray:
-    """Resize RGBA uint8 array to (w, h) target using LANCZOS; return numpy."""
+def _resize_rgba(rgba: np.ndarray, target_px: tuple,
+                  interp: Optional[str] = None) -> np.ndarray:
+    """Resize RGBA uint8 array to (w, h) target.
+
+    ``interp`` is the user's explicit HQ/Export pixel-interpolation choice:
+    ``"nearest"`` forces hard-edged NEAREST scaling, ``"bicubic"`` forces
+    PIL's BICUBIC. Any other value (the default, ``None``, or ``"bilinear"``)
+    keeps the historical smooth behaviour — BILINEAR for downsampling (faster,
+    visually equivalent at these ratios) and LANCZOS for upsampling —
+    unaffected callers that don't pass ``interp`` see no change."""
     try:
         from PIL import Image as _PIL
         img = _PIL.fromarray(rgba)
         if img.size != target_px:
-            # For downsampling use BILINEAR (faster, visually equivalent at
-            # the downscale ratios used here). For upsampling keep LANCZOS.
-            tw, th = target_px
-            ih, iw = rgba.shape[:2]
-            filt = _PIL.BILINEAR if (iw >= tw or ih >= th) else _PIL.LANCZOS
+            if interp == "nearest":
+                filt = _PIL.NEAREST
+            elif interp == "bicubic":
+                filt = _PIL.BICUBIC
+            else:
+                tw, th = target_px
+                ih, iw = rgba.shape[:2]
+                filt = _PIL.BILINEAR if (iw >= tw or ih >= th) else _PIL.LANCZOS
             img = img.resize(target_px, filt)
         return np.array(img)
     except ImportError:
@@ -644,7 +655,8 @@ def _downsample_maxabs(d: np.ndarray, tgt_h: int, tgt_w: int) -> np.ndarray:
 def _colorize_for_target(d: np.ndarray, cmap_name: str,
                           vmin: float, vmax: float,
                           target_px: tuple,
-                          max_abs_pool: bool = False) -> np.ndarray:
+                          max_abs_pool: bool = False,
+                          interp: Optional[str] = None) -> np.ndarray:
     """
     Colorize a 2-D float32 seismic array to a target pixel size using
     the faster of two paths:
@@ -652,11 +664,15 @@ def _colorize_for_target(d: np.ndarray, cmap_name: str,
     Path A — downsample float32 FIRST, then colorize:
         Used when either dimension is downsampled. With ``max_abs_pool`` the
         shrink uses MAX-|amplitude| pooling (reflector-safe — thin high-amplitude
-        events survive); otherwise ``scipy.ndimage.zoom(order=1)`` (bilinear).
+        events survive); otherwise ``scipy.ndimage.zoom`` (order=0 nearest / 3
+        bicubic per ``interp``, else order=1 bilinear — the default, unchanged
+        for callers that don't pass ``interp``).
         Downsampling float32 first is much cheaper than PIL on the 4× RGBA array.
 
     Path B — colorize FIRST, then PIL resize (original path):
-        Used for upsampling or near 1:1 scales.
+        Used for upsampling or near 1:1 scales. ``interp`` is forwarded to
+        :func:`_resize_rgba` (``"nearest"`` forces hard edges; default keeps the
+        historical BILINEAR/LANCZOS smooth behaviour).
     """
     src_h, src_w = d.shape
     tgt_w, tgt_h = target_px
@@ -672,19 +688,20 @@ def _colorize_for_target(d: np.ndarray, cmap_name: str,
             pw = tgt_w if vw > 1.0 else src_w
             d_s = _downsample_maxabs(d, ph, pw).astype(np.float32)
             rgba = colormapped_rgba(d_s, cmap_name, vmin, vmax)
-            return _resize_rgba(rgba, target_px)
+            return _resize_rgba(rgba, target_px, interp=interp)
         try:
             from scipy.ndimage import zoom as _zoom
             sh = tgt_h / src_h
             sw = tgt_w / src_w
-            d_s = _zoom(d, (sh, sw), order=1, prefilter=False).astype(np.float32)
+            order = 0 if interp == "nearest" else (3 if interp == "bicubic" else 1)
+            d_s = _zoom(d, (sh, sw), order=order, prefilter=False).astype(np.float32)
             return colormapped_rgba(d_s, cmap_name, vmin, vmax)
         except Exception:
             pass  # fall through to Path B
 
     # Path B
     rgba = colormapped_rgba(d, cmap_name, vmin, vmax)
-    return _resize_rgba(rgba, target_px)
+    return _resize_rgba(rgba, target_px, interp=interp)
 
 
 # ── Wiggle / variable-area overlay ──────────────────────────────────────────────
@@ -854,7 +871,8 @@ def render_profile_figure(
                                        max_abs_pool=max_abs_pool)
         # rasterized=True: the base stays a single embedded raster in vector
         # output (PDF/SVG); the wiggle/VA overlay above remains true vector paths.
-        ax.imshow(resized, aspect="auto", interpolation="none",
+        ax.imshow(resized, aspect="auto",
+                  interpolation=params.get("interp", "nearest"),
                   extent=[x_lo, x_hi, t1, t0], rasterized=True)
     if style == "wiggle":
         _draw_wiggle_overlay(ax, d, x_lo, x_hi, t0, t1, vmax=vmax,
@@ -1027,7 +1045,8 @@ def render_chain_figure(
     x_lo, x_hi = _x_axis_extent(x_axis, ch.dist_km[0], ch.dist_km[-1], n_traces_native)
     if draw_raster and resized is not None:
         # rasterized base raster; the wiggle/VA overlay stays vector in PDF/SVG.
-        ax.imshow(resized, aspect="auto", interpolation="none",
+        ax.imshow(resized, aspect="auto",
+                  interpolation=params.get("interp", "nearest"),
                   extent=[x_lo, x_hi, t1, t0], rasterized=True)
     if style == "wiggle":
         _draw_wiggle_overlay(ax, d, x_lo, x_hi, t0, t1, vmax=vmax_cb,
