@@ -51,7 +51,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QFileDialog, QFormLayout, QGraphicsItem, QGraphicsLineItem,
     QGraphicsPathItem, QGraphicsRectItem, QHBoxLayout, QInputDialog, QLabel,
     QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QSlider,
-    QVBoxLayout, QWidget,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
 from ..i18n import language_manager
@@ -735,7 +735,11 @@ class MapView(QWidget):
         super().__init__(parent)
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(4)
+        root.setSpacing(0)
+        # Resizable divider between the map canvas and the layers sidebar so the
+        # user can widen the layer list (long names) or reclaim canvas space.
+        map_split = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(map_split)
 
         self.plot = pg.PlotWidget()
         self.plot.setMenuEnabled(False)
@@ -762,9 +766,15 @@ class MapView(QWidget):
         self.lbl_cursor_coords = QLabel("")
         self.lbl_cursor_coords.setStyleSheet(f"font-family: {MONO};")
         plot_lay.addWidget(self.lbl_cursor_coords)
-        root.addWidget(plot_col, 1)
+        map_split.addWidget(plot_col)
         self._layer_count = 0                  # for cycling layer colours
-        root.addWidget(self._build_layer_panel())
+        map_split.addWidget(self._build_layer_panel())
+        # Canvas absorbs resize; the sidebar keeps its width and never collapses
+        # fully (always grab-able to re-expand).
+        map_split.setStretchFactor(0, 1)
+        map_split.setStretchFactor(1, 0)
+        map_split.setCollapsible(1, False)
+        map_split.setSizes([1000, 190])
 
         # Track data (per trace).
         self._x: Optional[np.ndarray] = None
@@ -1150,7 +1160,10 @@ class MapView(QWidget):
         """Side panel: a drag-reorderable, checkable list of custom layers plus
         Add/Remove buttons. List order = draw order (top row = top of the band)."""
         panel = QWidget()
-        panel.setFixedWidth(190)
+        # Min/max (not fixed) so the QSplitter can resize it; sensible bounds keep
+        # it from shrinking unusably small or hogging the whole tab.
+        panel.setMinimumWidth(150)
+        panel.setMaximumWidth(420)
         v = QVBoxLayout(panel)
         v.setContentsMargins(4, 4, 4, 4)
         v.setSpacing(4)

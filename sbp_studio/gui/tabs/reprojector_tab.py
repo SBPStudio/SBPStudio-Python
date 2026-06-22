@@ -23,7 +23,7 @@ from PyQt6.QtGui import QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
     QLabel, QLineEdit, QProgressBar, QPushButton, QRadioButton, QScrollArea,
-    QTextEdit, QVBoxLayout, QWidget,
+    QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from ...core import CRS_CATALOG, CRS_PRESETS, resolve_crs, validate_crs
@@ -94,9 +94,13 @@ class ReprojectorTab(QWidget):
         self.rb_active = QRadioButton()
         self.rb_chains = QRadioButton()
         self.rb_all.setChecked(True)
+        # Don't let the pill toggles stretch to the full tab width — size each to
+        # its content and left-align; a uniform width (matched to the longest
+        # label) is applied in retranslate_ui once the texts are set.
         for i, rb in enumerate((self.rb_all, self.rb_active, self.rb_chains)):
             self.sel_group.addButton(rb, i)
-            v.addWidget(rb)
+            rb.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            v.addWidget(rb, 0, Qt.AlignmentFlag.AlignLeft)
         self.sel_group.idToggled.connect(
             lambda _id, on: self._update_sel_label() if on else None)
         self.lbl_sel = QLabel(); self.lbl_sel.setObjectName("sub")
@@ -455,6 +459,15 @@ class ReprojectorTab(QWidget):
         self.rb_all.setText(self.tr("All loaded profiles (individually)"))
         self.rb_active.setText(self.tr("Only the active profile"))
         self.rb_chains.setText(self.tr("Detected chains (join + reproject)"))
+        # Uniform pill width = widest of the three (so they read as a clean,
+        # aligned stack rather than three different-length buttons). Recomputed
+        # on every language switch since label lengths change.
+        scope_rbs = (self.rb_all, self.rb_active, self.rb_chains)
+        for rb in scope_rbs:
+            rb.setMinimumWidth(0)
+        wide = max(rb.sizeHint().width() for rb in scope_rbs)
+        for rb in scope_rbs:
+            rb.setMinimumWidth(wide)
         self.src_title.setText(self.tr("Source CRS"))
         self.dst_title.setText(self.tr("Target CRS"))
         for lbl in (self.src_lbl_preset, self.dst_lbl_preset):

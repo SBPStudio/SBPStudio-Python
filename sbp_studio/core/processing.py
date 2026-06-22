@@ -494,6 +494,33 @@ def apply_tvg(data: np.ndarray, alpha: float, dt_us: int) -> np.ndarray:
     return (data * gain_curve[:, np.newaxis]).astype(np.float32)
 
 
+# ── Log compression (HDR dynamic-range compression) ─────────────────────────────
+
+def apply_log_compression(data: np.ndarray, k: float) -> np.ndarray:
+    """
+    Phase-preserving logarithmic dynamic-range compression ("Seismic HDR").
+
+    Normalises to [-1, 1] by the array's own peak amplitude so ``k`` behaves
+    consistently regardless of the raw SEG-Y amplitude scale, applies
+    ``sign(x) * log1p(k*|x|) / log1p(k)`` (sign-preserving, so polarity/phase
+    is never altered), then rescales back to the original peak amplitude.
+
+    Parameters
+    ----------
+    data : (ns, n_traces) float32 — input NOT mutated
+    k    : compression strength (k=0 ⇒ no compression; higher k ⇒ stronger
+           boost of weak amplitudes relative to strong ones)
+
+    Returns
+    -------
+    (ns, n_traces) float32 — new array
+    """
+    max_amp = float(np.max(np.abs(data))) + 1e-12   # prevent division by zero
+    norm_data = data / max_amp
+    comp_data = np.sign(norm_data) * (np.log1p(k * np.abs(norm_data)) / np.log1p(k))
+    return (comp_data * max_amp).astype(np.float32)
+
+
 # ── Delay alignment (geometry) ──────────────────────────────────────────────────
 
 def apply_delay_alignment(data: np.ndarray, delays: np.ndarray,

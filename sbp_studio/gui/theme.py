@@ -24,18 +24,22 @@ MONO = "Courier New"
 # Every palette defines the same keys; the QSS template below interpolates them.
 THEMES: Dict[str, Dict[str, str]] = {
     "dark": {
-        "bg":        "#12141a",
-        "panel":     "#1a1d26",
-        "sidebar":   "#141720",
-        "accent":    "#1e2535",
-        "highlight": "#2a3a5c",
-        "bright":    "#4d9de0",
-        "warn":      "#e94560",
-        "ok":        "#3ddc97",
-        "text":      "#dce3ee",
-        "sub":       "#6a7a96",
-        "entry":     "#0e1118",
-        "sel":       "#253555",
+        "bg":        "#1e1e1e",
+        "panel":     "#2d2d2d",
+        "sidebar":   "#252526",
+        "accent":    "#3c3c3c",
+        "highlight": "#094771",
+        "bright":    "#4fc1ff",
+        "warn":      "#f48771",
+        "ok":        "#89d185",
+        "text":      "#f0f0f0",
+        "sub":       "#a0a6b0",
+        "entry":     "#1a1a1a",
+        "sel":       "#094771",
+        # Header gradient stops (top → bottom) + its accent under-line.
+        "topbar_a":  "#343438",
+        "topbar_b":  "#242427",
+        "topbar_ln": "#4fc1ff",
     },
     "light": {
         "bg":        "#f4f6fa",
@@ -50,6 +54,9 @@ THEMES: Dict[str, Dict[str, str]] = {
         "sub":       "#5b6677",
         "entry":     "#ffffff",
         "sel":       "#cfe2f7",
+        "topbar_a":  "#ffffff",
+        "topbar_b":  "#e7ecf4",
+        "topbar_ln": "#2f6fb0",
     },
 }
 
@@ -70,16 +77,26 @@ def build_qss(palette: Dict[str, str]) -> str:
     }}
     QFrame#panel    {{ background-color: {c['panel']};   }}
     QFrame#sidebar  {{ background-color: {c['sidebar']}; }}
-    QFrame#topbar   {{ background-color: {c['accent']};  }}
+    /* Premium IDE-style header: a soft top-to-bottom gradient lifts it off the
+       flat workspace, and a 2px accent under-line gives a crisp, modern edge
+       (QSS has no box-shadow, so the bright rule doubles as the 'drop shadow'). */
+    QFrame#topbar   {{
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {c['topbar_a']}, stop:1 {c['topbar_b']});
+        border-bottom: 2px solid {c['topbar_ln']};
+    }}
+    /* Children of the header inherit no background so the gradient shows through. */
+    QFrame#topbar > QLabel {{ background: transparent; }}
     QFrame#hline    {{ background-color: {c['accent']}; max-height: 1px; min-height: 1px; }}
 
-    QLabel#title    {{ color: {c['bright']}; font-size: 18px; font-weight: bold; }}
-    QLabel#subtitle {{ color: {c['sub']};    font-size: 10px; }}
-    QLabel#section  {{ color: {c['bright']}; font-size: 10px; font-weight: bold; }}
-    QLabel#hdr      {{ color: {c['bright']}; font-size: 10px; font-weight: bold;
+    QLabel#title    {{ color: {c['text']}; font-size: 20px; font-weight: bold;
+                       padding: 0 2px; }}
+    QLabel#subtitle {{ color: {c['sub']};    font-size: 11px; padding-bottom: 1px; }}
+    QLabel#section  {{ color: {c['bright']}; font-size: 11px; font-weight: bold; }}
+    QLabel#hdr      {{ color: {c['bright']}; font-size: 11px; font-weight: bold;
                        background-color: {c['accent']}; padding: 6px 10px; }}
-    QLabel#sub      {{ color: {c['sub']};    font-size: 10px; }}
-    QLabel#info     {{ color: {c['sub']};    font-size: 10px; }}
+    QLabel#sub      {{ color: {c['sub']};    font-size: 11px; }}
+    QLabel#info     {{ color: {c['sub']};    font-size: 11px; }}
     QLabel#placeholder {{ color: {c['sub']}; font-size: 13px; }}
 
     QListWidget, QTextEdit, QLineEdit, QTableWidget {{
@@ -156,12 +173,12 @@ def build_qss(palette: Dict[str, str]) -> str:
         border-radius: 4px;
         background: {c['entry']};
     }}
-    QRadioButton:hover {{ border-color: #00e5ff; }}
+    QRadioButton:hover {{ border-color: {c['bright']}; }}
     QRadioButton:checked {{
-        background-color: #00e5ff;
-        color: #000000;
+        background-color: {c['bright']};
+        color: {c['bg']};
         font-weight: bold;
-        border: 1px solid #00e5ff;
+        border: 1px solid {c['bright']};
     }}
 
     QTabWidget::pane {{ border: 1px solid {c['accent']}; background: {c['bg']}; }}

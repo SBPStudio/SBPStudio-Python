@@ -231,6 +231,16 @@ class SeismicView(QWidget):
         # tab's plot is created. clear() leaves that method intact while
         # removing every default action. ──────────────────────────────────
         vb = self.plot.getViewBox()
+        # Keep pyqtgraph's stock corner "A" auto-range button. A custom
+        # instant "Reset View" was tried here (both hand-rolled aspect-lock
+        # math and the plain pg.ViewBox.autoRange() one-liner) but both fight
+        # this view's OWN zoom-adaptive re-slicing: _apply_zoom_update shrinks
+        # self.img's rect to whatever column range is currently visible (see
+        # its docstring), so anything that fits to CURRENT item geometry
+        # (autoRange included) ends up re-fitting to the last zoomed sub-
+        # window instead of the true full dataset — confirmed reproducible,
+        # not a one-off. Reverted; the stock button is the supported reset.
+        self.plot.showButtons()
         self._measure_action = QAction(self)
         self._measure_action.triggered.connect(lambda: self._set_ruler_active(True))
         self._hide_ruler_action = QAction(self)

@@ -22,8 +22,9 @@ from typing import Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout,
-    QLabel, QPushButton, QRadioButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QAbstractSpinBox, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFrame,
+    QHBoxLayout, QLabel, QPushButton, QRadioButton, QSlider, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 from ..i18n import language_manager
@@ -297,26 +298,62 @@ class ProcessingControls(QWidget):
         self.sp_ratio.valueChanged.connect(self._on_deform_spin)
 
         # Mode 2 — Lock vertical exaggeration (constant, geologically comparable).
+        # The radio is alone on its row; an indented slider + numeric box below it
+        # set the VE value (mirrors the aspect-ratio slider/spin pattern above).
         self.rb_ve = QRadioButton()
         self.scale_group.addButton(self.rb_ve, 1)
+        _tight_row((self.rb_ve, 1))
+        self._VE_SCALE = 1.0             # slider int ↔ VE float (1:1, integer VE)
+        self.sld_ve = QSlider(Qt.Orientation.Horizontal)
+        self.sld_ve.setRange(1, 2000)
+        self.sld_ve.setSingleStep(1)
+        self.sld_ve.setPageStep(25)
+        self.sld_ve.setMaximumWidth(120)
         self.sp_ve = QDoubleSpinBox()
         self.sp_ve.setRange(1.0, 2000.0)
+        self.sp_ve.setDecimals(0)
         self.sp_ve.setSingleStep(1.0)
         self.sp_ve.setValue(67.0)
         self.sp_ve.setMaximumWidth(72)
-        _tight_row((self.rb_ve, 1), (self.sp_ve, 0))
+        self.sld_ve.setValue(67)
+        _ve_row = QHBoxLayout()
+        _ve_row.setContentsMargins(16, 0, 0, 0)   # indent under the VE label
+        _ve_row.setSpacing(4)
+        _ve_row.addWidget(self.sld_ve, 0)
+        _ve_row.addStretch(1)
+        _ve_row.addWidget(self.sp_ve, 0)
+        v.addLayout(_ve_row)
+        self._syncing_ve = False
+        self.sld_ve.valueChanged.connect(self._on_ve_slider)
+        self.sp_ve.valueChanged.connect(self._on_ve_spin)
 
         # Mode 3 — Hybrid: lock VE (the value above) but cap the aspect so an
         # extremely long line never deforms into an 'infinite noodle'.
         self.rb_hybrid = QRadioButton()
         self.scale_group.addButton(self.rb_hybrid, 2)
+        _tight_row((self.rb_hybrid, 1))
+        self._MAXASP_SCALE = 10.0        # slider int ↔ max-aspect float (×0.1)
+        self.sld_maxasp = QSlider(Qt.Orientation.Horizontal)
+        self.sld_maxasp.setRange(10, 1000)        # 1.0 .. 100.0
+        self.sld_maxasp.setSingleStep(5)          # 0.5
+        self.sld_maxasp.setPageStep(25)
+        self.sld_maxasp.setMaximumWidth(120)
         self.sp_maxasp = QDoubleSpinBox()
         self.sp_maxasp.setRange(1.0, 100.0)
         self.sp_maxasp.setSingleStep(0.5)
         self.sp_maxasp.setValue(5.0)
         self.sp_maxasp.setMaximumWidth(72)
-        _tight_row((self.rb_hybrid, 1), (self.sp_maxasp, 0))
-        self.cap_scale_hint = self._caption()
+        self.sld_maxasp.setValue(50)
+        _maxasp_row = QHBoxLayout()
+        _maxasp_row.setContentsMargins(16, 0, 0, 0)   # indent under the Hybrid label
+        _maxasp_row.setSpacing(4)
+        _maxasp_row.addWidget(self.sld_maxasp, 0)
+        _maxasp_row.addStretch(1)
+        _maxasp_row.addWidget(self.sp_maxasp, 0)
+        v.addLayout(_maxasp_row)
+        self._syncing_maxasp = False
+        self.sld_maxasp.valueChanged.connect(self._on_maxasp_slider)
+        self.sp_maxasp.valueChanged.connect(self._on_maxasp_spin)
 
         # ── Horizontal scale: traces per cm (label, then slider + numeric) ────
         # Replaces the old px/trace control. STRICTLY horizontal: sets the export
@@ -428,6 +465,13 @@ class ProcessingControls(QWidget):
         v.addWidget(self.btn_export_fix)
 
         v.addStretch(1)
+
+        # Clean numeric inputs: strip the clunky up/down arrows from every spin
+        # box in the panel. Values are set via the paired sliders, by typing, or
+        # the scroll wheel — and dropping the arrow buttons stops the spin text
+        # from being clipped in the narrow side panel.
+        for _sb in self.findChildren((QSpinBox, QDoubleSpinBox)):
+            _sb.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
 
         # Presentation changes drive a live recolour of the preview (debounced
         # downstream by the controller's own work being cheap).
@@ -632,6 +676,38 @@ class ProcessingControls(QWidget):
         self.sld_tpc.setValue(int(round(val)))
         self._syncing_tpc = False
 
+    # ── VE slider ↔ spin sync ────────────────────────────────────────────────
+
+    def _on_ve_slider(self, val: int) -> None:
+        if self._syncing_ve:
+            return
+        self._syncing_ve = True
+        self.sp_ve.setValue(val / self._VE_SCALE)
+        self._syncing_ve = False
+
+    def _on_ve_spin(self, val: float) -> None:
+        if self._syncing_ve:
+            return
+        self._syncing_ve = True
+        self.sld_ve.setValue(int(round(val * self._VE_SCALE)))
+        self._syncing_ve = False
+
+    # ── Max-aspect slider ↔ spin sync ────────────────────────────────────────
+
+    def _on_maxasp_slider(self, val: int) -> None:
+        if self._syncing_maxasp:
+            return
+        self._syncing_maxasp = True
+        self.sp_maxasp.setValue(val / self._MAXASP_SCALE)
+        self._syncing_maxasp = False
+
+    def _on_maxasp_spin(self, val: float) -> None:
+        if self._syncing_maxasp:
+            return
+        self._syncing_maxasp = True
+        self.sld_maxasp.setValue(int(round(val * self._MAXASP_SCALE)))
+        self._syncing_maxasp = False
+
     def _on_overlay_toggled(self, *_args) -> None:
         """The Raster checkbox is interactive only while the wiggle overlay is
         active — Show Wiggles or Show Variable Area checked (Density always
@@ -742,14 +818,17 @@ class ProcessingControls(QWidget):
         self.rb_hybrid.setToolTip(self.tr(
             "Locks the VE above, but caps the width:height ratio so extreme lines "
             "don't deform into an 'infinite noodle'."))
-        self.cap_scale_hint.setText(self.tr(
+        # Descriptive hint moved off-panel into the max-aspect spin's tooltip to
+        # keep the side panel compact (no inline prose label).
+        self.sp_maxasp.setToolTip(self.tr(
             "Hybrid uses the VE value, limited by the max-aspect on its right."))
         self.sld_deform.setToolTip(self.tr(
             "Horizontal deformation (stretch / vertical exaggeration): drag for a "
             "fine, live adjustment of the aspect ratio. Synced with the box on its "
             "right."))
         self.sp_ratio.setToolTip(self.sld_deform.toolTip())
-        self.btn_scale_reset.setText(self.tr("↺  Reset aspect settings"))
+        self.btn_scale_reset.setText(self.tr("↺ Reset"))
+        self.btn_scale_reset.setToolTip(self.tr("Reset aspect settings"))
         self.cap_tpc.setText(self.tr("Traces / cm (horizontal scale)"))
         self.sp_tpc.setToolTip(self.tr(
             "Horizontal trace spacing: higher = more traces per cm (compressed), "
@@ -758,7 +837,7 @@ class ProcessingControls(QWidget):
         self.sld_tpc.setToolTip(self.sp_tpc.toolTip())
         self.btn_render.setText(self.tr("⟳  Render Full"))
         self.btn_render.setToolTip(self.tr("Re-render the whole seismic line."))
-        self.btn_render_viewport.setText(self.tr("🔍  Render Viewport HQ"))
+        self.btn_render_viewport.setText(self.tr("🔍 Viewport HQ"))
         self.btn_render_viewport.setToolTip(self.tr(
             "Render the visible (zoomed-in) area at high quality and overlay it on "
             "the live view. Pan or zoom to dismiss it."))
@@ -767,5 +846,6 @@ class ProcessingControls(QWidget):
         self.rb_interp_bicubic.setText(self.tr("Bicubic"))
         self.sec_export.setText(self.tr("EXPORT"))
         self.btn_export_img.setText(self.tr("💾  Export image"))
-        self.btn_export_fix.setText(self.tr("🗺  Export FIX → SHP / GeoJSON / CSV"))
+        self.btn_export_fix.setText(self.tr("🗺 Export FIX"))
+        self.btn_export_fix.setToolTip(self.tr("Export FIX → SHP / GeoJSON / CSV"))
         self._update_preset_desc()

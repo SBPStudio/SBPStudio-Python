@@ -22,9 +22,9 @@ from typing import List
 from PyQt6.QtCore import QPoint, Qt, QTimer
 from PyQt6.QtGui import QAction, QActionGroup
 from PyQt6.QtWidgets import (
-    QDialog, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QListWidget, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
-    QSplitter, QStatusBar, QTabWidget, QVBoxLayout, QWidget,
+    QAbstractSpinBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout,
+    QLabel, QListWidget, QMainWindow, QMenu, QMessageBox, QProgressBar,
+    QPushButton, QSlider, QSplitter, QStatusBar, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .i18n import LANGUAGE_NAMES, language_manager
@@ -189,7 +189,7 @@ class MainWindow(QMainWindow):
         body.addWidget(self._build_tabs())
         body.setStretchFactor(0, 0)
         body.setStretchFactor(1, 1)
-        body.setSizes([280, 1200])
+        body.setSizes([210, 1200])
         root.addWidget(body, 1)
 
         self._build_statusbar()
@@ -198,17 +198,20 @@ class MainWindow(QMainWindow):
     def _build_topbar(self) -> QWidget:
         bar = QFrame()
         bar.setObjectName("topbar")
-        bar.setFixedHeight(48)
+        bar.setFixedHeight(54)
         lay = QHBoxLayout(bar)
-        lay.setContentsMargins(16, 4, 12, 4)
+        lay.setContentsMargins(20, 6, 16, 6)
 
         self._lbl_brand = QLabel("◈  SBP Studio")
         self._lbl_brand.setObjectName("title")
         self._lbl_brand_sub = QLabel()
         self._lbl_brand_sub.setObjectName("subtitle")
-        lay.addWidget(self._lbl_brand)
-        lay.addSpacing(8)
-        lay.addWidget(self._lbl_brand_sub)
+        # Vertically centre both so the wordmark and its tagline share a clean
+        # baseline band; the tagline sits just right of the title as a subtle
+        # secondary label.
+        lay.addWidget(self._lbl_brand, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addSpacing(12)
+        lay.addWidget(self._lbl_brand_sub, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addStretch(1)
         return bar
 
@@ -216,7 +219,7 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("sidebar")
-        panel.setMinimumWidth(240)
+        panel.setMinimumWidth(190)
         outer = QVBoxLayout(panel)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -283,21 +286,41 @@ class MainWindow(QMainWindow):
         self._hdr_chains.setObjectName("hdr")
         cl.addWidget(self._hdr_chains)
 
+        # Threshold = label + slider + arrow-less numeric box (synced both ways);
+        # the slider carries the fine adjustment so the box only needs to show
+        # the value (no clunky up/down arrows clipping the digits).
         ctrl = QHBoxLayout()
         ctrl.setContentsMargins(6, 0, 6, 0)
+        ctrl.setSpacing(4)
         self._lbl_threshold = QLabel()
         self._lbl_threshold.setObjectName("sub")
         ctrl.addWidget(self._lbl_threshold)
+        self._THR_SCALE = 10.0            # slider int ↔ km float (×0.1)
+        self.sld_threshold = QSlider(Qt.Orientation.Horizontal)
+        self.sld_threshold.setRange(1, 500)      # 0.1 .. 50.0 km
+        self.sld_threshold.setSingleStep(5)      # 0.5 km
+        self.sld_threshold.setPageStep(25)
+        self.sld_threshold.setValue(20)          # 2.0 km
+        ctrl.addWidget(self.sld_threshold, 1)
         self.chain_gap = QDoubleSpinBox()
         self.chain_gap.setRange(0.1, 50.0)
         self.chain_gap.setSingleStep(0.5)
+        self.chain_gap.setDecimals(1)
         self.chain_gap.setValue(2.0)
-        self.chain_gap.setFixedWidth(64)
+        self.chain_gap.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.chain_gap.setFixedWidth(48)
         ctrl.addWidget(self.chain_gap)
+        cl.addLayout(ctrl)
+        self._syncing_threshold = False
+        self.sld_threshold.valueChanged.connect(self._on_threshold_slider)
+        self.chain_gap.valueChanged.connect(self._on_threshold_spin)
+
+        detect_row = QHBoxLayout()
+        detect_row.setContentsMargins(6, 0, 6, 0)
         self._btn_detect = QPushButton()
         self._btn_detect.clicked.connect(self._detect_chains)
-        ctrl.addWidget(self._btn_detect, 1)
-        cl.addLayout(ctrl)
+        detect_row.addWidget(self._btn_detect, 1)
+        cl.addLayout(detect_row)
 
         self.chain_list = QListWidget()
         self.chain_list.setSelectionMode(
@@ -528,6 +551,22 @@ class MainWindow(QMainWindow):
                 "Warning: purged {0} duplicate trace(s) based on timestamps."
             ).format(purged)
         self.status_lbl.setText(msg)
+
+    # ── Threshold slider ↔ spin sync (guarded against feedback loops) ─────────
+
+    def _on_threshold_slider(self, val: int) -> None:
+        if self._syncing_threshold:
+            return
+        self._syncing_threshold = True
+        self.chain_gap.setValue(val / self._THR_SCALE)
+        self._syncing_threshold = False
+
+    def _on_threshold_spin(self, val: float) -> None:
+        if self._syncing_threshold:
+            return
+        self._syncing_threshold = True
+        self.sld_threshold.setValue(int(round(val * self._THR_SCALE)))
+        self._syncing_threshold = False
 
     def _detect_chains(self) -> None:
         profiles = list(self.state.profiles.values())
@@ -989,7 +1028,7 @@ class MainWindow(QMainWindow):
         self._hdr_chains.setText(self.tr("DETECTED CHAINS"))
         self._lbl_threshold.setText(self.tr("Threshold (km):"))
         self._btn_detect.setText(self.tr("🔍 Detect"))
-        self._btn_add_chains.setText(self.tr("📂 Add chains"))
+        self._btn_add_chains.setText(self.tr("📂 Add"))
         self._btn_add_chains.setToolTip(
             self.tr("Import chains from a campaign directory (one folder per chain)"))
         self._btn_chain_remove.setText(self.tr("✖ Remove"))

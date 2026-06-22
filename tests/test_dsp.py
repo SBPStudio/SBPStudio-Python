@@ -20,9 +20,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sbp_studio.core import apply_agc
+from sbp_studio.core import apply_agc, apply_log_compression
 from sbp_studio.gui.dsp import (
-    AGCNode, DSPContext, Pipeline, extract_visible_window,
+    AGCNode, DSPContext, LogCompressionNode, Pipeline, extract_visible_window,
 )
 
 
@@ -101,6 +101,58 @@ class TestAGCMath:
         np.testing.assert_array_equal(
             node.apply(data, ctx),
             apply_agc(data, 25.0, self.DT_US))
+
+
+class TestLogCompressionMath:
+    DT_US = 250
+
+    def test_log_compression_shrinks_dynamic_range(self):
+        """A strong early reflector and a weak late reflector should have their
+        peak-amplitude ratio shrink after log compression (weak events boosted
+        relative to strong ones), without flipping polarity."""
+        tr = synthetic_trace(ns=1000, dt_us=self.DT_US,
+                             reflectors=((200, 1.0), (800, 0.1)), noise_std=0.0)
+        data = as_matrix(tr)
+        out = apply_log_compression(data, k=10.0)
+
+        strong_in  = float(np.max(np.abs(data[150:250, 0])))
+        weak_in    = float(np.max(np.abs(data[750:850, 0])))
+        strong_out = float(np.max(np.abs(out[150:250, 0])))
+        weak_out   = float(np.max(np.abs(out[750:850, 0])))
+
+        ratio_in  = strong_in / max(weak_in, 1e-9)
+        ratio_out = strong_out / max(weak_out, 1e-9)
+        assert ratio_out < ratio_in
+
+        # Polarity (sign) of each reflector's peak must be preserved.
+        assert np.sign(tr[200]) == np.sign(out[200, 0])
+        assert np.sign(tr[800]) == np.sign(out[800, 0])
+
+    def test_log_compression_preserves_shape_dtype_and_peak(self):
+        data = as_matrix(synthetic_trace())
+        out = apply_log_compression(data, k=10.0)
+        assert out.shape == data.shape
+        assert out.dtype == np.float32
+        assert out is not data            # never mutates input
+        # Rescaled back to the original peak amplitude (k=0 would be exact
+        # identity; for k>0 the peak sample itself maps to +/-max_amp).
+        assert np.isclose(float(np.max(np.abs(out))), float(np.max(np.abs(data))), rtol=1e-4)
+
+    def test_log_compression_zero_input_safe(self):
+        """The 1e-12 epsilon on max_amp must keep all-zero input finite."""
+        data = np.zeros((256, 4), dtype=np.float32)
+        out = apply_log_compression(data, k=10.0)
+        assert np.all(np.isfinite(out))
+        assert np.all(out == 0.0)
+
+    def test_log_compression_matches_core_reference(self):
+        """The node must produce EXACTLY the core's apply_log_compression output."""
+        ctx = DSPContext(dt_us=self.DT_US, ns=1000, n_traces=8)
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        node = LogCompressionNode({"k": 25.0})
+        np.testing.assert_array_equal(
+            node.apply(data, ctx),
+            apply_log_compression(data, 25.0))
 
 
 # ── 2. PIPELINE: prefix memoization ─────────────────────────────────────────────
@@ -390,7 +442,8 @@ class TestNodeMigration:
         from sbp_studio.gui.dsp import NODE_REGISTRY
         keys = {c.KEY for c in NODE_REGISTRY}
         assert keys == {"swell", "fk", "water_mute", "demultiple", "decon",
-                        "bandpass", "notch", "whiten", "preset", "tvg", "agc"}
+                        "bandpass", "notch", "whiten", "preset", "tvg", "agc",
+                        "log_compress"}
         assert "align" not in keys
 
 

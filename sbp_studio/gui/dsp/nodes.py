@@ -260,6 +260,21 @@ class AGCNode(DSPNode):
         return apply_agc(data, self.params["win_ms"], ctx.dt_us)
 
 
+class LogCompressionNode(DSPNode):
+    """Seismic HDR — phase-preserving log compression — wraps ``core.apply_log_compression``."""
+
+    KEY     = "log_compress"
+    DISPLAY = "Log Compression (Seismic HDR)"
+    SPECS   = (
+        ParamSpec("k", "Strength (k)", 1.0, 100.0, 10.0, 1.0, 0),
+    )
+
+    # Pointwise rescale → no halo needed.
+    def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
+        from sbp_studio.core import apply_log_compression
+        return apply_log_compression(data, self.params["k"])
+
+
 class SpectralWhiteningNode(DSPNode):
     """Spectral whitening (resolution enhancement) — wraps ``core.apply_spectral_whitening``.
 
@@ -435,6 +450,7 @@ NODE_REGISTRY: List[type[DSPNode]] = [
     PresetNode,
     TVGNode,
     AGCNode,
+    LogCompressionNode,
 ]
 
 

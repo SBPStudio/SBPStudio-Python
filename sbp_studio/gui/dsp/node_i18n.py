@@ -37,6 +37,7 @@ def tr_node(key: str, fallback: str = "") -> str:
         "fk":         QCoreApplication.translate("DSPNodes", "F-K Dip Filter"),
         "demultiple": QCoreApplication.translate("DSPNodes", "Seabed Multiple Suppression"),
         "notch":      QCoreApplication.translate("DSPNodes", "Notch Filter"),
+        "log_compress": QCoreApplication.translate("DSPNodes", "Log Compression (Seismic HDR)"),
     }
     return table.get(key, fallback or key)
 
@@ -65,5 +66,6 @@ def tr_param(label: str) -> str:
         "Max gain":                QCoreApplication.translate("DSPNodes", "Max gain"),
         "Notch frequency":         QCoreApplication.translate("DSPNodes", "Notch frequency"),
         "Q factor":                QCoreApplication.translate("DSPNodes", "Q factor"),
+        "Strength (k)":            QCoreApplication.translate("DSPNodes", "Strength (k)"),
     }
     return table.get(label, label)

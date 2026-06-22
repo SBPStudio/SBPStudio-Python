@@ -150,6 +150,11 @@
         <translation>Filtro Notch (banda eliminada)</translation>
     </message>
     <message>
+        <location filename="..\dsp\node_i18n.py" line="40" />
+        <source>Log Compression (Seismic HDR)</source>
+        <translation>Compresión HDR (Logarítmica)</translation>
+    </message>
+    <message>
         <location filename="..\dsp\node_i18n.py" line="55" />
         <source>Smooth window</source>
         <translation>Ventana de suavizado</translation>
@@ -193,6 +198,11 @@
         <location filename="..\dsp\node_i18n.py" line="63" />
         <source>Q factor</source>
         <translation>Factor Q</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="69" />
+        <source>Strength (k)</source>
+        <translation>Fuerza (k)</translation>
     </message>
 </context><context>
     <name>ExportDialog</name>
@@ -756,8 +766,8 @@ Interfaz PyQt6, desacoplada del núcleo de procesado.</translation>
     </message>
     <message>
         <location filename="..\main_window.py" line="818" />
-        <source>📂 Add chains</source>
-        <translation>📂 Añadir cadenas</translation>
+        <source>📂 Add</source>
+        <translation>📂 Añadir</translation>
     </message>
     <message>
         <location filename="..\main_window.py" line="820" />
@@ -1517,8 +1527,12 @@ Perímetro: {2}</translation>
     </message>
     <message>
         <location filename="..\components\processing_controls.py" line="679" />
-        <source>↺  Reset aspect settings</source>
-        <translation>↺  Restablecer ajustes de aspecto</translation>
+        <source>↺ Reset</source>
+        <translation>↺ Restablecer</translation>
+    </message>
+    <message>
+        <source>Reset aspect settings</source>
+        <translation>Restablecer ajustes de aspecto</translation>
     </message>
     <message>
         <location filename="..\components\processing_controls.py" line="680" />
@@ -1542,8 +1556,8 @@ Perímetro: {2}</translation>
     </message>
     <message>
         <location filename="..\components\processing_controls.py" line="688" />
-        <source>🔍  Render Viewport HQ</source>
-        <translation>🔍  Renderizar vista HQ</translation>
+        <source>🔍 Viewport HQ</source>
+        <translation>🔍 Vista HQ</translation>
     </message>
     <message>
         <location filename="..\components\processing_controls.py" line="689" />
@@ -1577,8 +1591,12 @@ Perímetro: {2}</translation>
     </message>
     <message>
         <location filename="..\components\processing_controls.py" line="694" />
-        <source>🗺  Export FIX → SHP / GeoJSON / CSV</source>
-        <translation>🗺  Exportar FIX → SHP / GeoJSON / CSV</translation>
+        <source>🗺 Export FIX</source>
+        <translation>🗺 Exportar FIX</translation>
+    </message>
+    <message>
+        <source>Export FIX → SHP / GeoJSON / CSV</source>
+        <translation>Exportar FIX → SHP / GeoJSON / CSV</translation>
     </message>
     <message>
         <source>Pixels / trace (resolution)</source>
