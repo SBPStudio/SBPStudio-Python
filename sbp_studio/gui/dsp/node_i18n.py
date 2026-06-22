@@ -33,6 +33,10 @@ def tr_node(key: str, fallback: str = "") -> str:
         "align":      QCoreApplication.translate("DSPNodes", "Delay Alignment (compensate groups)"),
         "water_mute": QCoreApplication.translate("DSPNodes", "Water Column Mute"),
         "swell":      QCoreApplication.translate("DSPNodes", "Swell Filter / Heave Correction"),
+        "whiten":     QCoreApplication.translate("DSPNodes", "Spectral Whitening"),
+        "fk":         QCoreApplication.translate("DSPNodes", "F-K Dip Filter"),
+        "demultiple": QCoreApplication.translate("DSPNodes", "Seabed Multiple Suppression"),
+        "notch":      QCoreApplication.translate("DSPNodes", "Notch Filter"),
     }
     return table.get(key, fallback or key)
 
@@ -52,5 +56,14 @@ def tr_param(label: str) -> str:
         "Margin":                  QCoreApplication.translate("DSPNodes", "Margin"),
         "Trace window":            QCoreApplication.translate("DSPNodes", "Trace window"),
         "Max shift":               QCoreApplication.translate("DSPNodes", "Max shift"),
+        "Smooth window":           QCoreApplication.translate("DSPNodes", "Smooth window"),
+        "Reject dip":              QCoreApplication.translate("DSPNodes", "Reject dip"),
+        "Fan half-width":          QCoreApplication.translate("DSPNodes", "Fan half-width"),
+        "Mode":                    QCoreApplication.translate("DSPNodes", "Mode"),
+        "Seabed threshold":        QCoreApplication.translate("DSPNodes", "Seabed threshold"),
+        "Period (0=auto)":         QCoreApplication.translate("DSPNodes", "Period (0=auto)"),
+        "Max gain":                QCoreApplication.translate("DSPNodes", "Max gain"),
+        "Notch frequency":         QCoreApplication.translate("DSPNodes", "Notch frequency"),
+        "Q factor":                QCoreApplication.translate("DSPNodes", "Q factor"),
     }
     return table.get(label, label)

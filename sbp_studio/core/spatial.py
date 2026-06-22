@@ -12,7 +12,7 @@ projection math ever lives in the GUI layer.
 """
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 from pyproj import CRS, Transformer
@@ -75,6 +75,30 @@ def reproject_points(lons, lats, src_crs: str, dst_crs: str
     tf = Transformer.from_crs(s, d, always_xy=True)
     nx, ny = tf.transform(xs, ys)
     return np.asarray(nx, dtype=float), np.asarray(ny, dtype=float)
+
+
+def crs_produces_geographic(src_crs) -> "Optional[bool]":
+    """Whether :func:`to_geographic` will yield GEOGRAPHIC (WGS84 lon/lat)
+    output for ``src_crs`` — used by the map to classify coordinate units
+    from the ACTUAL CRS instead of a value-magnitude heuristic (Bug #10).
+
+    * ``True``  — ``src_crs`` parses as a CRS (geographic stays lon/lat;
+      projected is reprojected to WGS84), so the produced display
+      coordinates are geographic.
+    * ``None``  — ``src_crs`` is empty or unparseable, so ``to_geographic``
+      passes the native coordinates through unchanged and their unit is
+      unknown; the caller should fall back to its magnitude heuristic.
+
+    Note: this reports the unit of the PRODUCED (post-``to_geographic``)
+    coordinates, which is what the map actually plots — not whether the
+    source CRS itself was geographic."""
+    if not src_crs:
+        return None
+    try:
+        CRS.from_user_input(src_crs)
+        return True
+    except Exception:
+        return None
 
 
 def to_geographic(lons, lats, src_crs) -> Tuple[np.ndarray, np.ndarray]:

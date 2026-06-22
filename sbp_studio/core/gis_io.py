@@ -1,13 +1,15 @@
 """
-gis_io.py — Local GIS layer readers (vector + raster), reprojected to WGS84.
+gis_io.py — Local GIS layer readers/writers (vector + raster), WGS84.
 
 Reads user-supplied overlay files for the navigation map and returns plain,
 GUI-free data containers already in WGS84 lon/lat so the GUI can render them
-directly against the geographic basemap:
+directly against the geographic basemap; also writes user-drawn map shapes
+back out to a shapefile:
 
   * read_vector(.shp …)  → :class:`VectorLayer`  (geometries as lon/lat paths)
   * read_geotiff(.tif …) → :class:`RasterLayer`  (image + WGS84 bounding box)
   * read_gis_layer(path) → dispatch by file extension
+  * write_vector(path, geom_type, paths) → save lon/lat paths to a shapefile
 
 ALL parsing and CRS reprojection happen here in the CORE (pyproj via
 ``spatial.reproject_points``). Heavy GIS deps (geopandas, tifffile) are imported
@@ -24,6 +26,29 @@ import numpy as np
 
 from .spatial import WGS84, reproject_points
 
+# Largest raster dimension (px) kept on read. A real-world bathymetry/DEM
+# GeoTIFF can be tens of thousands of pixels per side — loading it full-res
+# bloats RAM and the live scene for a backdrop that's only ever a few hundred
+# screen pixels wide. Above this, the array is strided-decimated on read; the
+# WGS84 bounding box is derived from the ORIGINAL geotransform, so the spatial
+# extent is unchanged (the GUI just stretches a smaller array over the same
+# rect). 4096 keeps it crisp at any practical map zoom.
+_MAX_RASTER_DIM = 4096
+
+
+def _decimate_raster(image: np.ndarray, max_dim: int = _MAX_RASTER_DIM) -> np.ndarray:
+    """Strided-downsample a raster so its largest side is ≤ ``max_dim``,
+    leaving any channel axis (H, W, C) untouched. No-op when already small.
+    Strided (not averaged) so it stays dependency-free and cheap — a map
+    backdrop doesn't need anti-aliased resampling."""
+    if image.ndim < 2:
+        return image
+    h, w = int(image.shape[0]), int(image.shape[1])
+    step = int(np.ceil(max(h, w) / float(max_dim)))
+    if step <= 1:
+        return image
+    return np.ascontiguousarray(image[::step, ::step])
+
 
 @dataclass
 class VectorLayer:
@@ -32,6 +57,11 @@ class VectorLayer:
     geom_type: str                       # 'line' | 'polygon' | 'point'
     paths: List[np.ndarray] = field(default_factory=list)
     src_crs: Optional[str] = None
+    # Whether the RETURNED coordinates are geographic (lon/lat). True when a
+    # source CRS was present (the paths were kept/reprojected to WGS84); None
+    # when no CRS/.prj was available, so the GUI falls back to its magnitude
+    # heuristic instead of guessing (Bug #10).
+    is_geographic: Optional[bool] = None
 
 
 @dataclass
@@ -41,6 +71,10 @@ class RasterLayer:
     image: np.ndarray                    # (H, W) or (H, W, C)
     bbox: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)  # lon0, lon1, lat0, lat1
     src_crs: Optional[str] = None
+    # As VectorLayer.is_geographic — True when the GeoTIFF carried a CRS (its
+    # extent was kept/reprojected to a WGS84 bbox), None when georeferencing
+    # gave no CRS (Bug #10).
+    is_geographic: Optional[bool] = None
 
 
 # ── Vector (shapefile / any OGR format geopandas can open) ─────────────────────
@@ -97,7 +131,48 @@ def read_vector(path: str) -> VectorLayer:
         _explode(geom, paths)
 
     src = f"EPSG:{src_epsg}" if src_epsg else None
-    return VectorLayer(name=Path(path).stem, geom_type=fam, paths=paths, src_crs=src)
+    # A CRS WAS present (so the paths are now WGS84 lon/lat) ⇒ geographic; no
+    # CRS/.prj ⇒ unknown (None) so the GUI uses its heuristic — Bug #10.
+    is_geographic = True if gdf.crs is not None else None
+    return VectorLayer(name=Path(path).stem, geom_type=fam, paths=paths,
+                       src_crs=src, is_geographic=is_geographic)
+
+
+def write_vector(path: str, geom_type: str, paths: List[np.ndarray],
+                 crs: str = "EPSG:4326", target_epsg: Optional[str] = None) -> None:
+    """Write a list of (N, 2) lon/lat coordinate paths to a shapefile (or any
+    other OGR format geopandas can write, selected by ``path``'s extension).
+    Each path becomes one feature; ``geom_type`` is 'point' | 'line' |
+    'polygon' (uniform per call — a shapefile can't mix geometry types in one
+    file, so callers with mixed types must call this once per type).
+
+    ``crs`` is the SOURCE CRS of ``paths`` (WGS84 lon/lat by default — how
+    every drawn/loaded map shape in the GUI is stored). If ``target_epsg`` is
+    given (e.g. ``"EPSG:32630"`` or bare ``"32630"``), the geometries are
+    reprojected to it via ``GeoDataFrame.to_crs()`` (geopandas/pyproj) before
+    saving — invalid codes raise naturally from ``to_crs()`` and propagate to
+    the caller."""
+    try:
+        import geopandas as gpd
+        from shapely.geometry import LineString, Point, Polygon
+    except ImportError as exc:                       # pragma: no cover
+        raise ImportError("Writing vector layers needs geopandas "
+                          "(pip install geopandas).") from exc
+
+    builders = {"point": lambda p: Point(p[0]), "line": LineString, "polygon": Polygon}
+    builder = builders.get(geom_type, LineString)
+    min_pts = 1 if geom_type == "point" else 2
+    geoms = [builder(np.asarray(p, dtype=float)) for p in paths if len(p) >= min_pts]
+    if not geoms:
+        raise ValueError("No valid geometry to write (need at least "
+                         f"{min_pts} point(s) per path for '{geom_type}').")
+    gdf = gpd.GeoDataFrame({"geometry": geoms}, crs=crs)
+    if target_epsg:
+        target_epsg = str(target_epsg).strip()
+        if target_epsg.isdigit():
+            target_epsg = f"EPSG:{target_epsg}"
+        gdf = gdf.to_crs(target_epsg)
+    gdf.to_file(path)
 
 
 # ── Raster (GeoTIFF) ───────────────────────────────────────────────────────────
@@ -159,7 +234,15 @@ def read_geotiff(path: str) -> RasterLayer:
     else:
         lon, lat = cx, cy
     bbox = (float(lon.min()), float(lon.max()), float(lat.min()), float(lat.max()))
-    return RasterLayer(name=Path(path).stem, image=image, bbox=bbox, src_crs=src_crs)
+    # Decimate AFTER the bbox is derived (which used the original h, w +
+    # geotransform), so the WGS84 extent is preserved exactly while RAM /
+    # scene cost is bounded — see _decimate_raster (Bug #7).
+    image = _decimate_raster(image)
+    # CRS present ⇒ extent kept/reprojected to a WGS84 bbox (geographic); no
+    # CRS ⇒ unknown (None), GUI heuristic decides — Bug #10.
+    is_geographic = True if src_crs else None
+    return RasterLayer(name=Path(path).stem, image=image, bbox=bbox,
+                       src_crs=src_crs, is_geographic=is_geographic)
 
 
 # ── Dispatch ───────────────────────────────────────────────────────────────────

@@ -183,6 +183,7 @@ class SegyProfile:
         self.water_depth: Optional[np.ndarray] = None
         self.timestamps:  List[str] = []
         self.text_header:   str  = ""          # 3200-byte textual header (decoded)
+        self.text_header_encoding: str = "ascii"  # "ascii" | "ebcdic" — auto-detected guess
         self.trace_headers: dict = {}          # {label: (n_traces,) raw header array}
         self.n_traces:    int   = 0
         # Duplicate-timestamp cleanup bookkeeping (io_segy). original_n_traces is
@@ -294,6 +295,8 @@ class ProfileChain:
         # Header Inspector: keep the first profile's textual header; concatenate
         # the per-trace raw header fields across the whole chain.
         self.text_header = self.profiles[0].text_header if self.profiles else ""
+        self.text_header_encoding = (
+            self.profiles[0].text_header_encoding if self.profiles else "ascii")
         if self.profiles and all(p.trace_headers for p in self.profiles):
             labels = list(self.profiles[0].trace_headers.keys())
             self.trace_headers = {

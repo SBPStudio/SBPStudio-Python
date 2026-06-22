@@ -14,8 +14,8 @@ from typing import Optional, TYPE_CHECKING
 
 from PyQt6.QtCore import QCoreApplication, Qt
 from PyQt6.QtWidgets import (
-    QDialog, QFileDialog, QFrame, QMessageBox, QScrollArea, QSplitter,
-    QStackedWidget, QTabWidget, QVBoxLayout, QWidget,
+    QCheckBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QMessageBox,
+    QScrollArea, QSplitter, QStackedWidget, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..components import (
@@ -193,6 +193,11 @@ def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
         show_raster=bool(params.get("show_raster", True)),
         style=params.get("style", "density"),
         layout_mode=scale_cfg.get("layout_mode", "aspect"),
+        # Variable-area fill / wiggle-line visibility, mirrored from the live
+        # PyQtGraph view's checkboxes (display_params) so exports never silently
+        # diverge from what's on screen.
+        va_fill=bool(params.get("va_fill", True)),
+        show_wiggle_line=bool(params.get("show_wiggle_line", True)),
         # Reflector-safe downscale: when the export must shrink below native
         # (RAM-capped DPI), pool by max-|amplitude| instead of bilinear so thin
         # high-amplitude reflectors are preserved. Default on.
@@ -288,6 +293,14 @@ class SubTabbedTab(QWidget):
         self._map.trace_clicked.connect(self._headers.select_trace)
         self._seismic.trace_clicked.connect(self._headers.select_trace)
         self._headers.trace_selected.connect(self._on_header_trace_selected)
+
+        # Link Views (cross-module sync, OFF by default — see _build_subtabs):
+        # live navigation cursor on hover + "Add Anomaly to Map" POI from the
+        # seismic view's right-click menu. Both handlers no-op while the
+        # toggle is unchecked; set_link_views_enabled also greys out the
+        # menu action itself (see SeismicView._update_ruler_menu_state).
+        self._seismic.cursor_trace_changed.connect(self._on_seismic_cursor_moved)
+        self._seismic.add_anomaly_requested.connect(self._on_seismic_anomaly_requested)
 
         # Render Full → re-fit the whole section (the live loop is automatic).
         self.controls.render_requested.connect(self.preview.fit)
@@ -399,6 +412,30 @@ class SubTabbedTab(QWidget):
         dist = getattr(obj, "dist_km", None) if obj is not None else None
         if dist is not None and 0 <= idx < len(dist):
             self._seismic.center_on_distance(float(dist[idx]))
+
+    def _on_link_views_toggled(self, checked: bool) -> None:
+        """Link Views turned off → drop the live navigation cursor immediately
+        (it would otherwise sit stale at its last hover position), and grey
+        out the seismic view's "Add Anomaly to Map" menu action."""
+        self._seismic.set_link_views_enabled(checked)
+        if not checked:
+            self._map.hide_navigation_marker()
+
+    def _on_seismic_cursor_moved(self, idx: int) -> None:
+        """Live Navigation Cursor (Part 1): only active while Link Views is
+        checked. The seismic view emits a bare trace index; the map already
+        holds the matching lon/lat track arrays (set_track), so no coordinate
+        crosses the signal boundary — same split as trace_clicked."""
+        if self.chk_link_views.isChecked():
+            self._map.show_navigation_marker(idx)
+
+    def _on_seismic_anomaly_requested(self, idx: int) -> None:
+        """Anomaly Waypoint (Part 1): "Add Anomaly to Map" on the seismic
+        view's right-click menu drops a permanent POI marker on the map.
+        The menu action is itself greyed out while Link Views is off (see
+        set_link_views_enabled), so this check is a defensive no-op only."""
+        if self.chk_link_views.isChecked():
+            self._map.add_poi_marker(idx)
 
     def _on_map_layer_requested(self, path: str) -> None:
         """Read a GIS overlay file in the core (off the GUI thread) and add the
@@ -545,7 +582,9 @@ class SubTabbedTab(QWidget):
         # rebuilds the pipeline thread-safely. EXPORT uses the SAME node config
         # as the preview, but runs it over the 100 % FULL array (no ViewBox /
         # decimation) — completely decoupled from the on-screen preview.
-        node_cfg = [(n.KEY, dict(n.params)) for n in self.pipeline_panel.nodes()]
+        # active_nodes() = enabled-only, so a MUTED node is bypassed on export
+        # exactly as it is in the preview.
+        node_cfg = [(n.KEY, dict(n.params)) for n in self.pipeline_panel.active_nodes()]
         # Static delay-alignment (geometry) is applied to the base BEFORE the
         # dynamic nodes — exactly as the preview does — read from the static
         # checkbox. ``params["align"]`` drives the renderer's time axis
@@ -624,11 +663,16 @@ class SubTabbedTab(QWidget):
             return
         # Snapshot the visible ViewBox window NOW (Qt objects aren't thread-safe).
         x_range, y_range = self._seismic.current_view_range()
+        # Snapshot the EXACT amplitude levels the live image is using right now —
+        # the HQ raster must reuse these verbatim (not recompute its own vmin/vmax
+        # from the crop) or its colors drift from what's on screen, most visibly
+        # when "[ -1 to 1 ]" (diverging) clipping is active.
+        live_vmin, live_vmax = self._seismic.current_levels()
 
         params = dict(self.controls.display_params())
         params["clip_lo"] = 0.0
         params["fill_value"] = 0.0
-        node_cfg = [(n.KEY, dict(n.params)) for n in self.pipeline_panel.nodes()]
+        node_cfg = [(n.KEY, dict(n.params)) for n in self.pipeline_panel.active_nodes()]
         align_enabled = self.controls.align_enabled()
         params["align"] = align_enabled
         handler = self._handler
@@ -637,7 +681,7 @@ class SubTabbedTab(QWidget):
         def job(progress, cancel) -> tuple:
             import numpy as np
             from sbp_studio.core.constants import CMAPS
-            from sbp_studio.viz.render import _colorize_for_target, _vmin_vmax
+            from sbp_studio.viz.render import _colorize_for_target
             if getattr(obj, "data", None) is None:
                 progress(float("nan"), "Loading traces…")
             _obj = handler.load_full(obj, cancel)
@@ -652,8 +696,10 @@ class SubTabbedTab(QWidget):
 
             # HQ colourise — the SAME smooth bilinear raster the Matplotlib export
             # embeds, upsampled so zoomed-in traces are sharp instead of blocky.
-            vmin, vmax = _vmin_vmax(crop, params.get("clip", 99.6),
-                                    params.get("clip_lo", 0.0))
+            # vmin/vmax are the live view's CURRENT levels (snapshotted above), not
+            # recomputed from the crop — keeps colors pixel-identical to what's on
+            # screen, including under fixed [-1, 1] diverging clipping.
+            vmin, vmax = live_vmin, live_vmax
             cmap_name = CMAPS.get(params.get("cmap", "Viridis"), "viridis")
             if params.get("inv_cmap"):
                 cmap_name += "_r"
@@ -703,7 +749,7 @@ class SubTabbedTab(QWidget):
         params["clip_lo"] = 0.0
         params["fill_value"] = 0.0 if cfg["fill_zero"] else float("nan")
         params["draw_file_boundaries"] = bool(cfg["draw_file_boundaries"])
-        node_cfg = [(n.KEY, dict(n.params)) for n in self.pipeline_panel.nodes()]
+        node_cfg = [(n.KEY, dict(n.params)) for n in self.pipeline_panel.active_nodes()]
         align_enabled = self.controls.align_enabled()
         params["align"] = align_enabled
 
@@ -848,13 +894,32 @@ class SubTabbedTab(QWidget):
         return scroll
 
     def _build_subtabs(self) -> QWidget:
+        host = QWidget()
+        col = QVBoxLayout(host)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(2)
+
+        # Cross-module sync toggle (Link Views). Governs ONLY the new live
+        # navigation cursor + double-click POI features below — the existing
+        # always-on visible-segment/click-to-jump sync is unrelated and stays
+        # unconditional. Crucial: unchecked by default (see _on_link_views_toggled).
+        row = QHBoxLayout()
+        row.setContentsMargins(4, 2, 4, 2)
+        self.chk_link_views = QCheckBox()
+        self.chk_link_views.setChecked(False)
+        self.chk_link_views.toggled.connect(self._on_link_views_toggled)
+        row.addWidget(self.chk_link_views)
+        row.addStretch(1)
+        col.addLayout(row)
+
         self.subtabs = QTabWidget()
         self.pages: list[_Page] = []
         for _ in range(4):
             page = _Page()
             self.pages.append(page)
             self.subtabs.addTab(page, "")
-        return self.subtabs
+        col.addWidget(self.subtabs)
+        return host
 
     # ── i18n ────────────────────────────────────────────────────────────────
 
@@ -870,6 +935,12 @@ class SubTabbedTab(QWidget):
         )
         for i, title in enumerate(titles):
             self.subtabs.setTabText(i, title)
+        self.chk_link_views.setText(QCoreApplication.translate(
+            "SubTabbedTab", "Link Views"))
+        self.chk_link_views.setToolTip(QCoreApplication.translate(
+            "SubTabbedTab",
+            "When active: hovering the seismic section shows a live cursor on "
+            "the map, and double-clicking adds a Point of Interest marker."))
         msg = self.empty_message()
         for page in self.pages:
             page.placeholder.set_text(msg)

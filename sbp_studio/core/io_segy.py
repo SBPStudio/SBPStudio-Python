@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import segyio
@@ -179,32 +179,97 @@ def _scalar_fac(sc: int) -> float:
     return 1.0
 
 
-def _decode_text_header(raw) -> str:
-    """Decode the 3200-byte textual header to clean ASCII, wrapped to the
-    standard 40 lines × 80 chars. Auto-detects EBCDIC (cp037) vs ASCII by
-    printable-character ratio (legacy SBP files are often EBCDIC)."""
+# Codec map for the textual header. "ascii"/"ebcdic" are the two SEG-Y-relevant
+# encodings the heuristic chooses between; "latin-1" is a never-fails fallback
+# for extended-ASCII files (every byte 0x00-0xFF maps to a code point) exposed
+# as a manual override in the GUI.
+_TEXT_CODECS: Dict[str, str] = {
+    "ascii":   "ascii",
+    "ebcdic":  "cp037",
+    "latin-1": "latin-1",
+}
+
+
+def _normalize_raw_text_bytes(raw) -> bytes:
+    """Null-pad fix for the Kongsberg/TOPAS (and similar marine SBP) quirk:
+    these acquisition systems pad the 3200-byte textual header with NUL bytes
+    (``0x00``) instead of the SEG-Y-standard ASCII space (``0x20``). Swap them
+    at the BYTE level *before* decoding so that (a) the encoding heuristic
+    isn't skewed by a sea of non-printable nulls and (b) the decoded text
+    shows clean trailing spaces under every codec. Idempotent and read-only."""
     if raw is None:
-        return ""
-    data = bytes(raw)
+        return b""
+    return bytes(raw).replace(b"\x00", b"\x20")
+
+
+def _printable_ratio(s: str) -> float:
+    if not s:
+        return 0.0
+    ok = sum(1 for ch in s if ch in "\r\n\t" or 32 <= ord(ch) < 127)
+    return ok / len(s)
+
+
+def detect_text_header_encoding(raw) -> str:
+    """Guess whether a raw 3200-byte textual-header block is ``"ascii"`` or
+    ``"ebcdic"`` by comparing printable-character ratios under each codec.
+    Many modern SBP acquisition systems violate the SEG-Y standard and write
+    this block as plain ASCII rather than EBCDIC, so this is a heuristic, not
+    a guarantee — the GUI exposes a manual override toggle (incl. a Latin-1
+    fallback) for exactly that reason. Null padding is normalised to spaces
+    first so the ratios reflect real content, not padding."""
+    data = _normalize_raw_text_bytes(raw)
     if not data:
-        return ""
-
-    def _printable(s: str) -> float:
-        if not s:
-            return 0.0
-        ok = sum(1 for ch in s if ch in "\r\n\t" or 32 <= ord(ch) < 127)
-        return ok / len(s)
-
+        return "ascii"
     ascii_txt = data.decode("ascii", errors="replace")
     try:
         ebcdic_txt = data.decode("cp037", errors="replace")
     except Exception:
         ebcdic_txt = ascii_txt
-    txt = ascii_txt if _printable(ascii_txt) >= _printable(ebcdic_txt) else ebcdic_txt
-    txt = txt.replace("\x00", " ")
+    return "ascii" if _printable_ratio(ascii_txt) >= _printable_ratio(ebcdic_txt) else "ebcdic"
+
+
+def decode_text_header(raw, encoding: str = "auto") -> str:
+    """Decode the 3200-byte textual header to clean text, wrapped to the
+    standard 40 lines x 80 chars.
+
+    *encoding* is one of ``"auto"`` (printable-ratio heuristic — the
+    historical default), ``"ascii"``, ``"ebcdic"`` (cp037), or ``"latin-1"``
+    (never-fails extended-ASCII fallback). NUL padding is converted to spaces
+    at the byte level before decoding (the Kongsberg/TOPAS quirk). Read-only
+    and side-effect-free: callers can re-decode the same raw bytes under a
+    different encoding as many times as they like with zero file-corruption
+    risk, since nothing is written.
+    """
+    data = _normalize_raw_text_bytes(raw)
+    if not data:
+        return ""
+
+    enc = encoding if encoding in _TEXT_CODECS else detect_text_header_encoding(data)
+    txt = data.decode(_TEXT_CODECS[enc], errors="replace")
     # Standard layout: 40 cards of 80 columns. Wrap accordingly and right-trim.
     lines = [txt[i:i + 80].rstrip() for i in range(0, min(len(txt), 3200), 80)]
     return "\n".join(lines)
+
+
+def read_raw_text_header(path: str) -> bytes:
+    """Read-only fetch of the TRUE raw, undecoded 3200-byte textual-header
+    block — bytes 0-3199 of the file, read directly with plain file I/O.
+
+    Deliberately does NOT use segyio's ``f.text[0]``: segyio unconditionally
+    runs an internal EBCDIC-to-ASCII conversion table on the textual header,
+    on the assumption that every SEG-Y file is standard-compliant EBCDIC.
+    Many marine SBP acquisition systems (Kongsberg TOPAS and others) instead
+    write this block as plain ASCII — running already-ASCII bytes through
+    segyio's EBCDIC table double-translates them into garbage (confirmed by
+    forensic byte comparison: ``segyio_text != raw_file_bytes`` for ANT26/
+    L001A/MCS7 sample files, all of which are clean ASCII with zero NUL
+    padding). Reading the bytes ourselves sidesteps that conversion entirely
+    so our own ``decode_text_header``/``detect_text_header_encoding`` can
+    choose ASCII vs EBCDIC (cp037) vs Latin-1 correctly, whatever the file
+    actually contains.
+    """
+    with open(path, "rb") as fh:
+        return fh.read(3200)
 
 
 def _extract_trace_headers(f: "segyio.SegyFile") -> dict:
@@ -417,7 +482,12 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
     # block, negligible cost). The full 91-field per-trace extract is deferred
     # for header-only stubs (chain detection, pre-scan) where no inspector is
     # shown; it runs only when traces are loaded so the GUI inspector works.
-    prof.text_header = _decode_text_header(f.text[0])
+    # Bytes come from read_raw_text_header (plain file I/O), NOT f.text[0] —
+    # segyio's own text accessor force-converts EBCDIC->ASCII and corrupts
+    # files (like these) that actually store the header as plain ASCII.
+    _raw_text = read_raw_text_header(prof.path)
+    prof.text_header = decode_text_header(_raw_text, encoding="auto")
+    prof.text_header_encoding = detect_text_header_encoding(_raw_text)
     if load_traces:
         prof.trace_headers = _extract_trace_headers(f)
         if _keep is not None:                    # keep the inspector aligned too
@@ -457,6 +527,213 @@ def load_profile(path: str, load_traces: bool = True) -> SegyProfile:
     except Exception as exc:
         prof.error = str(exc)
     return prof
+
+
+# ── In-place header patch ───────────────────────────────────────────────────────
+
+def _format_text_header_for_write(text: str) -> str:
+    """Format user-edited text into the SEG-Y 40 × 80 char layout (3200 chars)."""
+    lines = text.split('\n')
+    padded = [line[:80].ljust(80) for line in lines[:40]]
+    while len(padded) < 40:
+        padded.append(' ' * 80)
+    return ''.join(padded)
+
+
+def _encode_text_header_bytes(text: str, encoding: str = "ascii") -> bytes:
+    """Format *text* to the 3200-char card layout and encode it to raw bytes
+    using *encoding* ('ascii', 'ebcdic'/cp037, or 'latin-1') — the SAME codec
+    the GUI is currently decoding/displaying with, so a round-trip Save
+    never silently flips the file's textual-header convention. Characters
+    outside the chosen codec degrade to ``?`` (errors="replace") rather than
+    raising mid-write."""
+    formatted = _format_text_header_for_write(text)
+    codec = _TEXT_CODECS.get(encoding, "ascii")
+    return formatted.encode(codec, errors="replace")
+
+
+def patch_segy_headers(
+    path: str,
+    *,
+    text_header: Optional[str] = None,
+    text_encoding: str = "ascii",
+    binary_updates: Optional[dict] = None,
+) -> tuple:
+    """Patch a SEG-Y file's text and/or binary header in-place.
+
+    The text header is written with PLAIN file I/O (seek 0, write 3200
+    raw bytes) — never via segyio's ``f.text[0] = ...`` setter. That setter
+    unconditionally EBCDIC-encodes (cp037) whatever string it's given,
+    regardless of the file's actual textual-header convention (confirmed by
+    byte-level probe: writing an ASCII string through ``f.text[0]`` produces
+    cp037 bytes on disk). Since many marine SBP systems (Kongsberg TOPAS and
+    others) store this block as plain ASCII, that setter would silently flip
+    the file's encoding on every save — exactly the kind of corruption this
+    module exists to prevent. *text_encoding* should be whatever codec the
+    GUI is currently displaying the text under (``profile.text_header_encoding``)
+    so the write matches the read.
+
+    Binary-header updates still go through segyio's ``r+`` mode (unaffected
+    by this issue — only the text/EBCDIC accessor is special-cased by
+    segyio). If ``BinField.Interval`` (dt_us) is in *binary_updates* the new
+    value is also bulk-written to every trace's ``TRACE_SAMPLE_INTERVAL``
+    field so that readers that use per-trace dt (rather than the binary
+    header) are also corrected.
+
+    Returns ``(True, "")`` on success or ``(False, error_message)`` on failure.
+    """
+    if text_header is None and not binary_updates:
+        return True, ""
+
+    if binary_updates:
+        samples_key = int(segyio.BinField.Samples)
+        if samples_key in {int(k) for k in binary_updates}:
+            return False, (
+                "Refusing to change ns (samples/trace) via header patch: this "
+                "would change the binary header's declared trace length without "
+                "resizing the actual trace data blocks on disk, corrupting every "
+                "trace boundary for any reader. Resampling/truncating the data "
+                "matrix and rewriting the file is a different, heavier operation "
+                "not supported by this in-place patcher."
+            )
+
+    try:
+        if text_header is not None:
+            raw_bytes = _encode_text_header_bytes(text_header, text_encoding)
+            with open(path, "r+b") as fh:
+                fh.seek(0)
+                fh.write(raw_bytes)
+
+        if binary_updates:
+            with segyio.open(path, mode='r+', ignore_geometry=True) as f:
+                f.bin.update(binary_updates)
+                interval_key = int(segyio.BinField.Interval)
+                if interval_key in {int(k) for k in binary_updates}:
+                    new_dt = int(binary_updates[
+                        next(k for k in binary_updates if int(k) == interval_key)])
+                    if new_dt > 0:
+                        # Mass-propagate dt to every trace header. ``f.attributes()``
+                        # is read-only in segyio; the portable write path is to
+                        # update each trace header mapping in place.
+                        ts_field = segyio.TraceField.TRACE_SAMPLE_INTERVAL
+                        for i in range(f.tracecount):
+                            f.header[i].update({ts_field: new_dt})
+                f.flush()
+
+        return True, ""
+    except Exception as exc:
+        _LOG.error("patch_segy_headers failed for %s: %s", path, exc)
+        return False, str(exc)
+
+
+# ── Trace-header field widths & safe bulk patching ──────────────────────────────
+
+_TRACE_HEADER_BYTES = 240
+
+
+def _build_trace_field_widths() -> Dict[str, int]:
+    """Derive each standard trace-header field's byte width (2 or 4) from the
+    gap to the next field's offset in segyio's byte-offset table. This
+    reproduces the SEG-Y rev1 spec exactly — e.g. NSummedTraces (offset 31)
+    to NStackedTraces (offset 33) is 2 bytes (int16); offset (37) to
+    ReceiverGroupElevation (41) is 4 bytes (int32)."""
+    offsets = sorted(segyio.tracefield.keys.items(), key=lambda kv: kv[1])
+    widths: Dict[str, int] = {}
+    for i, (name, off) in enumerate(offsets):
+        nxt = offsets[i + 1][1] if i + 1 < len(offsets) else (_TRACE_HEADER_BYTES + 1)
+        widths[name] = nxt - off
+    return widths
+
+
+_TRACE_FIELD_WIDTHS: Dict[str, int] = _build_trace_field_widths()
+
+
+def trace_field_names() -> Tuple[str, ...]:
+    """All standard trace-header field names, in on-disk byte order."""
+    return tuple(sorted(_TRACE_FIELD_WIDTHS, key=lambda n: segyio.tracefield.keys[n]))
+
+
+def trace_field_int_range(field_name: str) -> Optional[Tuple[int, int]]:
+    """Signed-integer (min, max) for a standard trace-header field, derived
+    from its byte width (2 -> int16, 4 -> int32) per the SEG-Y rev1 spec.
+    Returns ``None`` if *field_name* isn't a recognised field — callers
+    should treat that as "refuse to write", not "anything goes"."""
+    width = _TRACE_FIELD_WIDTHS.get(field_name)
+    if width == 2:
+        return (-32768, 32767)
+    if width == 4:
+        return (-2_147_483_648, 2_147_483_647)
+    return None
+
+
+def patch_trace_header_field(
+    path: str,
+    field_name: str,
+    values: np.ndarray,
+    progress: Optional[ProgressCallback] = None,
+) -> tuple:
+    """Bulk-write *values* into a single named trace-header field, in-place.
+
+    Safety contract (defense in depth — callers SHOULD validate first, but
+    this is the function that actually touches the disk, so it validates
+    again regardless):
+      * *field_name* must be a recognised, fixed-width SEG-Y trace-header
+        field (see :func:`trace_field_int_range`) — unknown fields are
+        refused.
+      * *values* must be an integer-dtype array — floats are refused, even
+        if numerically whole, since the on-disk field is always integer.
+      * Every value must fit the field's byte width (int16 or int32) —
+        anything that would overflow/wrap on write is refused.
+      * The array length must exactly match the file's trace count —
+        otherwise headers would silently misalign.
+
+    Writes use ``header[i].update({field: value})`` per trace, which patches
+    ONLY that field's bytes — every other byte of every trace header is left
+    untouched. Returns ``(True, "")`` on success or ``(False, error_message)``
+    with NOTHING written on failure.
+    """
+    try:
+        field_enum = getattr(segyio.TraceField, field_name)
+    except AttributeError:
+        return False, f"Unknown trace-header field: {field_name}"
+
+    arr = np.asarray(values)
+    if arr.dtype.kind == "f":
+        return False, (
+            f"Refusing to write floating-point values into integer field "
+            f"'{field_name}'."
+        )
+    if arr.dtype.kind not in "iub":
+        return False, f"Unsupported value dtype for '{field_name}': {arr.dtype}"
+
+    int_range = trace_field_int_range(field_name)
+    if int_range is None:
+        return False, f"'{field_name}' has no recognised fixed-width slot — refusing to write."
+    lo, hi = int_range
+    if arr.size and (int(arr.min()) < lo or int(arr.max()) > hi):
+        return False, (
+            f"Value range [{int(arr.min())}, {int(arr.max())}] overflows "
+            f"'{field_name}' (valid range [{lo}, {hi}]) — refusing to write."
+        )
+
+    try:
+        with segyio.open(path, mode='r+', ignore_geometry=True) as f:
+            n = f.tracecount
+            if arr.shape[0] != n:
+                return False, (
+                    f"Value count ({arr.shape[0]}) does not match trace count "
+                    f"({n}) — refusing to write (would misalign headers)."
+                )
+            for i in range(n):
+                if progress is not None and (i % 256 == 0):
+                    progress(i / max(1, n), "patching trace headers")
+                f.header[i].update({field_enum: int(arr[i])})
+            f.flush()
+        return True, ""
+    except Exception as exc:
+        _LOG.error("patch_trace_header_field failed for %s/%s: %s",
+                   path, field_name, exc)
+        return False, str(exc)
 
 
 # ── Reprojection helpers ────────────────────────────────────────────────────────

@@ -30,7 +30,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QRectF, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont, QPainterPath
+from PyQt6.QtGui import QAction, QFont, QPainterPath
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from ..i18n import language_manager
@@ -68,6 +68,28 @@ class SeismicView(QWidget):
     # distance axis). Drives the Header Inspector's row selection.
     trace_clicked = pyqtSignal(int)
 
+    # Emitted by the right-click "Add Anomaly to Map" menu action, carrying the
+    # trace index under the cursor at the time of the right-click. Drives the
+    # "Anomaly Waypoint" cross-module feature: when Link Views is active, the
+    # tab adds a POI marker to the map at this trace. Deliberately an EXPLICIT
+    # menu action rather than a double-click — a double-click is too easy to
+    # trigger by accident while zooming/measuring.
+    add_anomaly_requested = pyqtSignal(int)
+
+    # Emitted on EVERY mouse move over the section (no debounce — mirrors the
+    # ruler's own live readout), carrying the trace index under the cursor.
+    # Only consumed when Link Views is active; drives the map's live
+    # "Navigation Marker". Cheap: same searchsorted lookup as a click.
+    cursor_trace_changed = pyqtSignal(int)
+
+    # Emitted while the user DRAGS the A/B Compare divider (the wiper),
+    # carrying its new X position (km). The PreviewController recomposes the
+    # raw|processed split from CACHED arrays — no DSP pipeline rerun — so the
+    # wipe is fluid. sigDragged fires only on user drag, never on the
+    # controller's own programmatic setPos (pan/zoom), so there's no feedback
+    # loop. See update_ab / _on_ab_divider_dragged.
+    ab_split_changed = pyqtSignal(float)
+
     # Viewport-settle debounce: DSP recompute fires this long after the LAST
     # pan/zoom event, so dragging never triggers a pipeline run mid-gesture.
     SETTLE_MS = 300
@@ -86,7 +108,12 @@ class SeismicView(QWidget):
         self.glw = pg.GraphicsLayoutWidget()
         lay.addWidget(self.glw)
         self.plot = self.glw.addPlot(row=0, col=0)
-        self.plot.setMenuEnabled(False)   # suppress PyQtGraph's default ViewBox menu
+        # Drop PlotItem's own "Plot Options" submenu (grid/log-scale clutter not
+        # relevant here) but KEEP the ViewBox's own menu (View All / Mouse Mode /
+        # Export...) — the Measure / Hide Ruler actions below are injected into
+        # that same ViewBox menu, so right-click still offers pyqtgraph's normal
+        # zoom/export entries alongside them.
+        self.plot.setMenuEnabled(False, enableViewBoxMenu=True)
         self.plot.invertY(True)  # time downward
         self.img = pg.ImageItem(autoDownsample=True)
         self.plot.addItem(self.img)
@@ -110,11 +137,28 @@ class SeismicView(QWidget):
         self._boundary_lines: List[pg.InfiniteLine] = []  # toggled live
         self._boundaries_visible: bool = True
 
+        # A/B Compare overlay: a vertical divider + "A (raw)" / "B (filtered)"
+        # labels drawn over the raw|processed composite raster (the controller
+        # composites the image; this view only draws the marker). Lazily
+        # created on first activation, then shown/hidden — see update_ab.
+        self._ab_divider = None
+        self._ab_label_a = None
+        self._ab_label_b = None
+
         # Full per-trace distance array (km) of the active profile/chain, set by
         # the controller. The ViewBox X-range is resolved to absolute trace
         # indices by masking THIS array directly (plateau-proof; see
         # _emit_visible_traces). None until a source is shown.
         self._dist_km: Optional[np.ndarray] = None
+
+        # Interactive ruler (Measure tool): a pg.LineSegmentROI with two
+        # free-dragging handles, plus a pg.TextItem that tracks its midpoint
+        # showing the live ΔX/ΔT readout. Both are None while inactive (see
+        # _set_ruler_active) so an idle ruler holds no scene items. Activated
+        # via the ViewBox right-click menu (self._measure_action /
+        # self._hide_ruler_action below), not a toolbar button.
+        self._ruler_roi: Optional[pg.LineSegmentROI] = None
+        self._ruler_label: Optional[pg.TextItem] = None
 
         # Display buffer state (set by show_image; used by _on_range_changed).
         self._arr: Optional[np.ndarray] = None   # (rows, cols) float32
@@ -124,12 +168,15 @@ class SeismicView(QWidget):
         self._vmax: float = 1.0
         self._vmin: float = 0.0                  # 0 (sequential) or −vmax (diverging)
         self._cmap_name: str = "viridis"
-        # Cached wiggle pen/brush — rebuilt only when color changes (always black by
-        # default, so these hit every frame after the first construction).
+        # Cached wiggle pen/brush — rebuilt only when color changes. Color is
+        # dynamic by default (see _contrast_color): black/white chosen to
+        # maximise contrast against whatever's showing underneath. An explicit
+        # update_wiggle(color=...) pins it until the next update_wiggle call.
         self._wiggle_pen = None
         self._wiggle_pen_col: str = ""
         self._wiggle_brush = None
         self._wiggle_brush_col: str = ""
+        self._wiggle_color_pinned: bool = False
         self._rect: tuple = (0.0, 1.0, 0.0, 1.0)   # (dist0, dist1, t0, t1)
         self._aspect: Optional[float] = None
         self._last_zoom_key: Optional[tuple] = None  # (c0, c1, stride) dedup
@@ -156,10 +203,51 @@ class SeismicView(QWidget):
         self._settle_timer.setInterval(self.SETTLE_MS)
         self._settle_timer.timeout.connect(self.view_range_changed.emit)
 
+        # Cross-module sync (Link Views) state: set by the owning tab whenever
+        # the "Link Views" toggle changes (see set_link_views_enabled). Drives
+        # whether the live hover marker/anomaly menu action are meaningful —
+        # the signals themselves still fire either way; the TAB is what
+        # actually no-ops while unchecked (same split as trace_clicked).
+        self._link_views_enabled: bool = False
+        self._last_hover_idx: Optional[int] = None
+
         # Connect dynamic-zoom handler.
         self.plot.getViewBox().sigRangeChanged.connect(self._on_range_changed)
         # Single-click (non-drag) → emit the trace index under the cursor.
         self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
+        # Live hover → cursor_trace_changed (cross-module navigation cursor).
+        self.plot.scene().sigMouseMoved.connect(self._on_scene_hover)
+
+        # ── Ruler actions, replacing the ViewBox's own right-click menu
+        # entirely (industry-standard "right-click to measure", no toolbar
+        # button). pyqtgraph's stock entries (View All / X axis / Y axis /
+        # Mouse Mode) are pure workspace clutter for this interpretation view,
+        # so the menu is stripped down to ONLY Measure / Hide Ruler. We keep
+        # the existing ViewBoxMenu INSTANCE (just empty it with .clear())
+        # rather than swapping in a plain QMenu, because ViewBox internals
+        # call menu.setViewList(...) whenever any ViewBox in the app is
+        # registered/unregistered (see ViewBox.updateViewLists) — a plain
+        # QMenu lacks that method and would crash the first time some other
+        # tab's plot is created. clear() leaves that method intact while
+        # removing every default action. ──────────────────────────────────
+        vb = self.plot.getViewBox()
+        self._measure_action = QAction(self)
+        self._measure_action.triggered.connect(lambda: self._set_ruler_active(True))
+        self._hide_ruler_action = QAction(self)
+        self._hide_ruler_action.triggered.connect(lambda: self._set_ruler_active(False))
+        # "Add Anomaly to Map" (Part 1): an EXPLICIT menu action rather than a
+        # double-click — see add_anomaly_requested's docstring. Uses the last
+        # hovered trace (set on every mouse move, same index resolution as a
+        # click) as "the trace under the cursor" at the moment of right-click.
+        self._anomaly_action = QAction(self)
+        self._anomaly_action.triggered.connect(self._on_add_anomaly_triggered)
+        vb.menu.clear()
+        vb.menu.addAction(self._measure_action)
+        vb.menu.addAction(self._hide_ruler_action)
+        vb.menu.addSeparator()
+        vb.menu.addAction(self._anomaly_action)
+        # Grey out "Hide Ruler"/"Add Anomaly" when there's nothing to act on.
+        vb.menu.aboutToShow.connect(self._update_ruler_menu_state)
 
         self._restyle()
         self._retranslate()
@@ -221,7 +309,16 @@ class SeismicView(QWidget):
         if aspect and x_ext > 0 and y_ext > 0:
             vb.setAspectLocked(True, ratio=aspect * y_ext / x_ext)
             lo_t, hi_t = (t0, t1) if t1 >= t0 else (t1, t0)
-            vb.setYRange(lo_t, hi_t, padding=0)   # anchor time; X follows the lock
+            vb.setYRange(lo_t, hi_t, padding=0)   # anchor time; X WIDTH follows the lock
+            # The lock derives X's width from Y + the widget's pixel aspect, but
+            # never recenters X's pan position — so loading a brand-new source
+            # (a different distance domain) would otherwise stay parked over the
+            # PREVIOUS file's old window. Recenter X on the new data's midpoint;
+            # passing only xRange (no yRange) leaves the just-set Y range intact.
+            (cur_x0, cur_x1), _ = vb.viewRange()
+            half_width = (cur_x1 - cur_x0) / 2.0
+            x_center = (d0 + d1) / 2.0
+            vb.setXRange(x_center - half_width, x_center + half_width, padding=0)
         else:
             vb.setAspectLocked(False)
             self.plot.autoRange()
@@ -246,6 +343,12 @@ class SeismicView(QWidget):
         """Return ((x0_km, x1_km), (y0_ms, y1_ms)) of the current ViewBox."""
         (x0, x1), (y0, y1) = self.plot.getViewBox().viewRange()
         return (float(x0), float(x1)), (float(y0), float(y1))
+
+    def current_levels(self) -> tuple:
+        """Return (vmin, vmax) currently applied to the live image's colormap —
+        the SAME amplitude bounds an HQ/Matplotlib render must reuse verbatim to
+        avoid a clipping mismatch with what's on screen."""
+        return self._vmin, self._vmax
 
     # ── Ephemeral HQ render overlay ──────────────────────────────────────────
 
@@ -298,7 +401,8 @@ class SeismicView(QWidget):
                       xs_va: Optional[np.ndarray] = None,
                       ys_va: Optional[np.ndarray] = None, *,
                       show_raster: bool = True, va_fill: bool = True,
-                      color=None) -> None:
+                      show_line: bool = True,
+                      color: Optional[str] = None) -> None:
         """Draw the batched wiggle line (``xs``/``ys``) and, when ``va_fill`` and
         ``xs_va``/``ys_va`` are given, the variable-area fill (one batched filled
         path), then set the raster base layer's visibility.
@@ -307,14 +411,28 @@ class SeismicView(QWidget):
         Wiggle); False hides it (Wiggle Only). The raster is only HIDDEN, never
         cleared, so a later transition re-shows it instantly (flicker-free).
 
-        Wiggle lines + variable-area fill render in BLACK by default (classic
-        seismic look); pass ``color`` to override."""
-        col = color or "#000000"
+        ``show_line`` and ``va_fill`` are independent: either the wiggle line
+        or the VA fill can be hidden while the other stays fully visible — the
+        line is a separate ``PlotCurveItem`` from the VA fill's
+        ``QGraphicsPathItem``, so toggling one's visibility never touches the
+        other's geometry or paint state.
 
-        # Rebuild pen/brush only when the color changes (always black by default,
-        # so these objects are constructed once and reused on every subsequent frame).
-        # Flags are captured BEFORE updating so the item-level setPen guard below
-        # can still branch on whether the pen actually changed this frame.
+        Wiggle line + VA fill render in a dynamically-chosen black/white for
+        maximum contrast against whatever's showing underneath — the active
+        colormap if the raster is visible, else the theme's panel background
+        (see ``_contrast_color``). Pass ``color`` to pin an explicit override;
+        it stays pinned (ignoring theme/colormap changes) until the next
+        ``update_wiggle`` call, including one with ``color=None``."""
+        self._wiggle_color_pinned = color is not None
+        # Apply show_raster BEFORE picking the color: _contrast_color reads
+        # the raster's CURRENT visibility to decide what it's contrasting against.
+        self.img.setVisible(bool(show_raster))
+        col = color if color is not None else self._contrast_color()
+
+        # Rebuild pen/brush only when the color changes (so these objects are
+        # constructed once and reused on every subsequent frame with the same
+        # color). Flags are captured BEFORE updating so the item-level setPen
+        # guard below can still branch on whether the pen actually changed.
         pen_changed   = col != self._wiggle_pen_col
         brush_changed = col != self._wiggle_brush_col
         if pen_changed:
@@ -331,13 +449,24 @@ class SeismicView(QWidget):
                                        np.asarray(ys_va, dtype=float),
                                        connect="finite")
                 if self._va_item is None:
-                    from PyQt6.QtWidgets import QGraphicsItem, QGraphicsPathItem
+                    from PyQt6.QtWidgets import QGraphicsPathItem
                     self._va_item = QGraphicsPathItem()
                     self._va_item.setPen(pg.mkPen(None))
                     self._va_item.setZValue(15)        # above raster, below line
-                    # Cache the rasterized path as a device-space pixmap so pan
-                    # gestures blit it instead of re-stroking millions of points.
-                    self._va_item.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+                    # NO cache mode (default). DeviceCoordinateCache was tried
+                    # here to blit a rasterized pixmap on pan instead of
+                    # re-filling the path, but it caches the path's footprint
+                    # in DEVICE pixels — when the ViewBox applies a fresh
+                    # X/Y transform (zoom), Qt must regenerate that pixmap from
+                    # scratch anyway, and during/just after an anisotropic
+                    # (non-uniform X vs Y) zoom the regenerated cache visibly
+                    # lagged the sibling wiggle line (a PlotCurveItem, which
+                    # has no cache and always re-strokes in true vector data
+                    # coordinates every frame) by a frame or more — the fill
+                    # would detach from the line until the next repaint. The
+                    # VA path is already capped at VA_MAX_ROWS, so re-filling
+                    # it every frame in plain vector mode is cheap, and it
+                    # keeps the fill pixel-exact with the line at all times.
                     self.plot.getViewBox().addItem(self._va_item)
                 self._va_item.setBrush(self._wiggle_brush)
                 self._va_item.setPath(path)
@@ -357,8 +486,83 @@ class SeismicView(QWidget):
         elif pen_changed:
             self._wiggle_item.setPen(self._wiggle_pen)
         self._wiggle_item.setData(xs, ys)
-        self._wiggle_item.setVisible(True)
-        self.img.setVisible(bool(show_raster))
+        self._wiggle_item.setVisible(bool(show_line))
+
+    def set_wiggle_line_visible(self, visible: bool) -> None:
+        """Show/hide the wiggle line only, independent of the VA fill and the
+        raster — used by the geometry-unchanged fast path (only the toggle
+        changed, not the underlying trace data)."""
+        if self._wiggle_item is not None:
+            self._wiggle_item.setVisible(bool(visible))
+
+    def set_raster_visible(self, visible: bool) -> None:
+        """Show/hide the raster base layer without touching wiggle geometry.
+
+        Used by the PreviewController's geometry-unchanged fast path (only
+        the colormap/show_raster toggle changed, not the wiggle shape itself)
+        — ``update_wiggle`` handles its own ``show_raster`` directly since it
+        already recomputes color on every call. Refreshes the dynamic wiggle/
+        VA contrast color when the visibility actually flips, since what's
+        showing underneath (colormap vs. bare theme background) just changed."""
+        visible = bool(visible)
+        changed = self.img.isVisible() != visible
+        self.img.setVisible(visible)
+        if changed:
+            self._refresh_dynamic_color()
+
+    def _contrast_color(self) -> str:
+        """Black or white — whichever maximises contrast against whatever is
+        currently showing underneath the wiggle line + VA fill: the perceived
+        brightness of the active colormap's LUT when the raster is visible,
+        otherwise the current theme's panel background color."""
+        if self.img.isVisible() and self._lut is not None and self._lut.size:
+            lut = self._lut.astype(np.float64)
+            # A flat mean over all 256 rows is invariant to "Invert Colors"
+            # (same palette, just reordered) and would never react to it.
+            # Weight the low-amplitude end (row 0 = vmin) most heavily: most
+            # of a seismic section sits near the quiet/background amplitude,
+            # so that's the color the wiggle/VA actually overlays most of the
+            # time — and this weighting correctly flips with the LUT's order.
+            n = lut.shape[0]
+            weights = np.linspace(1.0, 0.0, n)
+            weights /= weights.sum()
+            lum = 0.299 * lut[:, 0] + 0.587 * lut[:, 1] + 0.114 * lut[:, 2]
+            avg_lum = float(np.dot(weights, lum) / 255.0)
+        else:
+            avg_lum = self._hex_luminance(theme.color("panel"))
+        return "#000000" if avg_lum > 0.5 else "#ffffff"
+
+    @staticmethod
+    def _rgb_luminance(r: float, g: float, b: float) -> float:
+        """Perceived (ITU-R BT.601) luminance of an 0..255 RGB triple, 0..1."""
+        return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+
+    @classmethod
+    def _hex_luminance(cls, hex_color: str) -> float:
+        h = hex_color.lstrip("#")
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+        return cls._rgb_luminance(r, g, b)
+
+    def _refresh_dynamic_color(self) -> None:
+        """Recompute and re-apply the wiggle/VA contrast color on the existing
+        items with no geometry change. Called on theme switch, colormap
+        switch, or a raster-visibility toggle that bypassed update_wiggle.
+        No-op while a color is pinned via ``update_wiggle(color=...)``."""
+        if self._wiggle_color_pinned:
+            return
+        col = self._contrast_color()
+        pen_changed   = col != self._wiggle_pen_col
+        brush_changed = col != self._wiggle_brush_col
+        if pen_changed:
+            self._wiggle_pen     = pg.mkPen(col, width=1)
+            self._wiggle_pen_col = col
+            if self._wiggle_item is not None:
+                self._wiggle_item.setPen(self._wiggle_pen)
+        if brush_changed:
+            self._wiggle_brush     = pg.mkBrush(col)
+            self._wiggle_brush_col = col
+            if self._va_item is not None:
+                self._va_item.setBrush(self._wiggle_brush)
 
     def disable_wiggle(self) -> None:
         """Hide the wiggle + VA fill and ensure the raster base is visible — the
@@ -382,22 +586,116 @@ class SeismicView(QWidget):
         half = (x1 - x0) / 2.0
         vb.setXRange(km - half, km + half, padding=0)
 
+    # ── Interactive ruler (Measure tool) ──────────────────────────────────────
+
+    def _update_ruler_menu_state(self) -> None:
+        """Grey out 'Hide Ruler' when no ruler is active, and 'Add Anomaly to
+        Map' when Link Views is off or there's no trace under the cursor
+        (menu aboutToShow)."""
+        self._hide_ruler_action.setEnabled(self._ruler_roi is not None)
+        self._anomaly_action.setEnabled(
+            self._link_views_enabled and self._last_hover_idx is not None)
+
+    def _set_ruler_active(self, active: bool) -> None:
+        """Create or fully tear down the ruler ROI + readout label.
+
+        Driven by the ViewBox right-click menu's 'Measure' / 'Hide Ruler'
+        actions (see __init__). The ViewBox's X axis is already real distance
+        (km) and its Y axis is already real time (ms) — see module docstring /
+        show_image — so the two handle positions can be read straight off the
+        ROI with no extra trace-index/sample-index lookup. Tearing down on
+        deactivation (rather than just hiding) frees the ROI's scene items
+        immediately. 'Measure' on an already-active ruler replaces it with a
+        fresh one centred on the current view."""
+        if active:
+            if self._ruler_roi is not None:
+                self._set_ruler_active(False)
+            (x0, x1), (y0, y1) = self.plot.getViewBox().viewRange()
+            cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            half_x = (x1 - x0) * 0.125
+            p1, p2 = (cx - half_x, cy), (cx + half_x, cy)
+            pen = pg.mkPen(theme.color("highlight"), width=2)
+            self._ruler_roi = pg.LineSegmentROI([p1, p2], pen=pen)
+            self.plot.addItem(self._ruler_roi)
+            self._ruler_label = pg.TextItem(
+                anchor=(0.5, 1.0), color=theme.color("highlight"))
+            self.plot.addItem(self._ruler_label)
+            self._ruler_roi.sigRegionChanged.connect(self._update_ruler_label)
+            self._update_ruler_label()
+        else:
+            if self._ruler_roi is not None:
+                self.plot.removeItem(self._ruler_roi)
+                self._ruler_roi.deleteLater()
+                self._ruler_roi = None
+            if self._ruler_label is not None:
+                self.plot.removeItem(self._ruler_label)
+                self._ruler_label.deleteLater()
+                self._ruler_label = None
+
+    def _update_ruler_label(self, *_) -> None:
+        """Recompute ΔX (m) / ΔT (ms) from the ROI's two handles and move the
+        label to their midpoint. Reads handle positions via the scene (the
+        same mapSceneToView idiom as _on_scene_click) so the result is
+        correct regardless of the ROI's own local coordinate frame."""
+        roi, label = self._ruler_roi, self._ruler_label
+        if roi is None or label is None:
+            return
+        vb = self.plot.getViewBox()
+        (_, scene_p1), (_, scene_p2) = roi.getSceneHandlePositions()
+        p1 = vb.mapSceneToView(scene_p1)
+        p2 = vb.mapSceneToView(scene_p2)
+        dx_m = abs(p2.x() - p1.x()) * 1000.0   # km → m
+        dt_ms = abs(p2.y() - p1.y())           # already ms
+        label.setText(f"ΔX: {dx_m:,.1f} m | ΔT: {dt_ms:,.1f} ms")
+        label.setPos((p1.x() + p2.x()) / 2.0, (p1.y() + p2.y()) / 2.0)
+
     def _on_scene_click(self, ev) -> None:
-        """Map a single left-click to the trace index under the cursor and emit
-        it. pyqtgraph fires sigMouseClicked only for clicks (drags pan the view),
-        so this never interferes with panning."""
-        dist = self._dist_km
-        if dist is None or dist.size < 1:
+        """Map a single left-click to the trace index under the cursor and
+        emit it. pyqtgraph fires sigMouseClicked only for clicks (drags pan
+        the view), so this never interferes with panning."""
+        idx = self._index_at_scene_pos(ev.scenePos())
+        if idx is None:
             return
         try:
             if ev.button() != Qt.MouseButton.LeftButton:
                 return
-            x = float(self.plot.getViewBox().mapSceneToView(ev.scenePos()).x())
-        except (AttributeError, TypeError):
+        except AttributeError:
             return
-        idx = int(np.searchsorted(dist, x, side="left"))
-        idx = max(0, min(idx, dist.size - 1))
         self.trace_clicked.emit(idx)
+
+    def set_link_views_enabled(self, enabled: bool) -> None:
+        """Called by the owning tab whenever the "Link Views" toggle changes
+        (see _base.py). Only gates the "Add Anomaly to Map" menu action's
+        enabled state — the hover/click signals themselves always fire; the
+        tab is what actually no-ops them while unchecked."""
+        self._link_views_enabled = bool(enabled)
+
+    def _on_add_anomaly_triggered(self) -> None:
+        if self._last_hover_idx is not None:
+            self.add_anomaly_requested.emit(self._last_hover_idx)
+
+    def _on_scene_hover(self, scene_pos) -> None:
+        """Live hover → cursor_trace_changed. Fires on every mouse move over
+        the scene; cheap (one searchsorted call), mirrors the ruler's own
+        live-readout idiom. Also remembers the index for "Add Anomaly to
+        Map" (the right-click menu has no cursor position of its own)."""
+        idx = self._index_at_scene_pos(scene_pos)
+        self._last_hover_idx = idx
+        if idx is not None:
+            self.cursor_trace_changed.emit(idx)
+
+    def _index_at_scene_pos(self, scene_pos) -> Optional[int]:
+        """Shared scene-position → absolute trace index resolution, used by
+        both click and hover handlers."""
+        dist = self._dist_km
+        if dist is None or dist.size < 1:
+            return None
+        try:
+            x = float(self.plot.getViewBox().mapSceneToView(scene_pos).x())
+        except (AttributeError, TypeError):
+            return None
+        idx = int(np.searchsorted(dist, x, side="left"))
+        return max(0, min(idx, dist.size - 1))
 
     def set_colormap(self, cmap_name: str, vmax: float, vmin: float = 0.0) -> None:
         """Set the LUT + colorbar for preview updates (cheap; no image reset).
@@ -411,6 +709,7 @@ class SeismicView(QWidget):
         if cmap_changed:
             self._lut = self._build_lut()
             self._lut_dirty = True   # schedule GPU upload on next show_preview
+            self._refresh_dynamic_color()  # new colormap → re-check wiggle contrast
         if self._cbar is None:
             self._cbar = pg.ColorBarItem(values=(self._vmin, self._vmax),
                                          colorMap=self._colormap(),
@@ -454,6 +753,74 @@ class SeismicView(QWidget):
                      fixes: Sequence[FixMark] = ()) -> None:
         """Public hook so the controller can (re)draw FIX/boundary lines."""
         self._draw_overlays(boundaries, fixes)
+
+    def update_ab(self, active: bool, split_km: float = 0.0,
+                  t_top: float = 0.0, t_bot: float = 0.0,
+                  x0: float = 0.0, x1: float = 0.0) -> None:
+        """Draw / hide the A/B Compare divider (the draggable wiper) over the
+        composite raster.
+
+        The controller has already spliced raw|processed into the shown image;
+        this only marks the boundary at ``split_km`` with a vertical DRAGGABLE
+        line and the "A (raw)" / "B (filtered)" captions, and clamps the line
+        to the visible window [x0, x1]. Lazily creates the items the first
+        time A/B is engaged, then toggles their visibility. Dragging the line
+        emits :pyattr:`ab_split_changed`; the controller recomposes the split
+        from cached arrays (no DSP rerun)."""
+        if not active:
+            for it in (self._ab_divider, self._ab_label_a, self._ab_label_b):
+                if it is not None:
+                    it.setVisible(False)
+            return
+
+        if self._ab_divider is None:
+            self._ab_divider = pg.InfiniteLine(
+                angle=90, movable=True,        # ← the user can drag this wiper
+                pen=pg.mkPen(theme.color("highlight"), width=2,
+                             style=Qt.PenStyle.DashLine),
+                hoverPen=pg.mkPen(theme.color("highlight"), width=3))
+            self._ab_divider.setZValue(70)
+            self._ab_divider.setCursor(Qt.CursorShape.SplitHCursor)
+            # sigDragged fires ONLY for a user drag (not the programmatic
+            # setPos below), so this can't feed back into the controller's
+            # pan/zoom repositioning.
+            self._ab_divider.sigDragged.connect(self._on_ab_divider_dragged)
+            self.plot.addItem(self._ab_divider, ignoreBounds=True)
+            self._ab_label_a = pg.TextItem(anchor=(1.0, 0.0),
+                                           color=theme.color("highlight"))
+            self._ab_label_b = pg.TextItem(anchor=(0.0, 0.0),
+                                           color=theme.color("highlight"))
+            for lb in (self._ab_label_a, self._ab_label_b):
+                lb.setZValue(71)
+                self.plot.addItem(lb, ignoreBounds=True)
+
+        # Clamp the wiper to the visible window so it can't be dragged into the
+        # axis margins where there is no data to reveal.
+        if x1 > x0:
+            self._ab_divider.setBounds((float(x0), float(x1)))
+        self._ab_label_top = min(float(t_top), float(t_bot))   # cached for drag
+        self._ab_divider.setPos(float(split_km))   # programmatic → no sigDragged
+        self._ab_divider.setVisible(True)
+        self._ab_label_a.setText(self.tr("A (raw)"))
+        self._ab_label_b.setText(self.tr("B (filtered)"))
+        self._position_ab_labels(float(split_km))
+        self._ab_label_a.setVisible(True)
+        self._ab_label_b.setVisible(True)
+
+    def _position_ab_labels(self, split_km: float) -> None:
+        """Pin the A/B captions to either side of the divider at the top."""
+        y_top = getattr(self, "_ab_label_top", 0.0)
+        if self._ab_label_a is not None:
+            self._ab_label_a.setPos(split_km, y_top)
+        if self._ab_label_b is not None:
+            self._ab_label_b.setPos(split_km, y_top)
+
+    def _on_ab_divider_dragged(self, line) -> None:
+        """User dragged the wiper → move the captions with it and ask the
+        controller to recompose the raw|processed split at the new position."""
+        x = float(line.value())
+        self._position_ab_labels(x)
+        self.ab_split_changed.emit(x)
 
     def set_boundaries_visible(self, visible: bool) -> None:
         """Show/hide the red file-seam boundary lines live (no re-render)."""
@@ -655,9 +1022,24 @@ class SeismicView(QWidget):
             self._update_colorbar()
             if self._arr is not None:
                 self._push_full_image()
+        if self._ruler_roi is not None:
+            self._ruler_roi.setPen(pg.mkPen(theme.color("highlight"), width=2))
+        if self._ruler_label is not None:
+            self._ruler_label.setColor(theme.color("highlight"))
+        if self._ab_divider is not None:
+            self._ab_divider.setPen(pg.mkPen(theme.color("highlight"), width=2,
+                                             style=Qt.PenStyle.DashLine))
+            self._ab_divider.setHoverPen(pg.mkPen(theme.color("highlight"), width=3))
+        for lb in (self._ab_label_a, self._ab_label_b):
+            if lb is not None:
+                lb.setColor(theme.color("highlight"))
+        self._refresh_dynamic_color()  # new panel background → re-check wiggle contrast
 
     def _retranslate(self, *_) -> None:
         self.plot.setLabel("bottom", self.tr("Distance (km)"))
         self.plot.setLabel("left", self.tr("Time (ms)"))
         if self._cbar is not None:
             self._cbar.setLabel("right", self.tr("Amplitude"))
+        self._measure_action.setText(self.tr("Measure"))
+        self._hide_ruler_action.setText(self.tr("Hide Ruler"))
+        self._anomaly_action.setText(self.tr("Add Anomaly to Map"))

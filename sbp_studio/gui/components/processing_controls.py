@@ -125,11 +125,13 @@ class ProcessingControls(QWidget):
         self.amp_sequential.toggled.connect(self._on_amp_sequential)
 
         # ── Render style (directly under the palette) ──
-        # Wiggle (+ Variable Area beside it); Raster below, interactive only when
-        # Wiggle is on. Wiggle traces render in BLACK. Wiggle OFF = pure density.
+        # Show Wiggles / Show Variable Area are INDEPENDENT visibility toggles
+        # (either can be on with the other off); Raster below, interactive only
+        # while one of them is on. Wiggle traces render in BLACK. Both off =
+        # pure density. Both default OFF so the initial preview stays the
+        # historical density/raster-only view.
         self.wiggle_cb = QCheckBox()
         self.va_cb = QCheckBox()
-        self.va_cb.setChecked(True)
         _wig_row = QHBoxLayout()
         _wig_row.setContentsMargins(0, 0, 0, 0)
         _wig_row.setSpacing(8)
@@ -139,9 +141,10 @@ class ProcessingControls(QWidget):
         v.addLayout(_wig_row)
         self.raster_cb = QCheckBox()
         self.raster_cb.setChecked(True)
-        self.raster_cb.setEnabled(False)       # enabled only when Wiggle is on
+        self.raster_cb.setEnabled(False)       # enabled only while the overlay is on
         v.addWidget(self.raster_cb)
-        self.wiggle_cb.toggled.connect(self._on_wiggle_toggled)
+        self.wiggle_cb.toggled.connect(self._on_overlay_toggled)
+        self.va_cb.toggled.connect(self._on_overlay_toggled)
         for _cb in (self.wiggle_cb, self.va_cb, self.raster_cb):
             _cb.toggled.connect(lambda *_: self.display_changed.emit())
 
@@ -229,6 +232,13 @@ class ProcessingControls(QWidget):
         self.show_boundaries.setChecked(True)
         self.show_boundaries.toggled.connect(self.boundaries_toggled.emit)
         v.addWidget(self.show_boundaries)
+        # A/B Compare: split the section into RAW (left) vs the live DSP
+        # pipeline output (right), with a labeled divider, so a filter's effect
+        # is judged side-by-side. A presentation toggle → drives display_changed.
+        self.ab_compare = QCheckBox()
+        self.ab_compare.setChecked(False)
+        self.ab_compare.toggled.connect(lambda *_: self.display_changed.emit())
+        v.addWidget(self.ab_compare)
 
         # ── Scale / proportions — THREE mutually-exclusive export modes ──────
         # The live PyQtGraph preview AND the matplotlib export both follow the
@@ -441,7 +451,12 @@ class ProcessingControls(QWidget):
         not a pipeline node): the controller applies it to the base array before
         the dynamic nodes. ``boundaries`` is the file-seam overlay toggle.
         """
-        wiggle = self.wiggle_cb.isChecked()
+        show_wiggle_line = self.wiggle_cb.isChecked()
+        show_va = self.va_cb.isChecked()
+        # Either toggle alone is enough to enter wiggle-overlay mode — they are
+        # independent visibility switches, not a coupled master/sub pair: with
+        # both off the section falls back to pure density (no overlay at all).
+        overlay_on = show_wiggle_line or show_va
         return dict(
             cmap=self.cmap_cb.currentText(),
             inv_cmap=self.inv_cmap.isChecked(),
@@ -451,15 +466,19 @@ class ProcessingControls(QWidget):
             align=self.align_delays.isChecked(),
             boundaries=self.show_boundaries.isChecked(),
             px_per_trace=DEFAULT_PX_PER_TRACE,
-            # Render style derived from the checkboxes: Wiggle on → 'wiggle' with
-            # optional Variable-Area fill; the raster underlay is user-toggleable
-            # only with Wiggle on (Density always keeps the raster).
-            style="wiggle" if wiggle else "density",
-            va_fill=self.va_cb.isChecked(),
-            show_raster=(self.raster_cb.isChecked() if wiggle else True),
+            # Render style derived from the checkboxes: either Show Wiggles or
+            # Show Variable Area being on enters 'wiggle' mode; the raster
+            # underlay is user-toggleable only while the overlay is active
+            # (Density always keeps the raster).
+            style="wiggle" if overlay_on else "density",
+            va_fill=show_va,
+            show_wiggle_line=show_wiggle_line,
+            show_raster=(self.raster_cb.isChecked() if overlay_on else True),
             # Amplitude range: diverging (−1..1, signed) vs sequential (0..1, |amp|).
             amp_range=("diverging" if self.amp_diverging.isChecked()
                        else "sequential"),
+            # A/B Compare: raw|processed split render (see PreviewController).
+            ab_compare=self.ab_compare.isChecked(),
         )
 
     def align_enabled(self) -> bool:
@@ -522,13 +541,16 @@ class ProcessingControls(QWidget):
         return DEFAULT_PX_PER_TRACE
 
     def render_style(self) -> str:
-        """Section render style: 'density' or 'wiggle' (from the Wiggle checkbox)."""
-        return "wiggle" if self.wiggle_cb.isChecked() else "density"
+        """Section render style: 'wiggle' while either Show Wiggles or Show
+        Variable Area is checked, else 'density'."""
+        return ("wiggle" if (self.wiggle_cb.isChecked() or self.va_cb.isChecked())
+               else "density")
 
     def show_raster(self) -> bool:
-        """Whether the raster base layer is drawn (always True unless Wiggle is on
-        and the Raster checkbox is cleared = 'Wiggle Only')."""
-        return self.raster_cb.isChecked() if self.wiggle_cb.isChecked() else True
+        """Whether the raster base layer is drawn (always True unless the wiggle
+        overlay is active and the Raster checkbox is cleared = 'Wiggle Only')."""
+        overlay_on = self.wiggle_cb.isChecked() or self.va_cb.isChecked()
+        return self.raster_cb.isChecked() if overlay_on else True
 
     def set_dpi_estimate(self, text: str) -> None:
         """Set the live 'resulting export DPI' readout (computed by the tab)."""
@@ -566,10 +588,11 @@ class ProcessingControls(QWidget):
         self.sld_tpc.setValue(int(round(val)))
         self._syncing_tpc = False
 
-    def _on_wiggle_toggled(self, on: bool) -> None:
-        """The Raster checkbox is interactive only when Wiggle is on (Density
-        always keeps the raster). Its checked state is preserved across toggles."""
-        self.raster_cb.setEnabled(bool(on))
+    def _on_overlay_toggled(self, *_args) -> None:
+        """The Raster checkbox is interactive only while the wiggle overlay is
+        active — Show Wiggles or Show Variable Area checked (Density always
+        keeps the raster). Its checked state is preserved across toggles."""
+        self.raster_cb.setEnabled(self.wiggle_cb.isChecked() or self.va_cb.isChecked())
 
     def _on_amp_diverging(self, on: bool) -> None:
         """Diverging (−1..1) and sequential (0..1) amplitude ranges are mutually
@@ -636,17 +659,19 @@ class ProcessingControls(QWidget):
         self.amp_sequential.setText(self.tr("[ 0 to 1 ]"))
         self.amp_sequential.setToolTip(self.tr(
             "Sequential amplitude range (0..1) — colormaps for |amplitude|."))
-        self.wiggle_cb.setText(self.tr("Wiggle"))
+        self.wiggle_cb.setText(self.tr("Show Wiggles"))
         self.wiggle_cb.setToolTip(self.tr(
             "Draw traces as black wiggle lines over the raster (zoom in for more "
-            "native detail)."))
-        self.va_cb.setText(self.tr("Variable area"))
+            "native detail). Independent of Show Variable Area — either can be "
+            "on while the other is off."))
+        self.va_cb.setText(self.tr("Show Variable Area"))
         self.va_cb.setToolTip(self.tr(
-            "Fill the positive lobes of each wiggle (classic variable-area look)."))
+            "Fill the positive lobes of each wiggle (classic variable-area look). "
+            "Independent of Show Wiggles — either can be on while the other is off."))
         self.raster_cb.setText(self.tr("Raster"))
         self.raster_cb.setToolTip(self.tr(
-            "Show the colour raster underneath the wiggles (only with Wiggle on; "
-            "off = wiggle only)."))
+            "Show the colour raster underneath the wiggle/variable-area overlay "
+            "(only while one of them is on; off = overlay only)."))
         self.decon.setText(self.tr("Enable deconvolution"))
         self.filt.setText(self.tr("Enable filter"))
         self.tvg.setText(self.tr("Adaptive TVG (compensate α)"))
@@ -656,6 +681,10 @@ class ProcessingControls(QWidget):
         self.align_delays.setText(self.tr("Compensate delays (align groups)"))
         self.show_boundaries.setText(self.tr("Show file boundaries (red lines)"))
         self.show_boundaries.setToolTip(self.tr("Show file boundaries (red lines)"))
+        self.ab_compare.setText(self.tr("A/B Compare"))
+        self.ab_compare.setToolTip(self.tr(
+            "Split the section: raw data on the left, the DSP pipeline output "
+            "on the right, with a labeled divider."))
         self.sec_scale.setText(self.tr("SCALE / PROPORTIONS"))
         self.rb_aspect.setText(self.tr("Lock aspect ratio (W:H)"))
         self.rb_aspect.setToolTip(self.tr(

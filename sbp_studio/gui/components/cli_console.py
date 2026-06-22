@@ -1,10 +1,12 @@
 """
-cli_console.py — Integrated command-line console (frameless top-right overlay).
+cli_console.py — Integrated command-line console (floating, undockable window).
 
 A functional internal terminal: an output log + an input line that parses typed
-commands and prints responses. It is a CHILD overlay widget of the main window
-(not a separate top-level window), so it floats over the top-right corner of the
-content area and is shown/hidden by the menu-bar CLI toggle.
+commands and prints responses. It is a real top-level window (``Qt.WindowType
+.Tool``) loosely tied to the main window (stays on top of it, shown/hidden by
+the menu-bar CLI toggle) but otherwise free — the user can drag it by its title
+bar to anywhere on screen, including outside the main window's bounds. It
+defaults to spawning at the bottom-left corner of the main window on first show.
 
 The command set is intentionally small but real, with a ``register`` hook so core
 batch operations can be wired in later without touching this widget.
@@ -19,8 +21,8 @@ import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QKeyEvent
+from PyQt6.QtCore import QPoint, Qt, pyqtSignal
+from PyQt6.QtGui import QFont, QKeyEvent, QMouseEvent
 from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
     QPushButton, QTextBrowser, QVBoxLayout, QWidget,
@@ -36,9 +38,13 @@ _LOG = get_logger("cli")
 # Dispatched through the SAME argparse logic as `python -m sbp_studio.cli.main`.
 _CORE_COMMANDS = [
     ("info",         "print SEG-Y metadata"),
+    ("check",        "inspect headers + scan for anomalies"),
+    ("patch-header", "patch dt/ns header fields in place (r+)"),
+    ("process",      "run a headless DSP pipeline → new SEG-Y"),
     ("reproject",    "reproject SEG-Y file(s) to a new CRS"),
     ("join-chain",   "reproject + join a chain into one SEG-Y"),
     ("export-image", "export profile/chain as image (PNG/PDF/…)"),
+    ("batch-export", "render many files/dirs into one folder"),
     ("spectrum",     "export the frequency-spectrum figure"),
     ("navline",      "export the navigation track (shp/geojson/csv)"),
     ("fix",          "export FIX-point marks (shp/geojson/csv)"),
@@ -107,7 +113,11 @@ class _CommandInput(QLineEdit):
 
 
 class CliConsole(QWidget):
-    """Frameless, floating command console overlaid on the main window."""
+    """Frameless, undockable floating console — a real top-level window (not
+    clipped to the main window's bounds) that the user can drag anywhere on
+    screen by its title bar. Tied to the main window only via ``Qt.WindowType
+    .Tool`` (stays on top of it, hides/shows together) — there is no docking
+    or snapping back into the main layout."""
 
     # Emitted with the raw command line for any external listener (future hooks).
     command_entered = pyqtSignal(str)
@@ -115,16 +125,19 @@ class CliConsole(QWidget):
     _log_line = pyqtSignal(str)
 
     def __init__(self, window: QWidget) -> None:
-        super().__init__(window)
+        super().__init__(window, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
         self._win = window
         self.setObjectName("cliConsole")
         self.setAutoFillBackground(True)
+        self._drag_pos: Optional[QPoint] = None    # set while the title bar is being dragged
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 6, 8, 8)
         root.setSpacing(4)
 
-        header = QHBoxLayout()
+        self._header_bar = QWidget()
+        header = QHBoxLayout(self._header_bar)
+        header.setContentsMargins(0, 0, 0, 0)
         self._title = QLabel("›_  SBP Studio CLI")     # brand, not translated
         self._title.setObjectName("section")
         header.addWidget(self._title)
@@ -133,7 +146,7 @@ class CliConsole(QWidget):
         self._btn_close.setFixedWidth(24)
         self._btn_close.clicked.connect(self.hide)
         header.addWidget(self._btn_close)
-        root.addLayout(header)
+        root.addWidget(self._header_bar)
 
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
@@ -182,6 +195,27 @@ class CliConsole(QWidget):
 
     def focus_input(self) -> None:
         self.input.setFocus()
+
+    # ── Drag-to-move (frameless top-level window has no native title bar) ──────
+
+    def mousePressEvent(self, ev: QMouseEvent) -> None:
+        if ev.button() == Qt.MouseButton.LeftButton and \
+                self._header_bar.geometry().contains(ev.position().toPoint()):
+            self._drag_pos = ev.globalPosition().toPoint() - self.pos()
+            ev.accept()
+        else:
+            super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev: QMouseEvent) -> None:
+        if self._drag_pos is not None and ev.buttons() & Qt.MouseButton.LeftButton:
+            self.move(ev.globalPosition().toPoint() - self._drag_pos)
+            ev.accept()
+        else:
+            super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev: QMouseEvent) -> None:
+        self._drag_pos = None
+        super().mouseReleaseEvent(ev)
 
     def recall_history(self, step: int) -> None:
         if not self._history:
@@ -337,9 +371,13 @@ class CliConsole(QWidget):
         from ...cli import commands as cli_cmds
 
         dispatch = {
-            "info": cli_cmds.cmd_info, "reproject": cli_cmds.cmd_reproject,
+            "info": cli_cmds.cmd_info, "check": cli_cmds.cmd_check,
+            "patch-header": cli_cmds.cmd_patch_header,
+            "process": cli_cmds.cmd_process,
+            "reproject": cli_cmds.cmd_reproject,
             "join-chain": cli_cmds.cmd_join_chain,
             "export-image": cli_cmds.cmd_export_image,
+            "batch-export": cli_cmds.cmd_batch_export,
             "spectrum": cli_cmds.cmd_spectrum, "navline": cli_cmds.cmd_navline,
             "fix": cli_cmds.cmd_fix, "accel": cli_cmds.cmd_accel,
         }
@@ -416,7 +454,7 @@ class CliConsole(QWidget):
 _GUIDE_FILE = r".\examples\_real_in\ANT26\SGY\20260215115516.seg"
 _GUIDE_OUT = r".\examples\_real_out"
 
-_GUIDE_HTML = f"""
+_GUIDE_HTML_ES = f"""
 <h2>Guía de Comandos — Consola interna de SBP Studio</h2>
 
 <p>La consola interna ejecuta los <b>mismos comandos</b> que la herramienta de
@@ -446,7 +484,11 @@ Escribe el comando y sus argumentos y pulsa <b>Intro</b>.</p>
 <h3>Comandos disponibles</h3>
 <ul>
   <li><code>info</code> — metadatos de un SEG-Y</li>
+  <li><code>check</code> — inspecciona cabeceras (EBCDIC + binarias) y detecta anomalías</li>
+  <li><code>patch-header</code> — corrige <code>dt</code>/<code>ns</code> en la cabecera, in situ (r+)</li>
+  <li><code>process</code> — ejecuta una cadena DSP headless y guarda un nuevo SEG-Y</li>
   <li><code>export-image</code> — exporta el perfil/cadena como imagen (PNG/PDF…)</li>
+  <li><code>batch-export</code> — renderiza varios archivos/carpetas a un directorio</li>
   <li><code>reproject</code> — reproyecta SEG-Y a otro CRS</li>
   <li><code>join-chain</code> — reproyecta y une una cadena en un solo SEG-Y</li>
   <li><code>spectrum</code> — figura del espectro de frecuencias</li>
@@ -473,13 +515,112 @@ cópiala con Ctrl+C). Usan un archivo real de la campaña ANT26:</p>
 (envelope + AGC + alineado + escala física + marcas FIX):</p>
 <pre>export-image {_GUIDE_FILE} --preset envelope --cmap Greys --agc --align --fill-zero --x-scale 2 --ratio 3 --velocity 1500 --x-tick 5 --t-tick 50 --time-ticks 5 --time-fmt full --time-font-size 5.5 --time-align left --fix 5 --fix-color "#cc4444" --fix-bbox-alpha 0.0 --margin-top 20 --margin-bottom 20 --theme print --quality high --format pdf --pdf-page auto --timeit --out {_GUIDE_OUT}\\ANT26_L01.pdf</pre>
 
+<p><b>5 · Diagnóstico de cabeceras</b> — texto EBCDIC, campos binarios y anomalías:</p>
+<pre>check {_GUIDE_FILE}</pre>
+
+<p><b>6 · Corrección de metadatos</b> — fija el intervalo de muestreo a 50 µs
+(se propaga a todas las trazas) y el nº de muestras. <b>Modifica el archivo</b>:</p>
+<pre>patch-header {_GUIDE_FILE} --dt 50 --ns 2048 --dry-run</pre>
+
+<p><b>7 · Cadena DSP headless</b> — banda + blanqueo espectral + AGC, a un nuevo SEG-Y:</p>
+<pre>process {_GUIDE_FILE} {_GUIDE_OUT}\\ANT26_proc.seg --pipeline "bandpass(1000,8000),whiten(1000,8000,300),agc(200)"</pre>
+
+<p><b>8 · Exportación por lotes</b> — todas las líneas de una carpeta a PDF con la
+paleta seismc y exageración vertical fija:</p>
+<pre>batch-export .\\examples\\_real_in\\ANT26\\SGY --format pdf --cmap seismc --x-scale 2 --ve 15 --out {_GUIDE_OUT}</pre>
+
 <p>El procesamiento se ejecuta en segundo plano: la interfaz no se bloquea y el
 progreso y los mensajes aparecen en el área de la consola.</p>
 """
 
+_GUIDE_HTML_EN = f"""
+<h2>Command Guide — SBP Studio internal console</h2>
+
+<p>The internal console runs the <b>same commands</b> as the SBP Studio
+command-line tool, but <b>directly inside the application</b>. Type the
+command and its arguments and press <b>Enter</b>.</p>
+
+<h3>Format</h3>
+<pre>&lt;command&gt; &lt;file(s)&gt; [--option value] [--flag]</pre>
+<ul>
+  <li>You do <b>NOT</b> need the <code>python -m sbp_studio.cli.main</code>
+      prefix. Type the command directly (e.g. <code>export-image</code>).</li>
+  <li>Do <b>NOT</b> use PowerShell line continuations (the <code>`</code>
+      character). Paste the <b>whole command on a single line</b>.</li>
+  <li>Quote values containing special characters, such as a hex colour
+      <code>"#cc4444"</code> or paths with spaces.</li>
+  <li>Windows paths with backslashes are respected as-is.</li>
+  <li><b>Portable relative paths:</b> paths like
+      <code>.\\examples\\…</code> are resolved relative to the
+      <b>application folder</b> (not the <code>Z:\\</code> drive nor the
+      directory the app was launched from). They work the same whether
+      running from source or from a packaged <code>.exe</code>. Use
+      <code>pwd</code> to see the current directory and
+      <code>cd &lt;path&gt;</code> to change it.</li>
+  <li>Use the <b>↑ / ↓</b> arrows to recall previous commands, and
+      <code>help</code> for the full list.</li>
+</ul>
+
+<h3>Available commands</h3>
+<ul>
+  <li><code>info</code> — SEG-Y metadata</li>
+  <li><code>check</code> — inspects headers (EBCDIC + binary) and detects anomalies</li>
+  <li><code>patch-header</code> — fixes <code>dt</code>/<code>ns</code> in the header, in place (r+)</li>
+  <li><code>process</code> — runs a headless DSP chain and saves a new SEG-Y</li>
+  <li><code>export-image</code> — exports the profile/chain as an image (PNG/PDF…)</li>
+  <li><code>batch-export</code> — renders several files/folders to a directory</li>
+  <li><code>reproject</code> — reprojects SEG-Y to another CRS</li>
+  <li><code>join-chain</code> — reprojects and joins a chain into a single SEG-Y</li>
+  <li><code>spectrum</code> — frequency-spectrum figure</li>
+  <li><code>navline</code> — exports the navigation track (shp/geojson/csv)</li>
+  <li><code>fix</code> — exports FIX marks (shp/geojson/csv)</li>
+  <li><code>accel</code> — hardware-acceleration status</li>
+  <li><code>pwd</code> / <code>cd &lt;path&gt;</code> — internal working directory</li>
+</ul>
+
+<h3>Practical Examples</h3>
+<p>Each example is a <b>single line</b> ready to copy and paste (select it and
+copy with Ctrl+C). They use a real file from the ANT26 survey:</p>
+
+<p><b>1 · Quick inspection</b> — headers and basic statistics:</p>
+<pre>info {_GUIDE_FILE}</pre>
+
+<p><b>2 · Track export</b> — extracts the navigation to a Shapefile:</p>
+<pre>navline {_GUIDE_FILE} --format shp --out {_GUIDE_OUT}\\ANT26_track.shp</pre>
+
+<p><b>3 · Reprojection</b> — converts from geographic (WGS84) to UTM 30N:</p>
+<pre>reproject {_GUIDE_FILE} --src epsg:4326 --dst epsg:32630 --out-dir {_GUIDE_OUT}</pre>
+
+<p><b>4 · Processing and Plotting</b> — high-quality PDF export
+(envelope + AGC + aligned + physical scale + FIX marks):</p>
+<pre>export-image {_GUIDE_FILE} --preset envelope --cmap Greys --agc --align --fill-zero --x-scale 2 --ratio 3 --velocity 1500 --x-tick 5 --t-tick 50 --time-ticks 5 --time-fmt full --time-font-size 5.5 --time-align left --fix 5 --fix-color "#cc4444" --fix-bbox-alpha 0.0 --margin-top 20 --margin-bottom 20 --theme print --quality high --format pdf --pdf-page auto --timeit --out {_GUIDE_OUT}\\ANT26_L01.pdf</pre>
+
+<p><b>5 · Header diagnostics</b> — EBCDIC text, binary fields and anomalies:</p>
+<pre>check {_GUIDE_FILE}</pre>
+
+<p><b>6 · Metadata correction</b> — sets the sample interval to 50&nbsp;µs
+(propagated to all traces) and the sample count. <b>Modifies the file</b>:</p>
+<pre>patch-header {_GUIDE_FILE} --dt 50 --ns 2048 --dry-run</pre>
+
+<p><b>7 · Headless DSP chain</b> — bandpass + spectral whitening + AGC, to a new SEG-Y:</p>
+<pre>process {_GUIDE_FILE} {_GUIDE_OUT}\\ANT26_proc.seg --pipeline "bandpass(1000,8000),whiten(1000,8000,300),agc(200)"</pre>
+
+<p><b>8 · Batch export</b> — every line in a folder to PDF with the seismc
+palette and fixed vertical exaggeration:</p>
+<pre>batch-export .\\examples\\_real_in\\ANT26\\SGY --format pdf --cmap seismc --x-scale 2 --ve 15 --out {_GUIDE_OUT}</pre>
+
+<p>Processing runs in the background: the interface never freezes and
+progress/messages appear in the console area.</p>
+"""
+
+
+def _guide_html() -> str:
+    """Pick the CLI Command Guide body for the ACTIVE app language."""
+    return _GUIDE_HTML_ES if language_manager.language == "es" else _GUIDE_HTML_EN
+
 
 class CliGuideDialog(QDialog):
-    """Read-only command-reference dialog (Spanish) for the internal CLI."""
+    """Read-only, language-aware command-reference dialog for the internal CLI."""
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -487,7 +628,7 @@ class CliGuideDialog(QDialog):
         lay = QVBoxLayout(self)
         self.browser = QTextBrowser()
         self.browser.setOpenExternalLinks(True)
-        self.browser.setHtml(_GUIDE_HTML)
+        self._reload()
         lay.addWidget(self.browser)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
@@ -496,5 +637,12 @@ class CliGuideDialog(QDialog):
         self._retranslate()
         language_manager.language_changed.connect(self._retranslate)
 
+    def _reload(self, *_) -> None:
+        """Rebuild the guide body in the ACTIVE language."""
+        self.browser.setHtml(_guide_html())
+
     def _retranslate(self, *_) -> None:
         self.setWindowTitle(self.tr("Command Guide"))
+        # The body was previously a single hardcoded-Spanish literal that this
+        # signal never touched — switching to English left it in Spanish.
+        self._reload()

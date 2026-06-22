@@ -42,7 +42,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from ...core import to_geographic
+from ...core import crs_produces_geographic, to_geographic
 from ._base import HEADERS, MAP, PROFILE, SPECTRUM
 
 
@@ -135,10 +135,19 @@ class ProfileHandler(SourceHandler):
         # already geographic) so projected/UTM files render on the lon/lat
         # basemap. Set BEFORE the preview fit (the fit's render feeds the
         # distance axis → visible_traces_changed → the map highlights it).
-        mx, my = to_geographic(profile.track_lons, profile.track_lats,
-                               getattr(profile, "detected_crs", None))
-        tab._map.set_track(mx, my)
+        crs = getattr(profile, "detected_crs", None)
+        mx, my = to_geographic(profile.track_lons, profile.track_lats, crs)
+        # Authoritative coordinate-unit flag from the ACTUAL CRS (Bug #10): a
+        # known CRS means the track is now WGS84 lon/lat; absent CRS → None →
+        # the map uses its magnitude heuristic.
+        tab._map.set_track(mx, my, is_geographic=crs_produces_geographic(crs))
         tab.preview.set_source(profile)
+        # Engage the aspect lock immediately (same path as touching a scale
+        # control) so the section is NEVER left in free/unlocked aspect mode —
+        # free mode lets a side-panel resize stretch the image, since pyqtgraph
+        # only preserves the data RANGE (not the screen aspect) across resizes
+        # when unlocked.
+        tab._on_scale_changed()
 
     def load_full(self, profile, cancel):
         if getattr(profile, "data", None) is not None:
@@ -178,10 +187,10 @@ class ChainHandler(SourceHandler):
             # already available from the lightweight metadata, so show them now
             # and mark the section/spectrum as loading.
             tab.preview.set_source(None)
-            mx, my = to_geographic(chain.track_lons, chain.track_lats,
-                                   getattr(chain, "detected_crs", None))
+            crs = getattr(chain, "detected_crs", None)
+            mx, my = to_geographic(chain.track_lons, chain.track_lats, crs)
             tab.pages[MAP].set_view(tab._map)
-            tab._map.set_track(mx, my)
+            tab._map.set_track(mx, my, is_geographic=crs_produces_geographic(crs))
             tab.pages[HEADERS].set_view(tab._headers)
             tab._headers.set_source(chain)
             for i in (PROFILE, SPECTRUM):
@@ -198,6 +207,8 @@ class ChainHandler(SourceHandler):
         tab._map.set_track(mx, my)
         tab._headers.set_source(chain)
         tab.preview.set_source(chain)
+        # Engage the aspect lock immediately — see ProfileHandler.on_selected.
+        tab._on_scale_changed()
 
     def load_full(self, chain, cancel):
         # Chains assemble their stitched matrix in place and return self.

@@ -100,8 +100,12 @@ class VisibleWindow:
     sub:    np.ndarray          # (rows, cols) float32 — the decimated haloed bbox
     r0:     int                 # visible-region row start WITHIN ``sub`` (decimated)
     r1:     int                 # visible-region row stop  WITHIN ``sub`` (decimated)
-    c0:     int                 # first trace index in the FULL array
-    c1:     int                 # last+1 trace index in the FULL array
+    cv0:    int                 # visible-region col start WITHIN ``sub`` (decimated)
+    cv1:    int                 # visible-region col stop  WITHIN ``sub`` (decimated)
+    c0:     int                 # first trace index in the FULL array (incl. halo)
+    c1:     int                 # last+1 trace index in the FULL array (incl. halo)
+    c_vis0: int                 # first VISIBLE trace index in the FULL array
+    c_vis1: int                 # last+1 VISIBLE trace index in the FULL array
     s0:     int                 # first sample index in the FULL array (visible, full-res)
     s1:     int                 # last+1 sample index in the FULL array (visible, full-res)
     row_stride: int             # rows decimation factor (1 = none)
@@ -110,8 +114,12 @@ class VisibleWindow:
     token:  tuple               # stable identity of this window (for the cache)
 
     def crop_visible(self, processed: np.ndarray) -> np.ndarray:
-        """Drop the halo rows, returning just the visible region of a processed sub."""
-        return processed[self.r0:self.r1, :]
+        """Drop the halo rows AND columns, returning just the visible region of a
+        processed sub. Cropping columns matters whenever a spatial filter (e.g.
+        the F-K dip filter's ``trace_halo``) widened the window: without this,
+        the extra halo traces — kept only so the filter sees correct edges —
+        would otherwise render on screen past the true ViewBox edge."""
+        return processed[self.r0:self.r1, self.cv0:self.cv1]
 
 
 def extract_visible_window(
@@ -199,8 +207,16 @@ def extract_visible_window(
     r0 = r0_full // row_stride
     r1 = min(sub.shape[0], r0 + max(1, -(-visible_rows_full // row_stride)))  # ceil-div
 
+    # Same ceil-div mapping for the trace-halo (spatial filters, e.g. F-K) so the
+    # halo columns are cropped away exactly like the halo rows above.
+    cv0_full = c_vis0 - c0
+    visible_cols_full = c_vis1 - c_vis0
+    cv0 = cv0_full // col_stride
+    cv1 = min(sub.shape[1], cv0 + max(1, -(-visible_cols_full // col_stride)))  # ceil-div
+
     token = (data_version, c0, c1, sh0, sh1, row_stride, col_stride)
     return VisibleWindow(
-        sub=sub, r0=r0, r1=r1, c0=c0, c1=c1, s0=s_vis0, s1=s_vis1,
+        sub=sub, r0=r0, r1=r1, cv0=cv0, cv1=cv1,
+        c0=c0, c1=c1, c_vis0=c_vis0, c_vis1=c_vis1, s0=s_vis0, s1=s_vis1,
         row_stride=row_stride, col_stride=col_stride,
         effective_dt_us=effective_dt_us, token=token)

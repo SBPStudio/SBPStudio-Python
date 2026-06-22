@@ -120,6 +120,20 @@ class AppState(QObject):
             self.chains_changed.emit()
         return added
 
+    def remove_chain(self, index: int) -> None:
+        if 0 <= index < len(self._chains):
+            del self._chains[index]
+            if self._active_chain_index == index:
+                self.set_active_chain(None)
+            elif self._active_chain_index is not None and self._active_chain_index > index:
+                self._active_chain_index -= 1
+            self.chains_changed.emit()
+
+    def clear_chains(self) -> None:
+        self._chains.clear()
+        self.set_active_chain(None)
+        self.chains_changed.emit()
+
     @property
     def active_chain(self) -> "Optional[ProfileChain]":
         if self._active_chain_index is None:
