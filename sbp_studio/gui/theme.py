@@ -146,6 +146,13 @@ def build_qss(palette: Dict[str, str]) -> str:
         border: 1px solid {c['accent']};
         padding: 2px 4px;
     }}
+    /* Without this, the hardcoded `color` above wins over Qt's native disabled
+       dimming, so a setEnabled(False) spinbox looked IDENTICAL to an active one
+       — no visual feedback for the scale-mode state machine's grey-out. */
+    QSpinBox:disabled, QDoubleSpinBox:disabled {{
+        color: {c['sub']};
+        border-color: {c['accent']};
+    }}
 
     QPushButton {{
         background-color: {c['accent']};

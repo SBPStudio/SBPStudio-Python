@@ -242,7 +242,7 @@ class ProcessingControls(QWidget):
         self.ab_compare.toggled.connect(lambda *_: self.display_changed.emit())
         v.addWidget(self.ab_compare)
 
-        # ── Scale / proportions — THREE mutually-exclusive export modes ──────
+        # ── Scale / proportions — FOUR mutually-exclusive vertical modes ─────
         # The live PyQtGraph preview AND the matplotlib export both follow the
         # selected mode (see _base.SubTabbedTab._on_scale_changed / export). Tight,
         # compact rows: the radio sits right next to its inline value editor.
@@ -260,11 +260,21 @@ class ProcessingControls(QWidget):
             v.addLayout(row)
             return row
 
+        # Mode 0 — Free (fit to window): pyqtgraph's native unlocked, free-aspect
+        # auto-fit, with NO ViewBox aspect lock at all (see SeismicView.set_aspect,
+        # which already treats aspect=None as 'unlocked + autoRange'). THE DEFAULT
+        # mode on construction (i.e. when a fresh file is loaded into a new panel) —
+        # no surprising stretch/squash before the user has chosen a rule. It has no
+        # value controls of its own.
+        self.rb_free = QRadioButton()
+        self.rb_free.setChecked(True)
+        self.scale_group.addButton(self.rb_free, 3)
+        _tight_row((self.rb_free, 1))
+
         # Mode 1 — Lock aspect ratio (constant W:H shape; VE floats with length).
         # Its value is the 'horizontal deformation' set by the slider + spin DIRECTLY
         # underneath it.
         self.rb_aspect = QRadioButton()
-        self.rb_aspect.setChecked(True)
         self.scale_group.addButton(self.rb_aspect, 0)
         _tight_row((self.rb_aspect, 1))
 
@@ -360,6 +370,14 @@ class ProcessingControls(QWidget):
         # width (n_traces / tpc / 2.54) and the live horizontal density; the
         # vertical (time) scale is held constant (decoupled — see figsize_for_scale
         # and SeismicView.set_aspect). Higher = compressed; lower = stretched.
+        #
+        # Performance note: a rigorous VE formula that ties height to this
+        # control's live width was tried and REVERTED — it made VE/hybrid mode
+        # recompute the full vertical geometry on every drag tick, which made
+        # dragging this slider laggy. VE/hybrid deliberately stay decoupled
+        # (fixed GUI_X_SCALE constant, see figsize_for_scale) so this control
+        # stays cheap and instantaneous, at the cost of VE not being perfectly
+        # physically rigorous relative to the chosen trace density.
         self.cap_tpc = QLabel()
         self.cap_tpc.setObjectName("sub")
         v.addWidget(self.cap_tpc)                 # label on its own line, above
@@ -397,14 +415,28 @@ class ProcessingControls(QWidget):
         self.btn_scale_reset.clicked.connect(self.reset_scale_defaults)
         _tight_row((self.btn_scale_reset, 1))
 
-        # Any mode switch or value edit → live preview re-aspect (debounced by the
-        # cheap downstream work) and is read at export time.
-        for rb in (self.rb_aspect, self.rb_ve, self.rb_hybrid):
+        # Any mode switch or value edit → live preview re-aspect immediately.
+        for rb in (self.rb_free, self.rb_aspect, self.rb_ve, self.rb_hybrid):
             rb.toggled.connect(lambda *_: self.scale_changed.emit())
+            # Strict state machine: a mode switch immediately enables ONLY that
+            # mode's own controls and disables (greys out) everyone else's — see
+            # _update_scale_mode_enabled. Fixes the cross-talk where an inactive
+            # mode's slider/spin could still be dragged/edited and silently
+            # mutate the view even though it had no visible effect.
+            rb.toggled.connect(lambda *_: self._update_scale_mode_enabled())
         for sp in (self.sp_ratio, self.sp_ve, self.sp_maxasp):
             sp.valueChanged.connect(lambda *_: self.scale_changed.emit())
-        # traces/cm changes the export width AND the live horizontal density.
+        # The master Trazas/cm control is intentionally DECOUPLED from VE's
+        # height: VE/hybrid use a fixed constant (GUI_X_SCALE), not the live
+        # width, precisely so dragging this slider is cheap and instant — no
+        # vertical-geometry recompute is triggered by it (see figsize_for_scale
+        # in _render.py for the rationale; rigorous-but-expensive VE math tied
+        # to live width was tried and reverted for performance).
         self.sp_tpc.valueChanged.connect(lambda *_: self.scale_changed.emit())
+        # Set the correct INITIAL enabled state (Free is checked by default, so
+        # the other three modes' controls must start disabled, not just on the
+        # first toggle).
+        self._update_scale_mode_enabled()
 
         # ── Action — two side-by-side render buttons (Part 3) ──
         line = QFrame()
@@ -604,9 +636,13 @@ class ProcessingControls(QWidget):
         """The selected scaling mode + its values, consumed by the live preview
         (``effective_aspect``) and the export (``figsize_for_scale``).
 
-        mode ∈ {'aspect','ve','hybrid'}; ratio (mode 1), ve (modes 2/3),
-        max_aspect (mode 3). Mirrors the three finalised CLI export recipes."""
-        if self.rb_ve.isChecked():
+        mode ∈ {'free','aspect','ve','hybrid'}; ratio (mode 'aspect'), ve (modes
+        've'/'hybrid'), max_aspect (mode 'hybrid'). 'free' has no value of its
+        own — it means 'no aspect lock', and the others are reported anyway so
+        the export still has a sane fallback if free's None can't apply."""
+        if self.rb_free.isChecked():
+            mode = "free"
+        elif self.rb_ve.isChecked():
             mode = "ve"
         elif self.rb_hybrid.isChecked():
             mode = "hybrid"
@@ -614,7 +650,8 @@ class ProcessingControls(QWidget):
             mode = "aspect"
         # layout_mode is FORCED to 'decoupled' (the Layout-mode dropdown was
         # removed): traces/cm is strictly horizontal, the vertical scale comes
-        # from VE and never changes with the trace spacing.
+        # from VE and never changes with the trace spacing (kept cheap/instant
+        # — see the performance note on the traces/cm widget above).
         return dict(mode=mode,
                     ratio=float(self.sp_ratio.value()),
                     ve=float(self.sp_ve.value()),
@@ -708,6 +745,28 @@ class ProcessingControls(QWidget):
         self.sld_maxasp.setValue(int(round(val * self._MAXASP_SCALE)))
         self._syncing_maxasp = False
 
+    # ── Scale-mode strict state machine ──────────────────────────────────────
+
+    def _update_scale_mode_enabled(self) -> None:
+        """Enable ONLY the active mode's own controls; grey out (disable) the
+        other modes' sliders/spinboxes so they cannot be dragged/edited or fire
+        a stray view-update while inactive — this is the fix for the reported
+        UI cross-talk. The Hybrid mode shares the VE slider+spin with VE mode
+        (it locks/edits the SAME 'vertical exaggeration' value, then caps the
+        resulting aspect with its own max-aspect control), so VE's controls are
+        enabled for EITHER mode. Free has no controls of its own. The master
+        horizontal-scale control is NOT touched here — it stays enabled in
+        every mode (wired once in __init__, never disabled)."""
+        is_aspect = self.rb_aspect.isChecked()
+        is_ve = self.rb_ve.isChecked()
+        is_hybrid = self.rb_hybrid.isChecked()
+        for w in (self.sld_deform, self.sp_ratio):
+            w.setEnabled(is_aspect)
+        for w in (self.sld_ve, self.sp_ve):
+            w.setEnabled(is_ve or is_hybrid)
+        for w in (self.sld_maxasp, self.sp_maxasp):
+            w.setEnabled(is_hybrid)
+
     def _on_overlay_toggled(self, *_args) -> None:
         """The Raster checkbox is interactive only while the wiggle overlay is
         active — Show Wiggles or Show Variable Area checked (Density always
@@ -729,8 +788,12 @@ class ProcessingControls(QWidget):
             self.amp_diverging.setChecked(True)
 
     def reset_scale_defaults(self) -> None:
-        """Part 3: restore every aspect/scale setting to its default in one click."""
-        self.rb_aspect.setChecked(True)
+        """Part 3: restore every aspect/scale setting to its default in one click.
+
+        Free is the panel's actual default mode now (see __init__); resetting
+        restores it too, alongside every sub-mode's own default value (so
+        switching to Aspect/VE/Hybrid afterwards starts from a known state)."""
+        self.rb_free.setChecked(True)      # also re-enables/disables via toggled
         self.sp_ratio.setValue(3.0)        # syncs the deformation slider too
         self.sp_ve.setValue(67.0)
         self.sp_maxasp.setValue(5.0)
@@ -806,6 +869,10 @@ class ProcessingControls(QWidget):
             "Split the section: raw data on the left, the DSP pipeline output "
             "on the right, with a labeled divider."))
         self.sec_scale.setText(self.tr("SCALE / PROPORTIONS"))
+        self.rb_free.setText(self.tr("Free (Fit to window)"))
+        self.rb_free.setToolTip(self.tr(
+            "No aspect lock — pyqtgraph's native free-fit view, exactly as a "
+            "freshly loaded file looks. The default mode."))
         self.rb_aspect.setText(self.tr("Lock aspect ratio (W:H)"))
         self.rb_aspect.setToolTip(self.tr(
             "Constant figure shape for every line; vertical exaggeration varies "

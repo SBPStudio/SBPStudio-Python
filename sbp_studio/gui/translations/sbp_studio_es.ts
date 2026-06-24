@@ -1511,6 +1511,16 @@ Perímetro: {2}</translation>
         <translation>ESCALA / PROPORCIONES</translation>
     </message>
     <message>
+        <location filename="..\components\processing_controls.py" line="863" />
+        <source>Free (Fit to window)</source>
+        <translation>Libre (Ajustar a ventana)</translation>
+    </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="864" />
+        <source>No aspect lock — pyqtgraph's native free-fit view, exactly as a freshly loaded file looks. The default mode.</source>
+        <translation>Sin bloqueo de relación de aspecto — la vista de ajuste libre nativa de pyqtgraph, igual que al cargar un archivo. El modo predeterminado.</translation>
+    </message>
+    <message>
         <location filename="..\components\processing_controls.py" line="660" />
         <source>Lock aspect ratio (W:H)</source>
         <translation>Fijar relación de aspecto (An:Al)</translation>
@@ -1560,12 +1570,12 @@ Perímetro: {2}</translation>
         <translation>Restablecer ajustes de aspecto</translation>
     </message>
     <message>
-        <location filename="..\components\processing_controls.py" line="680" />
+        <location filename="..\components\processing_controls.py" line="899" />
         <source>Traces / cm (horizontal scale)</source>
         <translation>Trazas / cm (escala horizontal)</translation>
     </message>
     <message>
-        <location filename="..\components\processing_controls.py" line="681" />
+        <location filename="..\components\processing_controls.py" line="900" />
         <source>Horizontal trace spacing: higher = more traces per cm (compressed), lower = stretched. Strictly horizontal — the vertical (time) scale never changes.</source>
         <translation>Espaciado horizontal de trazas: mayor = más trazas por cm (comprimido), menor = estirado. Estrictamente horizontal — la escala vertical (tiempo) nunca cambia.</translation>
     </message>
