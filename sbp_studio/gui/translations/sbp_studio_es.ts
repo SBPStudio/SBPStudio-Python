@@ -165,6 +165,31 @@
         <translation>Eliminación de Picos (Ruido Impulsivo)</translation>
     </message>
     <message>
+        <location filename="..\dsp\node_i18n.py" line="43" />
+        <source>Trace Equalization (RMS Balance)</source>
+        <translation>Ecualización de Trazas (Balance RMS)</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="44" />
+        <source>Trace Mixing (Horizontal Smoothing)</source>
+        <translation>Mezcla de Trazas (Trace Mixing)</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="45" />
+        <source>Median Filter (Edge-Preserving)</source>
+        <translation>Filtro de Mediana (Edge-Preserving)</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="78" />
+        <source>Traces to mix</source>
+        <translation>Trazas a mezclar:</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="79" />
+        <source>Traces to evaluate</source>
+        <translation>Trazas a evaluar:</translation>
+    </message>
+    <message>
         <location filename="..\dsp\node_i18n.py" line="62" />
         <source>Smooth window</source>
         <translation>Ventana de suavizado</translation>
@@ -228,6 +253,92 @@
         <location filename="..\dsp\node_i18n.py" line="74" />
         <source>Window Size</source>
         <translation>Tamaño de ventana</translation>
+    </message>
+</context><context>
+    <name>CRSAdvancedSearchDialog</name>
+    <message>
+        <location filename="..\components\crs_selector.py" line="64" />
+        <source>Search EPSG / CRS</source>
+        <translation>Buscar EPSG / SRC</translation>
+    </message>
+    <message>
+        <location filename="..\components\crs_selector.py" line="71" />
+        <source>Type an EPSG code or name (e.g. '32631' or 'UTM zone 31')…</source>
+        <translation>Escriba un código EPSG o nombre (p. ej. '32631' o 'UTM zone 31')…</translation>
+    </message>
+    <message>
+        <location filename="..\components\crs_selector.py" line="101" />
+        <source>Type to search the full EPSG registry ({0} entries)…</source>
+        <translation>Escriba para buscar en el registro EPSG completo ({0} entradas)…</translation>
+    </message>
+    <message>
+        <location filename="..\components\crs_selector.py" line="108" />
+        <source>{0} match(es) (showing up to {1})</source>
+        <translation>{0} resultado(s) (mostrando hasta {1})</translation>
+    </message>
+</context><context>
+    <name>CRSSelectorDialog</name>
+    <message>
+        <location filename="..\components\crs_selector.py" line="140" />
+        <source>Select Coordinate Reference System</source>
+        <translation>Seleccionar sistema de referencia de coordenadas</translation>
+    </message>
+    <message>
+        <location filename="..\components\crs_selector.py" line="146" />
+        <source>'{0}' uses PROJECTED coordinates (metres/feet) — SEG-Y has no field for the zone, so it can't be auto-detected. Pick the CRS used by this survey, or Cancel to leave its map track empty:</source>
+        <translation>'{0}' usa coordenadas PROYECTADAS (metros/pies) — SEG-Y no tiene un campo para la zona, por lo que no se puede detectar automáticamente. Elija el SRC usado en este levantamiento, o Cancelar para dejar su traza del mapa vacía:</translation>
+    </message>
+    <message>
+        <location filename="..\components\crs_selector.py" line="157" />
+        <source>Other…</source>
+        <translation>Otro…</translation>
+    </message>
+</context><context>
+    <name>MetadataInspectorDialog</name>
+    <message>
+        <location filename="..\components\metadata_inspector.py" line="40" />
+        <source>Properties / Metadata</source>
+        <translation>Propiedades / Metadatos</translation>
+    </message>
+    <message>
+        <location filename="..\components\metadata_inspector.py" line="53" />
+        <source>Edit CRS…</source>
+        <translation>Editar CRS…</translation>
+    </message>
+    <message>
+        <location filename="..\components\metadata_inspector.py" line="72" />
+        <source>Unknown / unset ({0})</source>
+        <translation>Desconocido / sin definir ({0})</translation>
+    </message>
+    <message>
+        <location filename="..\components\metadata_inspector.py" line="75" />
+        <source>Traces: {0}</source>
+        <translation>Trazas: {0}</translation>
+    </message>
+    <message>
+        <location filename="..\components\metadata_inspector.py" line="77" />
+        <source>Sample interval: {0} µs</source>
+        <translation>Intervalo de muestreo: {0} µs</translation>
+    </message>
+    <message>
+        <location filename="..\components\metadata_inspector.py" line="80" />
+        <source>Sample rate: {0:.1f} Hz</source>
+        <translation>Frecuencia de muestreo: {0:.1f} Hz</translation>
+    </message>
+    <message>
+        <location filename="..\components\metadata_inspector.py" line="81" />
+        <source>Coordinate units (raw SEG-Y): {0}</source>
+        <translation>Unidades de coordenadas (SEG-Y crudo): {0}</translation>
+    </message>
+    <message>
+        <location filename="..\components\metadata_inspector.py" line="85" />
+        <source>CRS: {0}</source>
+        <translation>SRC: {0}</translation>
+    </message>
+    <message>
+        <location filename="..\components\metadata_inspector.py" line="86" />
+        <source>Unresolved (projected, no zone in header)</source>
+        <translation>Sin resolver (proyectado, sin zona en el encabezado)</translation>
     </message>
 </context><context>
     <name>ExportDialog</name>
@@ -642,6 +753,11 @@
         <location filename="..\main_window.py" line="611" />
         <source>Export selected in batch…</source>
         <translation>Exportar selección por lotes…</translation>
+    </message>
+    <message>
+        <location filename="..\main_window.py" line="683" />
+        <source>View Properties / Metadata…</source>
+        <translation>Ver Propiedades / Metadatos…</translation>
     </message>
     <message>
         <location filename="..\main_window.py" line="653" />

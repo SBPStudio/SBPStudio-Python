@@ -158,6 +158,71 @@ class DSPNode(ABC):
 
 # ── Concrete nodes ──────────────────────────────────────────────────────────────
 
+class TraceMixingNode(DSPNode):
+    """Trace Mixing (Horizontal Spatial Smoothing) — wraps
+    ``core.apply_trace_mixing``.
+
+    Rolling average ACROSS traces (not down a trace): a continuous reflector
+    has coherent amplitude/phase between neighbours and survives via
+    constructive interference, while incoherent salt-and-pepper noise has no
+    such correlation and is attenuated via destructive interference —
+    countering the noise a downstream gain stage (AGC, TVG) would otherwise
+    amplify into visible speckle in deep, low-SNR sections.
+
+    ``window_size`` MUST be odd (centred average, no lateral event shift);
+    enforced again at the core-function level even if the UI slider lets an
+    even value slip through.
+    """
+
+    KEY     = "trace_mix"
+    DISPLAY = "Trace Mixing (Horizontal Smoothing)"
+    SPECS   = (
+        ParamSpec("window_size", "Traces to mix", 3.0, 51.0, 3.0, 2.0, 0, "tr"),
+    )
+
+    def trace_halo(self, ctx: DSPContext) -> int:
+        # Neighbours needed on each side so the rolling average is correct
+        # right up to the visible window's edges (same rationale as
+        # SwellFilterNode's trace_halo).
+        return int(self.params["window_size"]) // 2
+
+    def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
+        from sbp_studio.core import apply_trace_mixing
+        return apply_trace_mixing(data, int(self.params["window_size"]))
+
+
+class MedianFilterNode(DSPNode):
+    """Median Filter (Edge-Preserving) — wraps ``core.apply_median_filter``.
+
+    The edge-preserving alternative to TraceMixingNode: each sample becomes
+    the MEDIAN of itself and its horizontal neighbours instead of their MEAN.
+    A median is always one of the actual input values, never an interpolated
+    blend, so an isolated noise spike is rejected outright rather than
+    smeared across neighbours — and unlike the mean, it does not "watercolor"
+    blur the sharp lateral edge of a fault or a steeply-dipping reflector.
+
+    ``window_size`` MUST be odd (centred window, no lateral event shift);
+    enforced again at the core-function level even if the UI slider lets an
+    even value slip through.
+    """
+
+    KEY     = "median_filter"
+    DISPLAY = "Median Filter (Edge-Preserving)"
+    SPECS   = (
+        ParamSpec("window_size", "Traces to evaluate", 3.0, 51.0, 3.0, 2.0, 0, "tr"),
+    )
+
+    def trace_halo(self, ctx: DSPContext) -> int:
+        # Same rationale as TraceMixingNode.trace_halo: neighbours needed on
+        # each side so the median is correct right up to the visible
+        # window's edges.
+        return int(self.params["window_size"]) // 2
+
+    def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
+        from sbp_studio.core import apply_median_filter
+        return apply_median_filter(data, int(self.params["window_size"]))
+
+
 class PredictiveDeconNode(DSPNode):
     """Predictive (Wiener-Levinson) deconvolution — wraps ``core.apply_predictive_decon``."""
 
@@ -263,6 +328,36 @@ class AGCNode(DSPNode):
     def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
         from sbp_studio.core import apply_agc
         return apply_agc(data, self.params["win_ms"], ctx.dt_us)
+
+
+class TraceEqualizationNode(DSPNode):
+    """Trace Equalization (RMS Balance) — wraps ``core.apply_trace_equalization``.
+
+    Divides each trace by its own RMS amplitude so every trace carries
+    comparable energy along the line. A SELECTABLE, order-sensitive
+    counterpart to the mandatory load-time ``apply_dc_removal`` (which only
+    zero-centres each trace — a precondition for a meaningful RMS, not an
+    energy balance): a downstream gain (AGC) or local-contrast (CLAHE) stage
+    amplifies whatever trace-to-trace imbalance still survives at that
+    point in the chain, which is what produces vertical 'striping' in the
+    water column. Placing this node before such a stage fixes the cause;
+    after it re-balances whatever that stage produced — the user's choice,
+    via where they drop it in their chain.
+
+    PRECROP: RMS must reflect each trace's WHOLE energy, not just whatever
+    happens to be visible in the current viewport — otherwise zooming/
+    panning would change the normalization factor. No params, no halo:
+    a single scalar-per-trace operation.
+    """
+
+    KEY     = "trace_eq"
+    DISPLAY = "Trace Equalization (RMS Balance)"
+    PRECROP = True
+    SPECS   = ()
+
+    def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
+        from sbp_studio.core import apply_trace_equalization
+        return apply_trace_equalization(data)
 
 
 class LogCompressionNode(DSPNode):
@@ -501,11 +596,14 @@ NODE_REGISTRY: List[type[DSPNode]] = [
     FKFilterNode,            # 2-D dip reject (spatial, full-res viewport)
     WaterMuteNode,
     MultipleSuppressionNode,  # seabed de-multiple (PRECROP, needs full trace)
+    TraceMixingNode,         # spatial denoise before any frequency-domain filter
+    MedianFilterNode,        # edge-preserving alternative to Trace Mixing
     PredictiveDeconNode,
     BandpassNode,
     NotchNode,               # surgical band-stop alongside the bandpass
     SpectralWhiteningNode,   # sharpen after filtering; before attribute/gain
     PresetNode,
+    TraceEqualizationNode,   # balance per-trace energy before gain/contrast amplify it
     TVGNode,
     AGCNode,
     LogCompressionNode,

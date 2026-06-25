@@ -306,8 +306,13 @@ class ProfileChain:
         else:
             self.trace_headers = {}
         # CRS inherited from the first profile so the map can reproject the chain
-        # track even before the trace matrix is assembled.
+        # track even before the trace matrix is assembled. coord_unit travels
+        # with it — safe_map_coords needs both to know whether the chain's
+        # native coordinates are projected (1), arc-seconds (2), or already
+        # decimal degrees (3). A chain only ever joins profiles with the SAME
+        # acquisition config, so the first profile's value is authoritative.
         self.detected_crs = self.profiles[0].detected_crs if self.profiles else None
+        self.coord_unit   = self.profiles[0].coord_unit   if self.profiles else 0
 
         # Continuous cumulative distance including inter-profile gaps
         segments = []

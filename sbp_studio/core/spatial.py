@@ -107,7 +107,16 @@ def to_geographic(lons, lats, src_crs) -> Tuple[np.ndarray, np.ndarray]:
 
     Passthrough (copy) when ``src_crs`` is empty/None or already geographic.
     Never raises — display must not crash, so any reprojection failure falls
-    back to the input coordinates unchanged."""
+    back to the input coordinates unchanged.
+
+    NOTE: this passthrough-when-unknown default is intentional for the
+    GENERAL case (e.g. a GeoTIFF/vector layer with no declared CRS, where the
+    native coordinates might genuinely already be lon/lat). It is NOT safe to
+    call directly on SEG-Y navigation that's KNOWN to be projected
+    (CoordinateUnits=1) but has no resolvable CRS — passing raw UTM-scale
+    eastings/northings through as if they were degrees is exactly the
+    'Inf/NaN bounding box, basemap crash' failure mode. Use
+    :func:`safe_map_coords` for that case instead."""
     xs = np.asarray(lons, dtype=float)
     ys = np.asarray(lats, dtype=float)
     if not src_crs:
@@ -118,3 +127,65 @@ def to_geographic(lons, lats, src_crs) -> Tuple[np.ndarray, np.ndarray]:
         return reproject_points(xs, ys, src_crs, WGS84)
     except Exception:
         return xs.copy(), ys.copy()
+
+
+def safe_map_coords(lons, lats, coord_unit: int, src_crs: Optional[str] = None
+                    ) -> Tuple[np.ndarray, np.ndarray]:
+    """'Geometry Sanity & Reprojection' — coordinates GUARANTEED safe to hand
+    to a WGS84 web-map widget. Every output point is either valid WGS84
+    (lon in [-180,180], lat in [-90,90]) or ``NaN``. ``NaN`` means "no safe
+    position for this point" — ``nanmin``/``nanmax``-based map bounds (the
+    standard pattern; see ``MapView``) skip it cleanly instead of being
+    corrupted by it.
+
+    ``coord_unit`` is the SEG-Y trace header's ``CoordinateUnits`` word
+    (1 = length/projected, 2 = arc-seconds, 3 = decimal degrees) — see
+    ``io_segy._detect_crs``, which resolves ``src_crs`` for the projected case
+    (explicit override, or an unconfirmed textual-header zone guess).
+
+    Projected path (coord_unit == 1)
+    ---------------------------------
+    Native units (e.g. UTM easting/northing in metres) are NEVER valid WGS84
+    degrees. Unlike :func:`to_geographic`'s general passthrough-when-unknown
+    default, this path REFUSES to hand raw projected values to the map at
+    all when ``src_crs`` is unresolved — that refusal (NaN, not a passthrough)
+    is what prevents a UTM-scale "longitude" of half a million degrees from
+    reaching a Mercator-style projection and blowing up to Infinity, which is
+    what actually crashes a tile-based basemap's zoom-to-extent. When
+    ``src_crs`` IS known, reprojects via :func:`to_geographic` (pyproj
+    ``Transformer``, one vectorised call).
+
+    Geographic path (coord_unit in (2, 3), or any other/legacy value)
+    --------------------------------------------------------------------
+    ``lons``/``lats`` are assumed ALREADY in degrees (io_segy applies the
+    arc-second ``/3600`` conversion upstream — see ``_populate_profile_from_file``).
+    Any point outside the valid WGS84 envelope is dropped to NaN. Bounds
+    alone can't catch a corrupt-but-plausible fix (e.g. a botched conversion
+    landing exactly on 0°,0° — still technically in-range); it catches the
+    impossible ones, which are the ones that actually break bounding-box math.
+    """
+    xs = np.asarray(lons, dtype=float)
+    ys = np.asarray(lats, dtype=float)
+
+    if coord_unit == 1:
+        if not src_crs:
+            return (np.full(xs.shape, np.nan, dtype=float),
+                    np.full(ys.shape, np.nan, dtype=float))
+        try:
+            # Deliberately NOT to_geographic(): its passthrough-on-failure
+            # default would hand back the very raw projected metres this
+            # function exists to refuse if src_crs turns out unparseable.
+            # reproject_points raises (CRSError) instead of swallowing it.
+            if CRS.from_user_input(src_crs).is_geographic:
+                return xs.copy(), ys.copy()
+            return reproject_points(xs, ys, src_crs, WGS84)
+        except Exception:
+            return (np.full(xs.shape, np.nan, dtype=float),
+                    np.full(ys.shape, np.nan, dtype=float))
+
+    out_x, out_y = xs.copy(), ys.copy()
+    bad = (~np.isfinite(out_x)) | (~np.isfinite(out_y)) | \
+          (out_x < -180.0) | (out_x > 180.0) | (out_y < -90.0) | (out_y > 90.0)
+    out_x[bad] = np.nan
+    out_y[bad] = np.nan
+    return out_x, out_y

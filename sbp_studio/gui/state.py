@@ -37,6 +37,14 @@ class AppState(QObject):
     active_profile_changed = pyqtSignal(object)
     # Emitted with the newly active ProfileChain (or None).
     active_chain_changed = pyqtSignal(object)
+    # Emitted with a profile/chain whose CRS was just resolved/changed IN
+    # PLACE (core.set_crs_override mutates detected_crs without a file
+    # re-read, so neither profiles_changed nor active_profile_changed fires
+    # on its own). Tabs showing that object's track refresh their map via
+    # core.safe_map_coords — this notification flows ONE way (CRS change →
+    # map refresh) and the refresh never changes the CRS again, so there is
+    # no cycle.
+    crs_updated = pyqtSignal(object)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -176,6 +184,15 @@ class AppState(QObject):
         so we only need to re-notify (no list replacement)."""
         if chain is self.active_chain:
             self.active_chain_changed.emit(chain)
+
+    def notify_crs_updated(self, obj) -> None:
+        """Call after ``core.set_crs_override(obj, ...)`` mutates a profile's
+        or chain's ``detected_crs`` in place. Every observing tab/dialog
+        refreshes its OWN view of ``obj`` (e.g. re-running
+        ``core.safe_map_coords`` for the map track) — this method itself
+        does nothing but relay the notification, so it can never trigger
+        another CRS change and cannot cycle."""
+        self.crs_updated.emit(obj)
 
     # ── LRU eviction of trace matrices (RAM bound) ───────────────────────────
 

@@ -19,6 +19,11 @@ Array contract
 - Input data : (ns, n_traces) float32
 - All public functions return NEW arrays; inputs are never mutated.
 - apply_filter_preset("none") returns data.copy() (new array, not aliased).
+- Exception: apply_dc_removal(data, inplace=True) is an explicit, opt-in
+  escape hatch for the ONE call site (io_segy.py's load path) that owns a
+  freshly-allocated array exclusively and benefits from skipping the extra
+  allocation. Every other caller, and the default (inplace=False), keeps the
+  contract above.
 
 Known limitations
 -----------------
@@ -69,6 +74,207 @@ def _parallel_apply(fn, data: np.ndarray, *args,
             results[futs[fut]] = fut.result()
 
     return np.concatenate(results, axis=1)
+
+
+# ── DC offset removal (mandatory, first stage — see io_segy.py's load path) ─────
+
+def apply_dc_removal(data: np.ndarray, inplace: bool = False) -> np.ndarray:
+    """
+    Mandatory DC-offset removal: subtract each trace's OWN mean so every
+    trace is strictly centred on zero.
+
+    This is "stage 0" of the pipeline — applied to ``prof.data`` immediately
+    after the raw trace matrix is loaded (see
+    ``io_segy._populate_profile_from_file``), BEFORE any DSP node, the legacy
+    generic pipeline (:func:`process_profile_data`), or the live preview ever
+    sees the data. Raw instrumental DC bias is harmless on its own, but once
+    a downstream gain stage (AGC, TVG) or filter (bandpass) touches it, a
+    per-trace offset gets amplified/redistributed into vertical 'striping'
+    artifacts in the water column — this removes the cause at the source,
+    once, rather than letting every filter fight a symptom.
+
+    Hardware/survey-agnostic by construction: the only assumption is the
+    array contract itself (axis 0 = samples/time, axis 1 = traces) — no
+    trace-length, sample-rate, or instrument-specific constant anywhere, so
+    it is identically correct for a 9000-sample TOPAS SBP trace or a
+    3000-sample deep-MCS trace. Pure subtraction with NO division anywhere,
+    so it is provably NaN/Inf-safe even for a degenerate all-zero or
+    constant (dead-channel) trace.
+
+    Parameters
+    ----------
+    data    : (ns, n_traces) float32 (or any float dtype) — per the module
+              contract, NOT mutated unless ``inplace=True``
+    inplace : subtract the mean DIRECTLY into ``data`` instead of allocating
+              a new array — a real saving for the multi-GB matrices this app
+              handles, but ONLY safe when the caller exclusively owns
+              ``data`` and no other reference depends on it staying
+              unchanged (e.g. immediately after
+              ``f.trace.raw[:].T.astype(...)`` at load time, before
+              anything else can have touched it). Defaults to False to
+              match every other ``apply_*`` function's contract.
+
+    Returns
+    -------
+    (ns, n_traces) — ``data`` itself if ``inplace``, else a new array of the
+    same dtype as ``data``.
+    """
+    # float64 accumulator keeps the mean numerically robust regardless of
+    # trace length (summing many float32 samples can otherwise lose
+    # precision) — the tiny (1, n_traces) mean array is the only extra
+    # allocation either way.
+    mean = data.mean(axis=0, keepdims=True, dtype=np.float64)
+    if inplace:
+        data -= mean
+        return data
+    return (data - mean).astype(data.dtype, copy=False)
+
+
+# ── Trace equalization (selectable pipeline node, NOT mandatory) ────────────────
+
+def apply_trace_equalization(data: np.ndarray) -> np.ndarray:
+    """
+    Trace Equalization (RMS Balance): divide each trace by its own RMS
+    amplitude, so every trace carries comparable energy along the line
+    regardless of source/receiver coupling or range-dependent attenuation.
+
+    Unlike :func:`apply_dc_removal` (mandatory, applied once at load time —
+    see io_segy.py — because zero-centring is a precondition for a
+    meaningful RMS), this is a SELECTABLE, order-sensitive pipeline node
+    (see gui/dsp/nodes.py's TraceEqualizationNode): a downstream gain stage
+    (AGC) or local-contrast stage (CLAHE) amplifies whatever relative
+    trace-to-trace imbalance still survives at that point in the chain,
+    which is what produces vertical 'striping' in the water column.
+    Inserting this node BEFORE such a stage removes the imbalance there;
+    after it instead re-balances whatever that stage produced — the user's
+    placement decides which, exactly like every other reorderable node.
+
+    Safety: RMS == 0 (or numerically negligible — a dead/disconnected
+    channel) would otherwise divide live values by ~0 and explode to
+    Inf/NaN; that trace is returned as all-zero instead, the same
+    degenerate-trace contract every other node in this module uses (e.g.
+    apply_water_mute's all-zero-trace guard).
+
+    Hardware/survey-agnostic: the only assumption is the array contract
+    itself (axis 0 = samples, axis 1 = traces) — no trace-length,
+    sample-rate, or instrument-specific constant anywhere.
+
+    Parameters
+    ----------
+    data : (ns, n_traces) float32 (or any float dtype) — NOT mutated.
+
+    Returns
+    -------
+    (ns, n_traces) — new array, same dtype as ``data``.
+    """
+    # Squaring straight into a float64 OUTPUT (rather than upcasting `data`
+    # first) keeps this to one extra (1, n_traces)-shaped float64 mean plus
+    # one same-size-as-data float64 temporary — not two.
+    mean_sq = np.mean(np.square(data, dtype=np.float64), axis=0, keepdims=True)
+    rms = np.sqrt(mean_sq)
+    safe = rms > 1e-6
+    out = np.zeros_like(data, dtype=np.float64)
+    np.divide(data, rms, out=out, where=safe)
+    return out.astype(data.dtype, copy=False)
+
+
+# ── Trace mixing (selectable pipeline node, NOT mandatory) ──────────────────────
+
+def apply_trace_mixing(data: np.ndarray, window_size: int = 3) -> np.ndarray:
+    """
+    Trace Mixing (Horizontal Spatial Smoothing): rolling average ACROSS
+    traces (axis=1) at each sample row independently. A continuous reflector
+    has coherent amplitude/phase from one trace to the next, so neighbouring
+    traces interfere CONSTRUCTIVELY and the event survives the average;
+    incoherent random ("salt-and-pepper") noise has no such cross-trace
+    correlation, so it interferes DESTRUCTIVELY and is attenuated — exactly
+    the noise a downstream gain stage (AGC, TVG) would otherwise amplify
+    into visible speckle in deep, low-SNR sections.
+
+    ``window_size`` MUST be odd so the average stays centred on each trace
+    without laterally shifting events — an even window has no centre column,
+    which would shift every reflector by half a trace. Coerced up to the
+    next odd value if given even; floored at 1 (a no-op pass-through).
+
+    Implementation: ``scipy.ndimage.uniform_filter1d`` along axis=1 — a
+    single optimized C rolling-average pass, not a Python loop over traces.
+    ``mode="nearest"`` (edge replication) avoids the artificial mirrored
+    duplicate traces ``mode="reflect"`` would otherwise introduce at the two
+    ends of the line.
+
+    Hardware/survey-agnostic: the only assumption is the array contract
+    itself (axis 0 = samples, axis 1 = traces) — no trace-length, sample-
+    rate, or instrument-specific constant anywhere.
+
+    Parameters
+    ----------
+    data        : (ns, n_traces) float32 (or any float dtype) — NOT mutated.
+    window_size : number of traces averaged together (odd, >= 1). Default 3.
+
+    Returns
+    -------
+    (ns, n_traces) — new array, same dtype as ``data``.
+    """
+    window_size = max(1, int(window_size))
+    if window_size % 2 == 0:
+        window_size += 1
+    if window_size <= 1:
+        return data.copy()
+
+    from scipy.ndimage import uniform_filter1d
+    out = uniform_filter1d(data, size=window_size, axis=1, mode="nearest")
+    return out.astype(data.dtype, copy=False)
+
+
+# ── Median filter (edge-preserving alternative to Trace Mixing) ─────────────────
+
+def apply_median_filter(data: np.ndarray, window_size: int = 3) -> np.ndarray:
+    """
+    Median Filter (Edge-Preserving Spatial Denoise): replaces each sample
+    with the MEDIAN of itself and its horizontal neighbours (same sample
+    row, ``window_size`` adjacent traces). Unlike :func:`apply_trace_mixing`
+    (a MEAN, i.e. a low-pass filter), the median is unmoved by a single
+    outlier value in the window, so an isolated salt-and-pepper noise spike
+    is rejected outright rather than smeared across its neighbours — the
+    mean's "watercolor" blurring of sharp lateral discontinuities (fault
+    edges, steeply-dipping reflectors) never happens, because the median is
+    always one of the ACTUAL input values, never an interpolated blend.
+
+    ``window_size`` MUST be odd, for the same reason as ``apply_trace_mixing``
+    (a centred window with no half-trace lateral shift); coerced up to the
+    next odd value if given even, floored at 1 (a no-op pass-through).
+
+    Implementation: ``scipy.ndimage.median_filter`` with ``size=(1,
+    window_size)`` — NOT a square/symmetric footprint. The footprint's FIRST
+    axis (samples) is fixed at 1 so the median is taken strictly along axis=1
+    (traces) at each sample row independently; a >1 first-axis would also
+    blend across TIME, destroying vertical/temporal resolution, which this
+    filter must never touch. ``mode="nearest"`` (edge replication) avoids the
+    artificial mirrored duplicate traces ``mode="reflect"`` would introduce
+    at the two ends of the line.
+
+    Hardware/survey-agnostic: the only assumption is the array contract
+    itself (axis 0 = samples, axis 1 = traces) — no trace-length, sample-
+    rate, or instrument-specific constant anywhere.
+
+    Parameters
+    ----------
+    data        : (ns, n_traces) float32 (or any float dtype) — NOT mutated.
+    window_size : number of traces evaluated together (odd, >= 1). Default 3.
+
+    Returns
+    -------
+    (ns, n_traces) — new array, same dtype as ``data``.
+    """
+    window_size = max(1, int(window_size))
+    if window_size % 2 == 0:
+        window_size += 1
+    if window_size <= 1:
+        return data.copy()
+
+    from scipy.ndimage import median_filter
+    out = median_filter(data, size=(1, window_size), mode="nearest")
+    return out.astype(data.dtype, copy=False)
 
 
 # ── Reference deconvolution ────────────────────────────────────────────────────
@@ -1205,6 +1411,10 @@ def compute_amplitude_spectrum(data: np.ndarray, dt_us: int) -> tuple:
 def _process_data_generic(obj: Any, params: Dict[str, Any]) -> np.ndarray:
     """
     Common pipeline implementation for SegyProfile and ProfileChain.
+
+    Stage 0 — mandatory DC-offset removal (apply_dc_removal) — already ran on
+    ``obj.data`` at load time (see io_segy._populate_profile_from_file), so it
+    is NOT repeated here; every stage below already sees a zero-centred trace.
 
     Stage order (preserved bit-for-bit from monolith):
       1. Predictive deconvolution

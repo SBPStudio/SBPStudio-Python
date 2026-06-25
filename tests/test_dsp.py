@@ -20,10 +20,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sbp_studio.core import apply_agc, apply_clahe, apply_despike, apply_log_compression, apply_tvg
+from sbp_studio.core import (
+    apply_agc, apply_clahe, apply_despike, apply_log_compression, apply_median_filter,
+    apply_trace_equalization, apply_trace_mixing, apply_tvg,
+)
 from sbp_studio.gui.dsp import (
-    AGCNode, CLAHENode, DespikeNode, DSPContext, LogCompressionNode, Pipeline,
-    TVGNode, extract_visible_window,
+    AGCNode, CLAHENode, DespikeNode, DSPContext, LogCompressionNode, MedianFilterNode, Pipeline,
+    TraceEqualizationNode, TraceMixingNode, TVGNode, extract_visible_window,
 )
 
 
@@ -175,6 +178,259 @@ class TestAGCMath:
         np.testing.assert_array_equal(
             node.apply(data, ctx),
             apply_agc(data, 25.0, self.DT_US))
+
+
+class TestTraceMixingMath:
+    DT_US = 250
+
+    def test_attenuates_incoherent_noise_more_than_coherent_signal(self):
+        """A reflector coherent across traces should survive the mix far
+        better than per-trace-independent random noise (the whole premise:
+        constructive interference for the signal, destructive for noise)."""
+        rng = np.random.default_rng(5)
+        ns, nt = 300, 31
+        coherent = np.tile(np.sin(np.linspace(0, 6, ns))[:, None], (1, nt)).astype(np.float32)
+        noise = rng.standard_normal((ns, nt)).astype(np.float32) * 0.5
+        data = coherent + noise
+        out = apply_trace_mixing(data, window_size=5)
+
+        # Noise residual should shrink roughly by sqrt(window_size); signal
+        # (away from the line edges, where the halo runs out) stays intact.
+        raw_noise_std = noise.std()
+        mixed_noise_std = (out - coherent)[:, 5:-5].std()
+        assert mixed_noise_std < raw_noise_std / 1.5
+
+    def test_even_window_is_coerced_to_next_odd(self):
+        data = np.random.default_rng(0).standard_normal((50, 20)).astype(np.float32)
+        np.testing.assert_array_equal(
+            apply_trace_mixing(data, window_size=4),
+            apply_trace_mixing(data, window_size=5))
+
+    def test_window_one_is_pass_through_copy(self):
+        data = np.random.default_rng(1).standard_normal((40, 10)).astype(np.float32)
+        out = apply_trace_mixing(data, window_size=1)
+        assert np.array_equal(out, data)
+        assert out is not data
+
+    def test_window_zero_coerced_to_one(self):
+        data = np.random.default_rng(1).standard_normal((40, 10)).astype(np.float32)
+        np.testing.assert_array_equal(
+            apply_trace_mixing(data, window_size=0),
+            apply_trace_mixing(data, window_size=1))
+
+    def test_preserves_shape_dtype_and_no_mutation(self):
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        original = data.copy()
+        out = apply_trace_mixing(data, window_size=3)
+        assert out.shape == data.shape
+        assert out.dtype == np.float32
+        assert np.array_equal(data, original)
+
+    def test_does_not_shift_events_horizontally(self):
+        """An odd, centred window must smear an isolated 'bright spot' trace
+        SYMMETRICALLY around its own index, not shifted left/right (a
+        symmetric tied plateau, not a lopsided one — argmax would just pick
+        the first of several equal-valued ties, so check symmetry instead)."""
+        data = np.zeros((20, 11), dtype=np.float32)
+        data[:, 5] = 10.0    # single bright trace at index 5
+        out = apply_trace_mixing(data, window_size=3)
+        row = out[0, :]
+        assert row[4] == pytest.approx(row[6])           # symmetric about index 5
+        assert row[5] > 0.0                               # the spike's own column still lit
+        assert row[3] == 0.0 and row[7] == 0.0            # window=3 doesn't reach this far
+
+    def test_node_matches_core_reference(self):
+        ctx = DSPContext(dt_us=self.DT_US, ns=1000, n_traces=8)
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        node = TraceMixingNode({"window_size": 5})
+        np.testing.assert_array_equal(
+            node.apply(data, ctx),
+            apply_trace_mixing(data, 5))
+
+    def test_node_default_param_is_three_and_trace_halo_matches(self):
+        node = TraceMixingNode()
+        assert node.params["window_size"] == 3
+        ctx = DSPContext(dt_us=self.DT_US, ns=100, n_traces=20)
+        assert node.trace_halo(ctx) == 1            # window_size // 2
+
+    def test_node_spec_enforces_odd_step_and_minimum(self):
+        spec = TraceMixingNode.SPECS[0]
+        assert spec.name == "window_size"
+        assert spec.lo == 3.0 and spec.default == 3.0 and spec.step == 2.0
+        assert spec.decimals == 0
+
+    def test_order_sensitive_vs_agc(self):
+        """trace_mix -> agc must differ from agc -> trace_mix: a reorderable
+        node, not a hardcoded background step."""
+        ctx = DSPContext(dt_us=self.DT_US, ns=300, n_traces=15)
+        rng = np.random.default_rng(6)
+        data = rng.standard_normal((300, 15)).astype(np.float32) * 5.0
+        p1 = Pipeline([TraceMixingNode(), AGCNode({"win_ms": 20.0})])
+        p2 = Pipeline([AGCNode({"win_ms": 20.0}), TraceMixingNode()])
+        out1 = p1.process(data, ctx, input_token="a")
+        out2 = p2.process(data, ctx, input_token="b")
+        assert not np.allclose(out1, out2)
+
+
+class TestMedianFilterMath:
+    DT_US = 250
+
+    def test_rejects_isolated_spike_unlike_mean(self):
+        """The whole point of the median over the mean: an outlier spike on
+        one trace must be rejected outright (output == the coherent value),
+        NOT blended into a huge smeared value the way apply_trace_mixing
+        (the mean) would."""
+        ns, nt = 10, 11
+        coherent = np.tile(np.arange(1, ns + 1, dtype=np.float32)[:, None], (1, nt))
+        data = coherent.copy()
+        data[3, 5] = 1000.0   # single outlier spike
+
+        out_median = apply_median_filter(data, window_size=3)
+        out_mean = apply_trace_mixing(data, window_size=3)
+
+        assert out_median[3, 5] == pytest.approx(coherent[3, 5])   # rejected outright
+        assert out_median[3, 4] == pytest.approx(coherent[3, 4])   # neighbours untouched
+        assert out_mean[3, 5] > 300.0                              # mean smears it badly
+
+    def test_preserves_vertical_temporal_resolution(self):
+        """size=(1, window_size): the median must NEVER blend across the
+        sample (time) axis — a single-sample-tall horizontal noise band must
+        stay exactly one sample tall after filtering."""
+        data = np.zeros((5, 7), dtype=np.float32)
+        data[2, :] = 5.0     # one sample row, every trace
+        out = apply_median_filter(data, window_size=3)
+        np.testing.assert_array_equal(out[2, :], data[2, :])
+        assert np.all(out[1, :] == 0.0) and np.all(out[3, :] == 0.0)
+
+    def test_even_window_is_coerced_to_next_odd(self):
+        data = np.random.default_rng(0).standard_normal((50, 20)).astype(np.float32)
+        np.testing.assert_array_equal(
+            apply_median_filter(data, window_size=4),
+            apply_median_filter(data, window_size=5))
+
+    def test_window_one_is_pass_through_copy(self):
+        data = np.random.default_rng(1).standard_normal((40, 10)).astype(np.float32)
+        out = apply_median_filter(data, window_size=1)
+        assert np.array_equal(out, data)
+        assert out is not data
+
+    def test_window_zero_coerced_to_one(self):
+        data = np.random.default_rng(1).standard_normal((40, 10)).astype(np.float32)
+        np.testing.assert_array_equal(
+            apply_median_filter(data, window_size=0),
+            apply_median_filter(data, window_size=1))
+
+    def test_preserves_shape_dtype_and_no_mutation(self):
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        original = data.copy()
+        out = apply_median_filter(data, window_size=3)
+        assert out.shape == data.shape
+        assert out.dtype == np.float32
+        assert np.array_equal(data, original)
+
+    def test_does_not_shift_events_horizontally(self):
+        data = np.zeros((20, 11), dtype=np.float32)
+        data[:, 5] = 10.0
+        out = apply_median_filter(data, window_size=3)
+        row = out[0, :]
+        assert row[4] == pytest.approx(row[6])      # symmetric about index 5
+
+    def test_node_matches_core_reference(self):
+        ctx = DSPContext(dt_us=self.DT_US, ns=1000, n_traces=8)
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        node = MedianFilterNode({"window_size": 5})
+        np.testing.assert_array_equal(
+            node.apply(data, ctx),
+            apply_median_filter(data, 5))
+
+    def test_node_default_param_is_three_and_trace_halo_matches(self):
+        node = MedianFilterNode()
+        assert node.params["window_size"] == 3
+        ctx = DSPContext(dt_us=self.DT_US, ns=100, n_traces=20)
+        assert node.trace_halo(ctx) == 1            # window_size // 2
+
+    def test_node_spec_enforces_odd_step_and_minimum(self):
+        spec = MedianFilterNode.SPECS[0]
+        assert spec.name == "window_size"
+        assert spec.lo == 3.0 and spec.default == 3.0 and spec.step == 2.0
+        assert spec.decimals == 0
+
+    def test_order_sensitive_vs_agc(self):
+        ctx = DSPContext(dt_us=self.DT_US, ns=300, n_traces=15)
+        rng = np.random.default_rng(7)
+        data = rng.standard_normal((300, 15)).astype(np.float32) * 5.0
+        p1 = Pipeline([MedianFilterNode(), AGCNode({"win_ms": 20.0})])
+        p2 = Pipeline([AGCNode({"win_ms": 20.0}), MedianFilterNode()])
+        out1 = p1.process(data, ctx, input_token="a")
+        out2 = p2.process(data, ctx, input_token="b")
+        assert not np.allclose(out1, out2)
+
+
+class TestTraceEqualizationMath:
+    DT_US = 250
+
+    def test_balances_traces_to_unit_rms(self):
+        """Traces with wildly different amplitude scales must all end up at
+        (numerically) the same RMS = 1.0 after equalization."""
+        rng = np.random.default_rng(3)
+        data = (rng.standard_normal((600, 5)).astype(np.float32)
+                * np.array([1.0, 10.0, 0.1, 50.0, 3.0], dtype=np.float32))
+        out = apply_trace_equalization(data)
+        rms = np.sqrt(np.mean(out.astype(np.float64) ** 2, axis=0))
+        np.testing.assert_allclose(rms, 1.0, atol=1e-4)
+
+    def test_dead_trace_becomes_zero_not_exploded(self):
+        """A dead (all-zero) channel must NOT be amplified to Inf/NaN — the
+        explicit safeguard against dividing by a ~0 RMS."""
+        data = np.zeros((400, 3), dtype=np.float32)
+        data[:, 1] = 5.0 * np.sin(np.linspace(0, 20 * np.pi, 400))   # one live trace
+        out = apply_trace_equalization(data)
+        assert np.all(np.isfinite(out))
+        assert np.allclose(out[:, 0], 0.0)
+        assert np.allclose(out[:, 2], 0.0)
+        assert not np.allclose(out[:, 1], 0.0)
+
+    def test_negligible_rms_trace_is_safe(self):
+        """A trace with RMS just barely above zero (numerical noise floor,
+        not exactly 0.0) must also be zeroed, not blown up."""
+        data = np.full((100, 1), 1e-10, dtype=np.float32)
+        out = apply_trace_equalization(data)
+        assert np.all(np.isfinite(out))
+        assert np.allclose(out, 0.0)
+
+    def test_preserves_shape_dtype_and_no_mutation(self):
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        original = data.copy()
+        out = apply_trace_equalization(data)
+        assert out.shape == data.shape
+        assert out.dtype == np.float32
+        assert np.array_equal(data, original)     # never mutates input
+
+    def test_order_sensitive_vs_agc(self):
+        """trace_eq -> agc must differ from agc -> trace_eq: the whole point
+        of making this a reorderable node, not a hardcoded background step."""
+        ctx = DSPContext(dt_us=self.DT_US, ns=600, n_traces=5)
+        rng = np.random.default_rng(4)
+        data = (rng.standard_normal((600, 5)).astype(np.float32)
+                * np.array([1.0, 10.0, 0.1, 50.0, 3.0], dtype=np.float32))
+        p1 = Pipeline([TraceEqualizationNode(), AGCNode({"win_ms": 20.0})])
+        p2 = Pipeline([AGCNode({"win_ms": 20.0}), TraceEqualizationNode()])
+        out1 = p1.process(data, ctx, input_token="a")
+        out2 = p2.process(data, ctx, input_token="b")
+        assert not np.allclose(out1, out2)
+
+    def test_node_matches_core_reference(self):
+        ctx = DSPContext(dt_us=self.DT_US, ns=1000, n_traces=8)
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        node = TraceEqualizationNode()
+        np.testing.assert_array_equal(
+            node.apply(data, ctx),
+            apply_trace_equalization(data))
+
+    def test_node_is_precrop_with_no_params(self):
+        node = TraceEqualizationNode()
+        assert node.PRECROP is True
+        assert node.SPECS == ()
 
 
 class TestLogCompressionMath:
@@ -633,8 +889,8 @@ class TestNodeMigration:
         from sbp_studio.gui.dsp import NODE_REGISTRY
         keys = {c.KEY for c in NODE_REGISTRY}
         assert keys == {"swell", "fk", "water_mute", "demultiple", "decon",
-                        "bandpass", "notch", "whiten", "preset", "tvg", "agc",
-                        "log_compress", "clahe", "despike"}
+                        "bandpass", "notch", "whiten", "preset", "trace_eq", "trace_mix",
+                        "median_filter", "tvg", "agc", "log_compress", "clahe", "despike"}
         assert "align" not in keys
 
 

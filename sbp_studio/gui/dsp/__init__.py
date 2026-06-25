@@ -7,9 +7,9 @@ preview. The core stays the single source of DSP truth.
 """
 from .nodes import (
     AGCNode, BandpassNode, ChoiceSpec, CLAHENode, DespikeNode, DSPContext, DSPNode,
-    FKFilterNode, LogCompressionNode, MultipleSuppressionNode, NotchNode,
+    FKFilterNode, LogCompressionNode, MedianFilterNode, MultipleSuppressionNode, NotchNode,
     NODE_REGISTRY, ParamSpec, PredictiveDeconNode, PresetNode, SwellFilterNode,
-    TVGNode, WaterMuteNode, make_node,
+    TraceEqualizationNode, TraceMixingNode, TVGNode, WaterMuteNode, make_node,
 )
 from .node_i18n import tr_node, tr_param
 from .pipeline import Pipeline, VisibleWindow, extract_visible_window
@@ -19,7 +19,8 @@ __all__ = [
     "DSPNode", "DSPContext", "ParamSpec", "ChoiceSpec", "NODE_REGISTRY", "make_node",
     "AGCNode", "BandpassNode", "TVGNode", "PredictiveDeconNode", "PresetNode",
     "SwellFilterNode", "WaterMuteNode", "LogCompressionNode", "CLAHENode", "DespikeNode",
-    "FKFilterNode", "MultipleSuppressionNode", "NotchNode",
+    "FKFilterNode", "MultipleSuppressionNode", "NotchNode", "TraceEqualizationNode",
+    "TraceMixingNode", "MedianFilterNode",
     "tr_node", "tr_param",
     "Pipeline", "VisibleWindow", "extract_visible_window",
     "PreviewController",

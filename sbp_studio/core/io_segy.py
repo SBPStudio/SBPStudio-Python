@@ -60,6 +60,7 @@ Behaviour preserved verbatim from the monolith
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
@@ -67,8 +68,10 @@ import numpy as np
 import segyio
 from pyproj import CRS, Transformer
 
+from .coordinates import resolve_crs
 from .logger import get_logger
 from .model import SegyMetadata, SegyProfile, ProfileChain
+from .processing import apply_dc_removal
 from .tasks import (
     SegyLoadError, CRSError, ReprojectionError, Cancelled,
     ProgressCallback, LogCallback, CancelToken,
@@ -317,7 +320,74 @@ def _dist_km(lons: np.ndarray, lats: np.ndarray, coord_unit: int) -> np.ndarray:
     return np.concatenate([[0.0], np.cumsum(d)])
 
 
-def _detect_crs(coord_unit: int, lons: np.ndarray) -> tuple:
+def _guess_utm_crs_from_text(raw_text: bytes) -> Optional[str]:
+    """Best-effort heuristic for projected (CoordinateUnits=1) files: look for
+    a POPULATED 'ZONE ID' card in the textual header (the standard SEG-Y C20
+    line: ``MAP PROJECTION ... ZONE ID:<n> ... COORDINATE UNITS``) and turn a
+    plausible UTM zone number into an EPSG guess.
+
+    Deliberately conservative — SEG-Y has NO field for hemisphere anywhere in
+    the standard header, so a found zone is assumed Northern (the more common
+    default) purely as a fallback guess, never a confirmed detection; callers
+    must flag it as unconfirmed (see ``_detect_crs``). Returns ``None`` (no
+    guess) when the card is blank or ``0`` — the literal, unfilled-template
+    state seen on real acquisition exports (confirmed on both ANT26 and MCS7
+    sample files: ``ZONE ID:0`` / blank ``ZONE ID``), so a real EPSG override
+    is the only reliable path for those.
+    """
+    try:
+        text = _normalize_raw_text_bytes(raw_text).decode("ascii", errors="replace")
+    except Exception:
+        return None
+    m = re.search(r"ZONE\s*ID\s*:?\s*(\d{1,2})\b", text, re.IGNORECASE)
+    if not m:
+        return None
+    zone = int(m.group(1))
+    if not (1 <= zone <= 60):
+        return None
+    return f"EPSG:{32600 + zone}"   # UTM zone, Northern hemisphere — UNCONFIRMED guess
+
+
+def _detect_crs(coord_unit: int, lons: np.ndarray,
+                crs_override: Optional[str] = None,
+                raw_text: Optional[bytes] = None) -> tuple:
+    """Resolve a CRS for the map, per CoordinateUnits — the 'Geometry Sanity
+    & Reprojection' pipeline (see also :func:`sbp_studio.core.safe_map_coords`,
+    which uses the result to guard what actually reaches the map widget).
+
+    coord_unit == 1 (projected length, e.g. UTM metres): standard SEG-Y has
+    NO field for the zone/projection, so it can never be auto-detected with
+    certainty from the header alone. Resolution order:
+      1. ``crs_override`` (explicit EPSG/WKT string, e.g. 'EPSG:32631') — the
+         reliable path; exactly what a human operator (or Petrel's CRS
+         prompt) would supply.
+      2. ``_guess_utm_crs_from_text`` — a textual-header 'ZONE ID' heuristic,
+         used ONLY when present and non-zero; flagged as unconfirmed.
+      3. Neither → return None with an explicit warning. The raw
+         eastings/northings must NEVER be silently treated as WGS84 degrees
+         (that is exactly the "UTM meters fed to a Lat/Lon bounding box"
+         crash) — refusing to guess here is what makes that refusal safe.
+    """
+    if coord_unit == 1:
+        if crs_override:
+            try:
+                resolved = resolve_crs(crs_override)
+                return resolved, [f"✔ Coordenadas proyectadas (units=1) → EPSG indicado: {resolved}"]
+            except Exception as exc:
+                return None, [f"⚠ EPSG indicado inválido ('{crs_override}'): {exc}"]
+        guess = _guess_utm_crs_from_text(raw_text) if raw_text else None
+        if guess:
+            return guess, [
+                f"⚠ Coordenadas proyectadas (units=1) — zona UTM ADIVINADA del "
+                f"encabezado de texto ({guess}, hemisferio Norte asumido). "
+                "VERIFICAR antes de confiar en el mapa; SEG-Y no registra el "
+                "hemisferio."]
+        return None, [
+            "⚠ Coordenadas proyectadas (units=1, metros/pies) detectadas — SEG-Y "
+            "no registra la zona/proyección. Indique un EPSG (p.ej. 'EPSG:32631' "
+            "para UTM 31N) para reproyectar al mapa; sin él, el mapa OMITIRÁ esta "
+            "pista en vez de graficar metros UTM como si fueran grados (lo que "
+            "rompería el cuadro delimitador del mapa)."]
     if coord_unit == 2:
         if -180 <= lons[0] <= 180:
             return "EPSG:4326", ["✔ Arc-seconds → WGS84 detectado"]
@@ -354,10 +424,21 @@ def _check_crs_units(detected_crs: Optional[str], coord_unit: int) -> list:
 
 
 def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
-                                load_traces: bool = True) -> None:
+                                load_traces: bool = True,
+                                crs_override: Optional[str] = None) -> None:
     """
     Fill a SegyProfile from an already-open segyio file handle.
     Shared by load_metadata and load_profile.
+
+    ``crs_override`` is the reliable resolution path for projected
+    (CoordinateUnits=1) files — e.g. 'EPSG:32631' for UTM 31N — whenever the
+    SEG-Y header itself can't say which projection/zone was used (it never
+    can; see ``_detect_crs``). Passed straight through to ``prof.detected_crs``
+    resolution; ``prof.lons``/``prof.lats``/``prof.track_lons``/``track_lats``
+    stay in their NATIVE recorded units regardless (unchanged contract — they
+    feed exports, dist_km, and chain-gap geometry, none of which need or want
+    a CRS to be known). Only the MAP-facing path
+    (``sbp_studio.core.safe_map_coords``, fed by ``detected_crs``) changes.
     """
     prof.n_traces = f.tracecount
     prof.ns       = f.samples.size
@@ -463,6 +544,14 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
         data = f.trace.raw[:].T.astype(np.float32)
         if _keep is not None:                    # drop the duplicate columns
             data = np.ascontiguousarray(data[:, _keep])
+        # Mandatory DC-offset removal — the VERY FIRST thing done to the raw
+        # trace matrix, before anything else (DSP nodes, the legacy generic
+        # pipeline, amp_max/clip_p99 stats) ever sees it. inplace=True is
+        # safe here specifically: `data` was JUST allocated above (by
+        # .astype(...) or by np.ascontiguousarray's copy) and has no other
+        # reference yet, so skipping the extra allocation is a real memory
+        # win on the multi-GB matrices a deep MCS line can produce.
+        data = apply_dc_removal(data, inplace=True)
         prof.data     = data
         prof.amp_max  = np.max(np.abs(prof.data), axis=0)
         prof.clip_p99 = float(np.percentile(np.abs(prof.data), 99))
@@ -492,38 +581,67 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
         prof.trace_headers = _extract_trace_headers(f)
         if _keep is not None:                    # keep the inspector aligned too
             prof.trace_headers = {k: v[_keep] for k, v in prof.trace_headers.items()}
-    prof.detected_crs, prof.crs_notes = _detect_crs(prof.coord_unit, prof.lons)
+    prof.detected_crs, prof.crs_notes = _detect_crs(
+        prof.coord_unit, prof.lons, crs_override=crs_override, raw_text=_raw_text)
 
     # OQ-2: warn if projected CRS axis unit is not metres
     unit_warnings = _check_crs_units(prof.detected_crs, prof.coord_unit)
     prof.crs_notes.extend(unit_warnings)
 
 
+def set_crs_override(obj, crs_override: str) -> None:
+    """Apply a user-chosen CRS to an ALREADY-LOADED ``SegyProfile`` or
+    ``ProfileChain`` in place — no file re-read needed (``coord_unit`` and
+    ``lons`` are already resident in memory). This is what the GUI's GIS-
+    style CRS-selector dialog calls once the user picks a zone for a
+    PROJECTED (CoordinateUnits=1) file that couldn't be auto-detected (see
+    ``_detect_crs``).
+
+    Updates ``obj.detected_crs``/``obj.crs_notes`` only. ``obj.lons``/
+    ``obj.track_lons`` etc. are deliberately left untouched (native units —
+    see ``_populate_profile_from_file``'s contract); the map picks up the
+    new CRS on its next read via ``sbp_studio.core.safe_map_coords``.
+    """
+    crs, notes = _detect_crs(obj.coord_unit, obj.lons, crs_override=crs_override)
+    notes = list(notes) + _check_crs_units(crs, obj.coord_unit)
+    obj.detected_crs = crs
+    obj.crs_notes = notes
+
+
 # ── Public loaders ─────────────────────────────────────────────────────────────
 
-def load_metadata(path: str) -> SegyMetadata:
+def load_metadata(path: str, crs_override: Optional[str] = None) -> SegyMetadata:
     """
     Load header-only metadata from a SEG-Y file WITHOUT reading trace data.
     Fast even for large files: reads only binary header + per-trace fields.
+
+    ``crs_override``: EPSG/WKT string (e.g. 'EPSG:32631') to resolve the map
+    CRS for PROJECTED files (CoordinateUnits=1) — SEG-Y has no zone/projection
+    field, so this is the reliable way to tell the loader what UTM zone (or
+    other projected CRS) the file's Source/CDP X/Y are actually in. See
+    ``_detect_crs`` / ``sbp_studio.core.safe_map_coords``.
     """
     prof = SegyProfile(path)
     try:
         with segyio.open(path, ignore_geometry=True) as f:
-            _populate_profile_from_file(prof, f, load_traces=False)
+            _populate_profile_from_file(prof, f, load_traces=False, crs_override=crs_override)
     except Exception as exc:
         prof.error = str(exc)
     return prof.to_metadata()
 
 
-def load_profile(path: str, load_traces: bool = True) -> SegyProfile:
+def load_profile(path: str, load_traces: bool = True,
+                 crs_override: Optional[str] = None) -> SegyProfile:
     """
     Load a SEG-Y file into a SegyProfile.
     On error, .error is set and other fields remain at defaults. Never raises.
+
+    ``crs_override``: see :func:`load_metadata`.
     """
     prof = SegyProfile(path)
     try:
         with segyio.open(path, ignore_geometry=True) as f:
-            _populate_profile_from_file(prof, f, load_traces=load_traces)
+            _populate_profile_from_file(prof, f, load_traces=load_traces, crs_override=crs_override)
     except Exception as exc:
         prof.error = str(exc)
     return prof

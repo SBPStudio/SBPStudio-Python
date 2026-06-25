@@ -40,6 +40,9 @@ def tr_node(key: str, fallback: str = "") -> str:
         "log_compress": QCoreApplication.translate("DSPNodes", "Log Compression (Seismic HDR)"),
         "clahe":      QCoreApplication.translate("DSPNodes", "CLAHE (Adaptive Local Contrast)"),
         "despike":    QCoreApplication.translate("DSPNodes", "Despike (Impulsive Noise Removal)"),
+        "trace_eq":   QCoreApplication.translate("DSPNodes", "Trace Equalization (RMS Balance)"),
+        "trace_mix":  QCoreApplication.translate("DSPNodes", "Trace Mixing (Horizontal Smoothing)"),
+        "median_filter": QCoreApplication.translate("DSPNodes", "Median Filter (Edge-Preserving)"),
     }
     return table.get(key, fallback or key)
 
@@ -72,5 +75,7 @@ def tr_param(label: str) -> str:
         "Clip Limit":              QCoreApplication.translate("DSPNodes", "Clip Limit"),
         "Tile Grid Size":          QCoreApplication.translate("DSPNodes", "Tile Grid Size"),
         "Window Size":             QCoreApplication.translate("DSPNodes", "Window Size"),
+        "Traces to mix":           QCoreApplication.translate("DSPNodes", "Traces to mix"),
+        "Traces to evaluate":      QCoreApplication.translate("DSPNodes", "Traces to evaluate"),
     }
     return table.get(label, label)

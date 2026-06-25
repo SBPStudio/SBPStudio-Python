@@ -42,7 +42,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from ...core import crs_produces_geographic, to_geographic
 from ._base import HEADERS, MAP, PROFILE, SPECTRUM
 
 
@@ -131,16 +130,13 @@ class ProfileHandler(SourceHandler):
         tab.pages[HEADERS].set_view(tab._headers)
         tab._headers.set_source(profile)
         # Cleaned display track (median-filtered in core); raw lons/lats stay
-        # export-only. Reproject to WGS84 geographic via the core (passthrough if
-        # already geographic) so projected/UTM files render on the lon/lat
-        # basemap. Set BEFORE the preview fit (the fit's render feeds the
-        # distance axis → visible_traces_changed → the map highlights it).
-        crs = getattr(profile, "detected_crs", None)
-        mx, my = to_geographic(profile.track_lons, profile.track_lats, crs)
-        # Authoritative coordinate-unit flag from the ACTUAL CRS (Bug #10): a
-        # known CRS means the track is now WGS84 lon/lat; absent CRS → None →
-        # the map uses its magnitude heuristic.
-        tab._map.set_track(mx, my, is_geographic=crs_produces_geographic(crs))
+        # export-only. _refresh_map_track resolves WGS84 via safe_map_coords
+        # (reprojects known CRSs incl. projected/UTM; NEVER passes through
+        # unresolved projected metres — the "UTM-as-degrees blows up the
+        # basemap" crash fix) — output is ALWAYS valid WGS84-or-NaN. Set
+        # BEFORE the preview fit (the fit's render feeds the distance axis →
+        # visible_traces_changed → the map highlights it).
+        tab._refresh_map_track()
         tab.preview.set_source(profile)
         # Engage the aspect lock immediately (same path as touching a scale
         # control) so the section is NEVER left in free/unlocked aspect mode —
@@ -187,10 +183,8 @@ class ChainHandler(SourceHandler):
             # already available from the lightweight metadata, so show them now
             # and mark the section/spectrum as loading.
             tab.preview.set_source(None)
-            crs = getattr(chain, "detected_crs", None)
-            mx, my = to_geographic(chain.track_lons, chain.track_lats, crs)
             tab.pages[MAP].set_view(tab._map)
-            tab._map.set_track(mx, my, is_geographic=crs_produces_geographic(crs))
+            tab._refresh_map_track()
             tab.pages[HEADERS].set_view(tab._headers)
             tab._headers.set_source(chain)
             for i in (PROFILE, SPECTRUM):
@@ -200,11 +194,10 @@ class ChainHandler(SourceHandler):
         tab.pages[SPECTRUM].set_view(tab._spectrum)
         tab.pages[MAP].set_view(tab._map)
         tab.pages[HEADERS].set_view(tab._headers)
-        # Cleaned display track → WGS84 geographic via core (passthrough if
-        # already geographic) so projected chains land on the lon/lat basemap.
-        mx, my = to_geographic(chain.track_lons, chain.track_lats,
-                               getattr(chain, "detected_crs", None))
-        tab._map.set_track(mx, my)
+        # Cleaned display track → guaranteed-safe WGS84 via _refresh_map_track
+        # (reprojects known CRSs incl. projected/UTM chains; never passes
+        # through unresolved projected metres).
+        tab._refresh_map_track()
         tab._headers.set_source(chain)
         tab.preview.set_source(chain)
         # Engage the aspect lock immediately — see ProfileHandler.on_selected.

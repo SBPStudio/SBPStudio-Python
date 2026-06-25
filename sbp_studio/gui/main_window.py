@@ -533,6 +533,10 @@ class MainWindow(QMainWindow):
         self._run_worker(job, self._on_profiles_loaded)
 
     def _on_profiles_loaded(self, profiles: list) -> None:
+        # CRS prompting moved to SubTabbedTab._prompt_crs_if_needed (_base.py),
+        # triggered just-in-time when the user actually switches to the Map
+        # sub-tab — NOT here at load time, so loading a file for pure signal-
+        # processing work is never interrupted by a dialog.
         ok = errors = purged = 0
         for prof in profiles:
             if getattr(prof, "error", None):
@@ -667,13 +671,26 @@ class MainWindow(QMainWindow):
                                 True, pos)
 
     def _list_context_menu(self, widget, items: list, is_chain: bool, pos) -> None:
-        """Show the batch-export action for the current multi-selection."""
+        """Show the batch-export action for the current multi-selection, plus
+        'View Properties / Metadata…' when EXACTLY one item is selected
+        (inspecting metadata is inherently single-target)."""
         if not items:
             return
         menu = QMenu(self)
         act_export = menu.addAction(self.tr("Export selected in batch…"))
-        if menu.exec(widget.mapToGlobal(pos)) is act_export:
+        act_props = None
+        if len(items) == 1:
+            act_props = menu.addAction(self.tr("View Properties / Metadata…"))
+        chosen = menu.exec(widget.mapToGlobal(pos))
+        if chosen is act_export:
             self._batch_export(items, is_chain)
+        elif chosen is act_props:
+            self._show_metadata_inspector(items[0])
+
+    def _show_metadata_inspector(self, obj) -> None:
+        from .components import MetadataInspectorDialog
+        dlg = MetadataInspectorDialog(self, obj=obj, state=self.state)
+        dlg.exec()
 
     def _batch_export(self, items: list, is_chain: bool) -> None:
         """Open the export options ONCE, then hand the whole selection to the
@@ -724,20 +741,22 @@ class MainWindow(QMainWindow):
                 continue
             name = getattr(obj, "label", None) or getattr(obj, "name", "track")
             source_id = f"chain:{name}" if is_chain else getattr(obj, "path", None)
-            specs.append((name, lons, lats, getattr(obj, "detected_crs", None), source_id))
+            specs.append((name, lons, lats, getattr(obj, "coord_unit", 0),
+                         getattr(obj, "detected_crs", None), source_id))
         if not specs:
             self.status_lbl.setText(self.tr("No navigation tracks to add."))
             return
         self.task_started(self.tr("Extracting navigation tracks…"))
 
         def job(progress, cancel) -> list:
-            from sbp_studio.core import to_geographic
+            from sbp_studio.core import safe_map_coords
             out = []
             n = len(specs)
-            for i, (name, lons, lats, crs, source_id) in enumerate(specs):
+            for i, (name, lons, lats, coord_unit, crs, source_id) in enumerate(specs):
                 cancel.check()
                 progress(i / n, "")
-                x, y = to_geographic(lons, lats, crs)   # passthrough if geographic
+                # Guaranteed-safe WGS84-or-NaN — never raw projected metres.
+                x, y = safe_map_coords(lons, lats, coord_unit, crs)
                 out.append((name, x, y, source_id))
             progress(1.0, "")
             return out

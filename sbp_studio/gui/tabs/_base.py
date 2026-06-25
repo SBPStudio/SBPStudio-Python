@@ -19,8 +19,8 @@ from PyQt6.QtWidgets import (
 )
 
 from ..components import (
-    ExportDialog, HeaderView, MapView, PipelinePanel, PlaceholderView,
-    ProcessingControls, SeismicView, SpectrumView,
+    CRSSelectorDialog, ExportDialog, HeaderView, MapView, PipelinePanel,
+    PlaceholderView, ProcessingControls, SeismicView, SpectrumView,
 )
 from ..dsp import DSPContext, PreviewController
 from ..i18n import language_manager
@@ -323,6 +323,12 @@ class SubTabbedTab(QWidget):
         # generated for the current configuration.
         self.state.active_profile_changed.connect(lambda *_: self._update_dpi_estimate())
         self.state.active_chain_changed.connect(lambda *_: self._update_dpi_estimate())
+        # Map-redraw mechanism (Task 1): ANY code path that resolves a CRS in
+        # place (the Map-tab just-in-time prompt below, or the sidebar's
+        # Metadata Inspector "Edit CRS…") calls state.notify_crs_updated();
+        # every tab showing that object reacts here. One-way notification —
+        # the refresh itself never changes the CRS — so this cannot cycle.
+        self.state.crs_updated.connect(self._on_crs_updated)
         language_manager.language_changed.connect(self.retranslate_ui)
         self.retranslate_ui()
         self._update_dpi_estimate()
@@ -340,6 +346,58 @@ class SubTabbedTab(QWidget):
         when no profile is active. Does NOT change the active profile or section."""
         self.pages[MAP].set_view(self._map)
         self.subtabs.setCurrentIndex(MAP)
+
+    # ── Map redraw (Task 1) + just-in-time CRS prompt (Task 2) ──────────────
+
+    def _refresh_map_track(self) -> None:
+        """(Re)compute the active object's map track via
+        ``core.safe_map_coords`` and push it to the MapView — the single
+        shared code path for 'put the active object's track on the map',
+        used by _handlers.py's on_selected AND by every CRS-change reaction
+        below. Always safe to call with nothing active (no-op)."""
+        obj = self._active_object()
+        if obj is None:
+            return
+        lons = getattr(obj, "track_lons", None)
+        lats = getattr(obj, "track_lats", None)
+        if lons is None or lats is None or len(lons) == 0:
+            return
+        from sbp_studio.core import safe_map_coords
+        mx, my = safe_map_coords(lons, lats, getattr(obj, "coord_unit", 0),
+                                 getattr(obj, "detected_crs", None))
+        self._map.set_track(mx, my, is_geographic=True)
+
+    def _on_crs_updated(self, obj) -> None:
+        """state.crs_updated reaction: only redraw if the object whose CRS
+        just changed is the one THIS tab is currently showing — a CRS edit
+        on a profile that isn't on screen here must not touch this map."""
+        if obj is self._active_object():
+            self._refresh_map_track()
+
+    def _on_subtab_changed(self, index: int) -> None:
+        if index == MAP:
+            self._prompt_crs_if_needed()
+
+    def _prompt_crs_if_needed(self) -> None:
+        """GIS-style CRS resolution (QGIS/Petrel workflow), triggered ONLY by
+        actually landing on the Map sub-tab — never at file-load time, so
+        pure signal-processing work is never interrupted. Standard SEG-Y has
+        no field for the projection/zone (see io_segy._detect_crs), so a
+        PROJECTED (CoordinateUnits=1) file can't be auto-resolved; prompt
+        once per visit while it stays unresolved. Cancelling just leaves the
+        track empty (safe_map_coords already refuses to plot raw projected
+        metres as if they were WGS84 degrees) rather than forcing a choice."""
+        obj = self._active_object()
+        if obj is None or getattr(obj, "error", None):
+            return
+        if getattr(obj, "coord_unit", 0) != 1 or getattr(obj, "detected_crs", None) is not None:
+            return
+        from sbp_studio.core import set_crs_override
+        name = getattr(obj, "name", None) or getattr(obj, "label", "") or ""
+        dlg = CRSSelectorDialog(self, file_label=name)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_crs():
+            set_crs_override(obj, dlg.selected_crs())
+            self.state.notify_crs_updated(obj)
 
     # ── Overridable hooks ───────────────────────────────────────────────────
 
@@ -924,6 +982,12 @@ class SubTabbedTab(QWidget):
             self.pages.append(page)
             self.subtabs.addTab(page, "")
         col.addWidget(self.subtabs)
+        # Just-in-time CRS prompting (Task 2): only check/ask when the user
+        # actually lands on the Map sub-tab, not at file-load time — loading
+        # a file for pure signal-processing work never interrupts with a
+        # dialog. Checked fresh on EVERY switch into Map, so a previously
+        # cancelled prompt is offered again rather than silently dropped.
+        self.subtabs.currentChanged.connect(self._on_subtab_changed)
         return host
 
     # ── i18n ────────────────────────────────────────────────────────────────

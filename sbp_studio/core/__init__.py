@@ -18,11 +18,12 @@ from .io_segy import (load_metadata, load_profile, smooth_track,
                       patch_segy_headers, decode_text_header,
                       detect_text_header_encoding, read_raw_text_header,
                       trace_field_names, trace_field_int_range,
-                      patch_trace_header_field)
+                      patch_trace_header_field, set_crs_override)
 from .header_calc import (evaluate_header_expr, parse_assignment,
                           validate_header_result, available_functions,
                           HeaderExprError)
 from .processing import (
+    apply_dc_removal, apply_trace_equalization, apply_trace_mixing, apply_median_filter,
     apply_predictive_decon, apply_filter_preset, apply_agc,
     apply_bandpass, apply_tvg, apply_delay_alignment, apply_log_compression,
     apply_clahe, apply_despike,
@@ -33,8 +34,8 @@ from .processing import (
 )
 from .spectrum import compute_spectrum, SpectrumResult
 from .coordinates import resolve_crs, validate_crs
-from .spatial import (reproject_points, to_geographic, crs_produces_geographic,
-                      CRS_CATALOG, CRS_PRESETS)
+from .spatial import (reproject_points, to_geographic, safe_map_coords,
+                      crs_produces_geographic, CRS_CATALOG, CRS_PRESETS)
 from .gis_io import (read_gis_layer, read_vector, read_geotiff,
                      VectorLayer, RasterLayer)
 from .chaining import detect_chains, import_chains_from_directory
@@ -62,10 +63,12 @@ __all__ = [
     "join_profiles", "patch_segy_headers", "decode_text_header",
     "detect_text_header_encoding", "read_raw_text_header",
     "trace_field_names", "trace_field_int_range", "patch_trace_header_field",
+    "set_crs_override",
     # Header calculator (safe sandboxed expression evaluator)
     "evaluate_header_expr", "parse_assignment", "validate_header_result",
     "available_functions", "HeaderExprError",
     # Processing
+    "apply_dc_removal", "apply_trace_equalization", "apply_trace_mixing", "apply_median_filter",
     "apply_predictive_decon", "apply_filter_preset", "apply_agc",
     "apply_bandpass", "apply_tvg", "apply_delay_alignment", "apply_log_compression",
     "apply_clahe", "apply_despike",
@@ -77,7 +80,7 @@ __all__ = [
     "compute_spectrum", "SpectrumResult",
     # Coordinates
     "resolve_crs", "validate_crs", "reproject_points", "to_geographic",
-    "crs_produces_geographic", "CRS_CATALOG", "CRS_PRESETS",
+    "safe_map_coords", "crs_produces_geographic", "CRS_CATALOG", "CRS_PRESETS",
     "read_gis_layer", "read_vector", "read_geotiff", "VectorLayer", "RasterLayer",
     # Chaining
     "detect_chains", "import_chains_from_directory",
