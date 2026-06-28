@@ -157,6 +157,15 @@ class SeismicView(QWidget):
         self._va_item = None    # QGraphicsPathItem (lazy) — variable-area fill
         self._overlay_lines: List[pg.InfiniteLine] = []
         self._boundary_lines: List[pg.InfiniteLine] = []  # toggled live
+        # Parallel to _boundary_lines: each seam's TRUE trace-index position
+        # (resolved once via searchsorted against self._dist_km when the
+        # lines are (re)built — see _draw_overlays), so _reposition_boundaries
+        # can keep them glued to the image's own per-window linear
+        # approximation exactly like picks (_pick_x_km) instead of sitting at
+        # a fixed/raw km value that mismatches the actual seam pixel
+        # whenever the window's local stretch diverges from the chain's
+        # true (non-uniform) distance axis — the same bug picks had.
+        self._boundary_trace_indices: List[int] = []
         self._boundaries_visible: bool = True
 
         # A/B Compare overlay: a vertical divider + "A (raw)" / "B (filtered)"
@@ -877,6 +886,18 @@ class SeismicView(QWidget):
             self._pick_labels[p.id] = label
         scatter.setData(spots)
 
+    def _reposition_boundaries(self) -> None:
+        """Keep file-boundary seam lines glued to the image's own current
+        per-window linear approximation, exactly like picks (_pick_x_km) —
+        called whenever the displayed window changes (show_preview/
+        _apply_zoom_update/_push_full_image), not just when the boundary
+        list itself is rebuilt (_draw_overlays)."""
+        if not self._boundary_lines:
+            return
+        n_traces = self._dist_km.size if self._dist_km is not None else None
+        for ln, trace_idx in zip(self._boundary_lines, self._boundary_trace_indices):
+            ln.setPos(self._pick_x_km(trace_idx, n_traces))
+
     def _create_pick_at(self, scene_pos, trace_index: int) -> None:
         """Double-click handler: resolve the grid position, ask for a
         description, assign the next id, append + draw. Cancelling the
@@ -1098,6 +1119,7 @@ class SeismicView(QWidget):
             self.set_aspect(self._aspect)   # autoRanges to fit the new section
         if self._picks:
             self._redraw_picks()
+        self._reposition_boundaries()
 
     def set_overlays(self, boundaries: Sequence[float] = (),
                      fixes: Sequence[FixMark] = ()) -> None:
@@ -1298,6 +1320,7 @@ class SeismicView(QWidget):
         self._img_km_lo, self._img_km_hi = sub_d0, sub_d1
         if self._picks:
             self._redraw_picks()
+        self._reposition_boundaries()
 
     # ── Internals ───────────────────────────────────────────────────────────
 
@@ -1320,6 +1343,7 @@ class SeismicView(QWidget):
         self._last_zoom_key = None
         if self._picks:
             self._redraw_picks()
+        self._reposition_boundaries()
 
     def _colormap(self) -> pg.ColorMap:
         try:
@@ -1353,14 +1377,30 @@ class SeismicView(QWidget):
             ln.deleteLater()  # destroy C++ InfiniteLine + its child TextItem label
         self._overlay_lines.clear()
         self._boundary_lines.clear()
+        self._boundary_trace_indices.clear()
 
+        # boundaries are RAW km values (e.g. ProfileChain.boundaries_km).
+        # Resolve each to its TRUE trace-index position once here (via
+        # searchsorted against self._dist_km) and position the line via
+        # _pick_x_km — the SAME window-relative linear interpolation picks
+        # use — rather than the raw km value directly, so the seam stays
+        # glued to the actual column boundary the image renders, not an
+        # approximate absolute position (see _boundary_trace_indices'
+        # comment in __init__ for the full story).
+        dist = self._dist_km
+        n_traces = dist.size if dist is not None else None
         pen_b = pg.mkPen(theme.color("warn"), width=1, style=Qt.PenStyle.DashLine)
         for x in boundaries:
-            ln = pg.InfiniteLine(pos=float(x), angle=90, pen=pen_b)
+            trace_idx = int(np.searchsorted(dist, float(x))) if dist is not None else 0
+            if n_traces:
+                trace_idx = max(0, min(trace_idx, n_traces - 1))
+            x_km = self._pick_x_km(trace_idx, n_traces)
+            ln = pg.InfiniteLine(pos=x_km, angle=90, pen=pen_b)
             ln.setVisible(self._boundaries_visible)   # honour the live toggle
             self.plot.addItem(ln)
             self._overlay_lines.append(ln)
             self._boundary_lines.append(ln)
+            self._boundary_trace_indices.append(trace_idx)
 
         pen_f = pg.mkPen(theme.color("highlight"), width=1, style=Qt.PenStyle.DashLine)
         for num, dist, label in fixes:

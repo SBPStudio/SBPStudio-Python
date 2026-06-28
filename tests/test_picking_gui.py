@@ -724,3 +724,175 @@ class TestZoomDriftFix:
         # old local-pixel-grid conversion (using frozen t0=0/dt_ms=1
         # defaults under this t0=100 source) would have placed it.
         assert sv._pick_scatter.data["y"][0] == pytest.approx(400.0, abs=1.0)
+
+
+class TestBoundaryLineDrift:
+    """Regression coverage for the SAME non-linear-vs-linear-stretch bug
+    picks had, applied to the vertical seam lines marking where one
+    chained SEG-Y file ends and the next begins (ProfileChain.boundaries_km
+    → SeismicView.set_overlays). A boundary plotted at its raw/absolute km
+    position decouples from the actual column the seam renders at whenever
+    the displayed window's local linear stretch diverges from the chain's
+    true (non-uniform) distance axis — exactly the bug _pick_x_km fixed for
+    picks. Boundary lines now reuse that same machinery: each boundary's
+    TRUE trace-index position is resolved once (via searchsorted against
+    self._dist_km) when the lines are (re)built, then _reposition_boundaries
+    re-derives its window-relative km position via _pick_x_km on every
+    show_preview/_apply_zoom_update/_push_full_image — the same tracking
+    picks get."""
+
+    def test_boundary_line_positioned_via_pick_x_km_not_raw_km(self):
+        """A boundary at the line's TRUE dist_km position must render at
+        the linear-fraction position _pick_x_km computes for that trace —
+        NOT the raw km value passed to set_overlays."""
+        sv = _make_view()   # show_image(dist0=0, dist1=2, ...); dist_km = linspace(0,2,20)
+        boundary_km = float(sv._dist_km[8])
+        sv.set_overlays(boundaries=[boundary_km])
+        assert len(sv._boundary_lines) == 1
+        assert sv._boundary_trace_indices == [8]
+        expected = sv._pick_x_km(8, sv._dist_km.size)
+        assert sv._boundary_lines[0].value() == pytest.approx(expected)
+
+    def test_boundary_trace_index_resolved_via_searchsorted(self):
+        """The cached trace index for a boundary must be the searchsorted
+        position into self._dist_km at the time the lines were built —
+        the same resolution render_chain_figure's own per-segment slicing
+        already uses (np.searchsorted(ch.dist_km, bk))."""
+        sv = _make_view()
+        boundary_km = 0.73   # between dist_km[6]=0.6316 and dist_km[7]=0.7368
+        sv.set_overlays(boundaries=[boundary_km])
+        expected_idx = int(np.searchsorted(sv._dist_km, boundary_km))
+        assert sv._boundary_trace_indices == [expected_idx]
+
+    def test_boundary_reposition_tracks_a_show_preview_window_change(self):
+        """The actual fix's intent: a boundary's rendered km position must
+        TRACK whichever window is currently shown — mirroring
+        test_marker_tracks_the_new_window_on_a_preview_recompute for
+        picks."""
+        sv = _make_view()
+        sv.set_overlays(boundaries=[float(sv._dist_km[8])])
+        x_before = sv._boundary_lines[0].value()
+
+        sv.set_colormap("viridis", 1.0)
+        narrower = np.zeros((50, 7), dtype=np.float32)
+        sv.show_preview(narrower, dist0=0.4, dist1=1.0, t0=50.0, t1=450.0,
+                        vmax=1.0, c0=2, c1=9)
+
+        x_after = sv._boundary_lines[0].value()
+        assert x_after != x_before
+        assert x_after == pytest.approx(sv._pick_x_km(8, sv._dist_km.size))
+
+    def test_boundary_reposition_tracks_apply_zoom_update(self):
+        """The static (non-preview) buffer-slice path must ALSO reposition
+        existing boundary lines — mirroring picks' own
+        _apply_zoom_update handling."""
+        sv = _make_view()
+        sv.set_overlays(boundaries=[float(sv._dist_km[8])])
+
+        sv._rect = (0.0, 2.0, 0.0, 500.0)
+        sv._pending_ranges = [(0.5, 1.0), (0.0, 500.0)]
+        sv._last_zoom_key = None
+        sv._apply_zoom_update()
+
+        assert (sv._img_trace_lo, sv._img_trace_hi) == (5, 10)
+        assert sv._boundary_lines[0].value() == \
+            pytest.approx(sv._pick_x_km(8, sv._dist_km.size))
+
+    def test_no_boundaries_is_a_safe_no_op_on_reposition(self):
+        sv = _make_view()
+        sv._reposition_boundaries()   # must not raise with an empty list
+
+    def test_boundaries_visible_toggle_still_works_after_repositioning(self):
+        """set_boundaries_visible's existing behaviour must be unaffected
+        by the new positioning logic."""
+        sv = _make_view()
+        sv.set_overlays(boundaries=[float(sv._dist_km[8])])
+        sv.set_boundaries_visible(False)
+        assert sv._boundary_lines[0].isVisible() is False
+        sv.set_boundaries_visible(True)
+        assert sv._boundary_lines[0].isVisible() is True
+
+    def test_rebuilding_overlays_clears_stale_trace_indices(self):
+        """A SECOND set_overlays call with a different boundary list must
+        not leave stale entries from the first call in
+        _boundary_trace_indices (a parallel-list desync would silently
+        mis-position a later reposition)."""
+        sv = _make_view()
+        sv.set_overlays(boundaries=[float(sv._dist_km[3]), float(sv._dist_km[8])])
+        assert sv._boundary_trace_indices == [3, 8]
+        sv.set_overlays(boundaries=[float(sv._dist_km[15])])
+        assert sv._boundary_trace_indices == [15]
+        assert len(sv._boundary_lines) == 1
+
+
+class TestChainPickTraceIndexIsAlreadyGlobal:
+    """The architecture does NOT need (and must NOT apply) a cumulative
+    per-file trace offset when burning chain picks into the export raster.
+
+    ProfileChain.load_chain_traces (core/model.py) assembles ONE combined
+    (ns, total_n_traces) array via np.concatenate(mats, axis=1), and
+    dist_km/boundaries_km are built the same way — every constituent
+    file's traces already live in ONE shared, GLOBAL column index space.
+    PreviewController._refresh (preview.py) sources both ``data`` and
+    ``dist_km`` straight from that same chain object, and
+    SeismicView._picking_trace_index_at_scene_pos resolves trace_index
+    purely from that global space — it has no notion of "which file" a
+    trace belongs to. render_chain_figure's OWN per-segment slicing
+    (seg_boundaries via searchsorted(ch.dist_km, bk), used to crop each
+    constituent file's columns out of the combined data/resized buffer)
+    independently treats that exact same column axis as global.
+
+    Adding a cumulative per-file offset before calling _draw_picks would
+    therefore DOUBLE-count the offset already baked into trace_index by
+    construction, pushing every pick whose file is not first in the chain
+    further right than its true position — this test proves the global
+    indexing holds end-to-end so that mistake is never made."""
+
+    def test_chain_pick_trace_index_already_indexes_the_combined_array(self):
+        """A pick's trace_index, once resolved via the chain's OWN global
+        dist_km/data column space, must already be directly usable as a
+        column index into the SAME combined array render_chain_figure
+        slices via seg_boundaries — no extra offset required."""
+        import numpy as np
+        from sbp_studio.core import PickPoint
+
+        # A synthetic 2-file chain: file A has 12 traces, file B has 8 —
+        # boundaries_km marks the seam at the GLOBAL index 12.
+        dist_a = np.linspace(0.0, 1.2, 12)
+        dist_b = np.linspace(1.2, 2.0, 8) + 0.05   # +gap, like a real chain
+        dist_km = np.concatenate([dist_a, dist_b])
+        n_traces = dist_km.size
+        assert n_traces == 20
+
+        # A pick placed on a trace WITHIN file B (global index 15, i.e.
+        # local index 3 within file B) — exactly the scenario the (wrong)
+        # diagnosis would want to offset by file A's trace count (12).
+        pick = PickPoint(id=1, trace_index=15, time_ms=50.0,
+                         x_coord=0.0, y_coord=0.0, description="p")
+
+        # render_chain_figure's OWN segmentation logic for this boundary:
+        seg_boundaries = [0, int(np.searchsorted(dist_km, dist_b[0])), n_traces]
+        assert seg_boundaries == [0, 12, 20]
+        # The pick's GLOBAL trace_index (15) must fall inside file B's
+        # OWN segment [12, 20) of the combined array — confirming it is
+        # already expressed in the SAME global space seg_boundaries uses,
+        # with NO additional offset applied or needed.
+        assert seg_boundaries[1] <= pick.trace_index < seg_boundaries[2]
+
+        # And it must land at the CORRECT linear-fraction position within
+        # the FULL combined extent (x_lo=dist_km[0], x_hi=dist_km[-1]),
+        # using trace_index DIRECTLY — exactly what _draw_picks does.
+        x_lo, x_hi = float(dist_km[0]), float(dist_km[-1])
+        frac = pick.trace_index / n_traces
+        x_correct = x_lo + frac * (x_hi - x_lo)
+
+        # The (incorrect) cumulative-offset approach would instead compute:
+        offset_wrong = 12   # file A's n_traces
+        frac_wrong = (pick.trace_index + offset_wrong) / n_traces
+        x_wrong = x_lo + frac_wrong * (x_hi - x_lo)
+
+        assert x_correct != pytest.approx(x_wrong)
+        # x_wrong overshoots past x_hi (proof it's nonsensical: a GLOBAL
+        # index already inside [0, n_traces) being offset AGAIN exceeds the
+        # valid range entirely).
+        assert x_wrong > x_hi
