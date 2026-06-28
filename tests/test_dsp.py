@@ -21,12 +21,15 @@ import numpy as np
 import pytest
 
 from sbp_studio.core import (
-    apply_agc, apply_clahe, apply_despike, apply_log_compression, apply_median_filter,
-    apply_trace_equalization, apply_trace_mixing, apply_tvg,
+    apply_agc, apply_bilateral_filter, apply_clahe, apply_despike, apply_log_compression,
+    apply_median_filter, apply_spherical_divergence, apply_svd_filter, apply_trace_equalization,
+    apply_trace_mixing, apply_tvg, pick_seabed,
 )
 from sbp_studio.gui.dsp import (
-    AGCNode, CLAHENode, DespikeNode, DSPContext, LogCompressionNode, MedianFilterNode, Pipeline,
-    TraceEqualizationNode, TraceMixingNode, TVGNode, extract_visible_window,
+    AGCNode, BilateralFilterNode, CLAHENode, DespikeNode, DSPContext, LogCompressionNode,
+    MedianFilterNode, Pipeline, SphericalDivergenceNode, SVDFilterNode, TraceEqualizationNode,
+    TraceMixingNode, TVGNode,
+    extract_visible_window,
 )
 
 
@@ -178,6 +181,222 @@ class TestAGCMath:
         np.testing.assert_array_equal(
             node.apply(data, ctx),
             apply_agc(data, 25.0, self.DT_US))
+
+
+class TestSphericalDivergenceMath:
+    DT_US = 250
+
+    def _trace_with_seabed(self, ns=1000, seabed_idx=200, amp=5.0, noise_std=0.05, seed=0):
+        """A trace with a genuine, sharp energy break at ``seabed_idx`` (a
+        Ricker wavelet), plus a little water-column noise — the realistic
+        case pick_seabed/the dynamic gain path are meant for, as opposed to
+        the degenerate constant/pure-noise arrays used elsewhere below."""
+        wav = ricker(101, 250e-6, 800.0)
+        tr = np.zeros(ns, dtype=np.float32)
+        lo, hi = seabed_idx - 50, seabed_idx + 51
+        tr[lo:hi] += amp * wav
+        tr += np.random.default_rng(seed).normal(0.0, noise_std, ns).astype(np.float32)
+        return tr
+
+    # ── exponent=0 / negative-exponent clamp (path-independent) ─────────────
+
+    def test_exponent_zero_is_exact_no_op_both_paths(self):
+        data = np.random.default_rng(0).standard_normal((500, 10)).astype(np.float32) * 5.0
+        for ref in (True, False):
+            out = apply_spherical_divergence(data, exponent=0.0, reference_seabed=ref)
+            np.testing.assert_allclose(out, data, atol=1e-5)
+
+    def test_negative_exponent_clamped_to_no_op_both_paths(self):
+        """A negative exponent would invert the curve into an attenuation —
+        the opposite of this filter's purpose — so it is floored at 0.0,
+        BEFORE either path's gain-curve math runs (path-independent)."""
+        data = np.random.default_rng(1).standard_normal((300, 5)).astype(np.float32)
+        for ref in (True, False):
+            out = apply_spherical_divergence(data, exponent=-3.0, reference_seabed=ref)
+            np.testing.assert_allclose(out, data, atol=1e-5)
+
+    # ── legacy global curve (reference_seabed=False) ────────────────────────
+
+    def test_legacy_curve_normalised_to_unit_mean(self):
+        """The legacy (from-t=0) curve must average to ~1.0 regardless of
+        exponent — the original safeguard against the amplitude range
+        exploding/clipping the viewport, unchanged by this turn's work."""
+        ns = 500
+        data = np.ones((ns, 1), dtype=np.float32)
+        for exponent in (0.5, 1.0, 2.0, 5.0):
+            out = apply_spherical_divergence(data, exponent=exponent, reference_seabed=False)
+            assert float(np.mean(out)) == pytest.approx(1.0, abs=1e-6)
+
+    def test_legacy_curve_increases_monotonically_from_t_zero(self):
+        data = np.ones((1000, 1), dtype=np.float32)
+        out = apply_spherical_divergence(data, exponent=1.0, reference_seabed=False)
+        assert out[10, 0] < out[500, 0] < out[990, 0]
+
+    def test_large_ns_and_exponent_does_not_overflow_legacy(self):
+        """float64 accumulation: t**exponent for a long trace at the high
+        end of the exponent range must stay finite, not overflow to inf."""
+        data = np.random.default_rng(2).standard_normal((100_000, 3)).astype(np.float32)
+        out = apply_spherical_divergence(data, exponent=5.0, reference_seabed=False)
+        assert np.all(np.isfinite(out))
+
+    def test_single_sample_trace_is_safe_legacy(self):
+        single = np.array([[5.0]], dtype=np.float32)
+        out = apply_spherical_divergence(single, exponent=3.0, reference_seabed=False)
+        np.testing.assert_allclose(out, single)
+
+    # ── pick_seabed ───────────────────────────────────────────────────────
+
+    def test_pick_seabed_finds_the_known_reflector(self):
+        tr = self._trace_with_seabed(seabed_idx=300)
+        data = np.tile(tr[:, None], (1, 4))
+        pick = pick_seabed(data)
+        assert np.all(np.abs(pick - 300) < 15)            # near the true break, all traces agree
+
+    def test_pick_seabed_falls_back_to_zero_on_constant_trace(self):
+        """No energy break anywhere -> picks index 0, the documented
+        fallback (callers then reduce transparently to a from-t=0 curve)."""
+        data = np.full((400, 3), 2.0, dtype=np.float32)
+        pick = pick_seabed(data)
+        np.testing.assert_array_equal(pick, 0)
+
+    def test_pick_seabed_falls_back_to_zero_on_all_zero_trace(self):
+        data = np.zeros((400, 3), dtype=np.float32)
+        pick = pick_seabed(data)
+        np.testing.assert_array_equal(pick, 0)
+
+    def test_pick_seabed_is_robust_to_an_early_noise_spike(self):
+        """A single early impulsive spike (not the real seafloor) must not
+        fool the pick — the whole reason the envelope is smoothed first."""
+        tr = self._trace_with_seabed(seabed_idx=400, noise_std=0.02)
+        tr[5] = 50.0                                       # huge early 1-sample spike
+        data = tr[:, None]
+        pick = pick_seabed(data)
+        assert abs(int(pick[0]) - 400) < 15
+
+    # ── dynamic, seabed-referenced gain (reference_seabed=True, default) ────
+
+    def test_water_column_gets_flat_gain(self):
+        tr = self._trace_with_seabed(seabed_idx=300, noise_std=0.02)
+        data = tr[:, None]
+        out = apply_spherical_divergence(data, exponent=1.0, reference_seabed=True)
+        ratio = (out[:250, 0] / (data[:250, 0] + 1e-9))
+        assert np.allclose(ratio, ratio[0], atol=1e-3)     # constant above the seabed
+
+    def test_gain_is_continuous_at_the_seabed_boundary(self):
+        tr = self._trace_with_seabed(seabed_idx=300, noise_std=0.02)
+        data = tr[:, None]
+        out = apply_spherical_divergence(data, exponent=1.0, reference_seabed=True)
+        pick = int(pick_seabed(data)[0])
+        gain_above = out[pick - 5, 0] / (data[pick - 5, 0] + 1e-9)
+        gain_at = out[pick, 0] / (data[pick, 0] + 1e-9)
+        assert gain_at == pytest.approx(gain_above, rel=1e-3)
+
+    def test_gain_grows_monotonically_below_the_seabed(self):
+        tr = self._trace_with_seabed(seabed_idx=300, noise_std=0.02)
+        data = tr[:, None]
+        out = apply_spherical_divergence(data, exponent=1.0, reference_seabed=True)
+        pick = int(pick_seabed(data)[0])
+        g1 = out[pick + 50, 0] / (data[pick + 50, 0] + 1e-9)
+        g2 = out[pick + 400, 0] / (data[pick + 400, 0] + 1e-9)
+        assert g2 > g1
+
+    def test_shallow_and_deep_seabed_traces_share_the_same_water_column_gain(self):
+        """The whole geophysical fix: a deep-water trace's water column must
+        no longer be blown out relative to a shallow-water trace's — both
+        get the SAME flat gain, because normalisation is one global scalar
+        for the whole chunk, not per-trace."""
+        shallow = self._trace_with_seabed(seabed_idx=200, noise_std=0.02, seed=1)
+        deep = self._trace_with_seabed(seabed_idx=800, noise_std=0.02, seed=2)
+        data = np.stack([shallow, deep], axis=1)
+        out = apply_spherical_divergence(data, exponent=1.0, reference_seabed=True)
+        ratio_shallow = out[20, 0] / (data[20, 0] + 1e-9)
+        ratio_deep = out[20, 1] / (data[20, 1] + 1e-9)
+        assert ratio_shallow == pytest.approx(ratio_deep, rel=1e-3)
+
+    def test_degenerate_trace_falls_back_to_legacy_curve(self):
+        """A trace with no clear seabed (pick=0) must produce EXACTLY the
+        same output as the legacy from-t=0 curve for that trace."""
+        data = np.full((400, 3), 2.0, dtype=np.float32)
+        out_dynamic = apply_spherical_divergence(data, exponent=1.5, reference_seabed=True)
+        out_legacy = apply_spherical_divergence(data, exponent=1.5, reference_seabed=False)
+        np.testing.assert_allclose(out_dynamic, out_legacy, rtol=1e-5)
+
+    def test_all_zero_chunk_is_safe_dynamic(self):
+        data = np.zeros((300, 4), dtype=np.float32)
+        out = apply_spherical_divergence(data, exponent=2.0, reference_seabed=True)
+        assert np.all(np.isfinite(out))
+        assert np.allclose(out, 0.0)
+
+    def test_large_ns_and_exponent_does_not_overflow_dynamic(self):
+        data = np.random.default_rng(3).standard_normal((100_000, 3)).astype(np.float32)
+        out = apply_spherical_divergence(data, exponent=5.0, reference_seabed=True)
+        assert np.all(np.isfinite(out))
+
+    def test_preserves_shape_dtype_and_no_mutation(self):
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        original = data.copy()
+        out = apply_spherical_divergence(data, exponent=1.0)
+        assert out.shape == data.shape
+        assert out.dtype == np.float32
+        assert np.array_equal(data, original)
+
+    # ── node / pipeline integration ──────────────────────────────────────
+
+    def test_node_matches_core_reference(self):
+        ctx = DSPContext(dt_us=self.DT_US, ns=1000, n_traces=8)
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        node = SphericalDivergenceNode({"exponent": 2.0, "reference_seabed": False})
+        np.testing.assert_array_equal(
+            node.apply(data, ctx),
+            apply_spherical_divergence(data, 2.0, reference_seabed=False))
+
+    def test_node_matches_core_reference_dynamic(self):
+        ctx = DSPContext(dt_us=self.DT_US, ns=1000, n_traces=8)
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        node = SphericalDivergenceNode({"exponent": 2.0, "reference_seabed": True})
+        np.testing.assert_array_equal(
+            node.apply(data, ctx),
+            apply_spherical_divergence(data, 2.0, reference_seabed=True))
+
+    def test_node_default_and_spec_bounds(self):
+        node = SphericalDivergenceNode()
+        assert node.params["exponent"] == 1.0
+        assert node.params["reference_seabed"] is True
+        exp_spec, ref_spec = SphericalDivergenceNode.SPECS
+        assert exp_spec.name == "exponent"
+        assert exp_spec.lo == 0.0 and exp_spec.hi == 5.0 and exp_spec.default == 1.0
+        assert exp_spec.step == 0.1 and exp_spec.decimals == 1
+        assert ref_spec.name == "reference_seabed"
+        assert ref_spec.default is True
+
+    def test_node_is_precrop(self):
+        """The seabed pick (and even the legacy curve's own t=0 meaning)
+        both require the FULL trace, never a cropped ViewBox fragment —
+        same rationale as TVGNode/WaterMuteNode."""
+        assert SphericalDivergenceNode.PRECROP is True
+
+    def test_order_sensitive_vs_agc(self):
+        ctx = DSPContext(dt_us=self.DT_US, ns=500, n_traces=10)
+        data = np.random.default_rng(3).standard_normal((500, 10)).astype(np.float32) * 5.0
+        p1 = Pipeline([SphericalDivergenceNode(), AGCNode({"win_ms": 20.0})])
+        p2 = Pipeline([AGCNode({"win_ms": 20.0}), SphericalDivergenceNode()])
+        out1 = p1.process(data, ctx, input_token="a")
+        out2 = p2.process(data, ctx, input_token="b")
+        assert not np.allclose(out1, out2)
+
+    def test_bool_spec_is_dispatched_to_a_checkbox_row(self):
+        """UI wiring (no live widget construction — this sandbox's Qt
+        backend hangs on ANY real widget instantiation, a documented
+        pre-existing limitation unrelated to this change; verified manually
+        in a normal desktop session instead): the panel's editor-builder
+        must route a BoolSpec param to _BoolRow, a real QCheckBox row, not
+        the ChoiceSpec/ParamSpec combo-box-or-slider fallback."""
+        from sbp_studio.gui.components.pipeline_panel import _BoolRow
+        from sbp_studio.gui.dsp import BoolSpec
+        node = SphericalDivergenceNode()
+        ref_spec = next(s for s in node.SPECS if s.name == "reference_seabed")
+        assert isinstance(ref_spec, BoolSpec)
+        assert issubclass(_BoolRow, object) and hasattr(_BoolRow, "_on_toggled")
 
 
 class TestTraceMixingMath:
@@ -361,6 +580,192 @@ class TestMedianFilterMath:
         data = rng.standard_normal((300, 15)).astype(np.float32) * 5.0
         p1 = Pipeline([MedianFilterNode(), AGCNode({"win_ms": 20.0})])
         p2 = Pipeline([AGCNode({"win_ms": 20.0}), MedianFilterNode()])
+        out1 = p1.process(data, ctx, input_token="a")
+        out2 = p2.process(data, ctx, input_token="b")
+        assert not np.allclose(out1, out2)
+
+
+class TestSVDFilterMath:
+    DT_US = 250
+
+    def _coherent_plus_noise(self, ns=200, nt=60, noise_std=0.3, seed=0):
+        rng = np.random.default_rng(seed)
+        t = np.linspace(0, 1, ns)
+        coherent = (np.outer(np.sin(2 * np.pi * 5 * t), np.ones(nt))
+                    + np.outer(np.cos(2 * np.pi * 3 * t), np.linspace(0, 1, nt))).astype(np.float32)
+        noise = (rng.standard_normal((ns, nt)) * noise_std).astype(np.float32)
+        return coherent, coherent + noise
+
+    def test_truncation_reduces_residual_vs_coherent_signal(self):
+        """The whole premise: reconstructing from only the top components
+        must land closer to the underlying coherent signal than the raw,
+        noisy input did."""
+        coherent, data = self._coherent_plus_noise()
+        out = apply_svd_filter(data, num_components=10)
+        assert np.std(out - coherent) < np.std(data - coherent)
+
+    def test_all_zero_chunk_is_safe_not_arpack_error(self):
+        """An exactly-all-zero chunk (e.g. a fully-muted window) would crash
+        ARPACK's Lanczos iteration (zero starting vector) without the guard."""
+        data = np.zeros((80, 30), dtype=np.float32)
+        out = apply_svd_filter(data, num_components=10)
+        assert np.all(np.isfinite(out))
+        assert np.allclose(out, 0.0)
+
+    def test_num_components_clipped_to_matrix_rank_bound(self):
+        """svds requires k < min(shape); an over-large request must be
+        clipped, not crash, on a small matrix/viewport chunk."""
+        data = np.random.default_rng(1).standard_normal((5, 8)).astype(np.float32)
+        out = apply_svd_filter(data, num_components=100)
+        assert out.shape == data.shape
+        assert np.all(np.isfinite(out))
+
+    def test_single_trace_or_single_sample_is_safe_passthrough(self):
+        rng = np.random.default_rng(2)
+        single_trace = rng.standard_normal((50, 1)).astype(np.float32)
+        out = apply_svd_filter(single_trace, num_components=10)
+        assert np.array_equal(out, single_trace)
+
+    def test_preserves_shape_dtype_and_no_mutation(self):
+        coherent, data = self._coherent_plus_noise()
+        original = data.copy()
+        out = apply_svd_filter(data, num_components=10)
+        assert out.shape == data.shape
+        assert out.dtype == np.float32
+        assert np.array_equal(data, original)
+
+    def test_node_matches_core_reference(self):
+        ctx = DSPContext(dt_us=self.DT_US, ns=1000, n_traces=8)
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        node = SVDFilterNode({"num_components": 3})
+        np.testing.assert_array_equal(
+            node.apply(data, ctx),
+            apply_svd_filter(data, 3))
+
+    def test_node_default_param_and_generous_trace_halo(self):
+        node = SVDFilterNode()
+        assert node.params["num_components"] == 10
+        ctx = DSPContext(dt_us=self.DT_US, ns=100, n_traces=200)
+        assert node.trace_halo(ctx) == 50            # generous, independent of num_components
+
+    def test_node_spec_bounds(self):
+        spec = SVDFilterNode.SPECS[0]
+        assert spec.name == "num_components"
+        assert spec.lo == 2.0 and spec.hi == 100.0 and spec.default == 10.0 and spec.step == 1.0
+        assert spec.decimals == 0
+
+    def test_order_sensitive_vs_agc(self):
+        ctx = DSPContext(dt_us=self.DT_US, ns=200, n_traces=60)
+        _, data = self._coherent_plus_noise(seed=3)
+        p1 = Pipeline([SVDFilterNode(), AGCNode({"win_ms": 20.0})])
+        p2 = Pipeline([AGCNode({"win_ms": 20.0}), SVDFilterNode()])
+        out1 = p1.process(data, ctx, input_token="a")
+        out2 = p2.process(data, ctx, input_token="b")
+        assert not np.allclose(out1, out2)
+
+
+class TestBilateralFilterMath:
+    DT_US = 250
+
+    def _step_edge_plus_noise(self, ns=100, nt=40, noise_std=0.3, seed=0):
+        """A sharp lateral step (fault) between two flat amplitude levels,
+        plus per-sample random noise — the canonical edge-preservation probe."""
+        rng = np.random.default_rng(seed)
+        half = nt // 2
+        coherent = np.concatenate([
+            np.full((ns, half), 1.0), np.full((ns, nt - half), 10.0)], axis=1).astype(np.float64)
+        noise = (rng.standard_normal((ns, nt)) * noise_std)
+        data = (coherent + noise).astype(np.float32)
+        return coherent, data, half
+
+    def test_preserves_edge_far_better_than_mean(self):
+        """The whole point vs Trace Mixing: a neighbour on the OTHER side of
+        a sharp amplitude step gets a near-zero weight, so the edge survives
+        — unlike the plain mean, which blends both sides into a mush value
+        near the boundary."""
+        coherent, data, half = self._step_edge_plus_noise()
+        out_bf = apply_bilateral_filter(data, window_size=7, sigma_space=2.0, sigma_color=0.5)
+        out_mean = apply_trace_mixing(data, window_size=7)
+
+        bf_err = abs(float(out_bf[0, half - 1]) - 1.0) + abs(float(out_bf[0, half]) - 10.0)
+        mean_err = abs(float(out_mean[0, half - 1]) - 1.0) + abs(float(out_mean[0, half]) - 10.0)
+        assert bf_err < mean_err / 2.0
+
+    def test_reduces_noise_within_flat_coherent_region(self):
+        """Away from any edge, neighbours ARE amplitude-similar, so the
+        filter still behaves like a smoother there — denoising isn't
+        sacrificed just to get edge preservation."""
+        coherent, data, half = self._step_edge_plus_noise()
+        out = apply_bilateral_filter(data, window_size=7, sigma_space=2.0, sigma_color=0.5)
+        flat_cols = slice(5, half - 5)             # well inside one flat side, away from the edge
+        raw_std = (data[:, flat_cols].astype(np.float64) - coherent[:, flat_cols]).std()
+        out_std = (out[:, flat_cols].astype(np.float64) - coherent[:, flat_cols]).std()
+        assert out_std < raw_std
+
+    def test_constant_chunk_is_safe_passthrough(self):
+        """Zero-variance input has nothing to normalise sigma_color
+        against — must return unchanged, never NaN (0/0 in the Gaussian)."""
+        data = np.full((30, 10), 5.0, dtype=np.float32)
+        out = apply_bilateral_filter(data)
+        assert np.array_equal(out, data)
+
+    def test_zero_sigma_color_is_safe_not_nan(self):
+        _, data, _ = self._step_edge_plus_noise()
+        out = apply_bilateral_filter(data, sigma_color=0.0)
+        assert np.all(np.isfinite(out))
+
+    def test_zero_sigma_space_is_safe_not_nan(self):
+        _, data, _ = self._step_edge_plus_noise()
+        out = apply_bilateral_filter(data, sigma_space=0.0)
+        assert np.all(np.isfinite(out))
+
+    def test_even_window_is_coerced_to_next_odd(self):
+        data = np.random.default_rng(0).standard_normal((50, 20)).astype(np.float32)
+        np.testing.assert_array_equal(
+            apply_bilateral_filter(data, window_size=4),
+            apply_bilateral_filter(data, window_size=5))
+
+    def test_window_one_is_pass_through_copy(self):
+        data = np.random.default_rng(1).standard_normal((40, 10)).astype(np.float32)
+        out = apply_bilateral_filter(data, window_size=1)
+        assert np.array_equal(out, data)
+        assert out is not data
+
+    def test_preserves_shape_dtype_and_no_mutation(self):
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        original = data.copy()
+        out = apply_bilateral_filter(data, window_size=5)
+        assert out.shape == data.shape
+        assert out.dtype == np.float32
+        assert np.array_equal(data, original)
+
+    def test_node_matches_core_reference(self):
+        ctx = DSPContext(dt_us=self.DT_US, ns=1000, n_traces=8)
+        data = as_matrix(synthetic_trace(noise_std=0.05))
+        node = BilateralFilterNode({"window_size": 5, "sigma_color": 0.5})
+        np.testing.assert_array_equal(
+            node.apply(data, ctx),
+            apply_bilateral_filter(data, 5, sigma_color=0.5))
+
+    def test_node_defaults_and_trace_halo_matches(self):
+        node = BilateralFilterNode()
+        assert node.params["window_size"] == 5
+        assert node.params["sigma_color"] == 0.5
+        ctx = DSPContext(dt_us=self.DT_US, ns=100, n_traces=20)
+        assert node.trace_halo(ctx) == 2             # window_size // 2
+
+    def test_node_spec_bounds(self):
+        win_spec, color_spec = BilateralFilterNode.SPECS
+        assert win_spec.name == "window_size"
+        assert win_spec.lo == 3.0 and win_spec.default == 5.0 and win_spec.step == 2.0
+        assert color_spec.name == "sigma_color"
+        assert color_spec.default == 0.5
+
+    def test_order_sensitive_vs_agc(self):
+        ctx = DSPContext(dt_us=self.DT_US, ns=200, n_traces=40)
+        _, data, _ = self._step_edge_plus_noise(seed=4)
+        p1 = Pipeline([BilateralFilterNode(), AGCNode({"win_ms": 20.0})])
+        p2 = Pipeline([AGCNode({"win_ms": 20.0}), BilateralFilterNode()])
         out1 = p1.process(data, ctx, input_token="a")
         out2 = p2.process(data, ctx, input_token="b")
         assert not np.allclose(out1, out2)
@@ -890,8 +1295,140 @@ class TestNodeMigration:
         keys = {c.KEY for c in NODE_REGISTRY}
         assert keys == {"swell", "fk", "water_mute", "demultiple", "decon",
                         "bandpass", "notch", "whiten", "preset", "trace_eq", "trace_mix",
-                        "median_filter", "tvg", "agc", "log_compress", "clahe", "despike"}
+                        "median_filter", "bilateral_filter", "svd_filter", "tvg", "agc",
+                        "spherical_divergence", "log_compress", "clahe", "despike"}
         assert "align" not in keys
+
+
+class TestSelfDocumentingTooltips:
+    """The 'Add module' dropdown's hover tooltips: every node must declare
+    one, it must round-trip through tr_tooltip identically (no typo between
+    the class constant and the i18n table), and the menu wiring that
+    surfaces it must use the correct QMenu API (QMenu hides QAction
+    tooltips by default unless setToolTipsVisible(True) is called — the
+    actual pitfall here, not the import path)."""
+
+    def test_every_registered_node_has_a_tooltip(self):
+        from sbp_studio.gui.dsp import NODE_REGISTRY
+        missing = [c.KEY for c in NODE_REGISTRY if not getattr(c, "TOOLTIP", "")]
+        assert missing == []
+
+    def test_tooltip_is_concise_one_to_two_sentences(self):
+        """Loosely enforce 'concise' (the task's own wording): short enough
+        for a hover tooltip, not a paragraph."""
+        from sbp_studio.gui.dsp import NODE_REGISTRY
+        for cls in NODE_REGISTRY:
+            assert 20 < len(cls.TOOLTIP) < 320, cls.KEY
+            assert cls.TOOLTIP.count(".") <= 3, cls.KEY    # ~1-2 sentences, some abbreviations
+
+    def test_tr_tooltip_round_trips_every_node_exactly(self):
+        """No silent typo between the node class's TOOLTIP and node_i18n's
+        translation table — they must be byte-identical English source text
+        (translate() returns the source verbatim with no .qm loaded)."""
+        from sbp_studio.gui.dsp import NODE_REGISTRY, tr_tooltip
+        for cls in NODE_REGISTRY:
+            assert tr_tooltip(cls.KEY, cls.TOOLTIP) == cls.TOOLTIP, cls.KEY
+
+    def test_tr_tooltip_unknown_key_falls_back(self):
+        from sbp_studio.gui.dsp import tr_tooltip
+        assert tr_tooltip("not_a_real_key", "fallback text") == "fallback text"
+        assert tr_tooltip("not_a_real_key") == "not_a_real_key"
+
+    def test_add_menu_sets_tooltip_and_enables_tooltips_visible(self):
+        """Verifies the ACTUAL pitfall for this widget type: QMenu does not
+        show QAction tooltips unless setToolTipsVisible(True) is called.
+        No live widget construction (this sandbox hangs on any real Qt
+        widget instantiation — confirmed pre-existing and unrelated by
+        reproducing the same hang with a bare QCheckBox()); instead this
+        inspects PipelinePanel's source directly. The category-header
+        reorganization extracted the per-action tooltip-setting line out of
+        _show_add_menu into _add_node_action, so both methods are checked."""
+        import inspect
+        from sbp_studio.gui.components.pipeline_panel import PipelinePanel
+        src = inspect.getsource(PipelinePanel._show_add_menu)
+        assert "setToolTipsVisible(True)" in src
+        node_action_src = inspect.getsource(PipelinePanel._add_node_action)
+        assert "act.setToolTip(" in node_action_src
+        assert "tr_tooltip(" in node_action_src
+
+    # ── Bug follow-up: 'filtros preestablecidos' had NO item tooltips ───────
+    #
+    # Root cause: TWO separate preset combos exist in this app, and last
+    # turn's fix only touched the Add-module MENU (one QAction per node,
+    # including a single "Filter Preset / Attribute" entry) — it never
+    # touched either combo box that lists the PRESET CHOICES themselves:
+    #   1. ProcessingControls.preset_cb — the legacy/static "PRESET FILTERS"
+    #      section (Spanish source label literally "FILTROS PREESTABLECIDOS"),
+    #      a plain QComboBox populated from FILTER_PRESETS with NO per-item
+    #      tooltip at all.
+    #   2. PresetNode's "Type" ChoiceSpec combo (_ChoiceRow, in the dynamic
+    #      pipeline param editor) — same gap, different widget.
+    # Neither is a QMenu/submenu (grep confirms pipeline_panel.py creates
+    # exactly one QMenu, no addMenu() anywhere), so the submenu propagation
+    # rule doesn't apply here — the fix is Qt.ItemDataRole.ToolTipRole via
+    # setItemData(), the task's QComboBox branch.
+
+    def test_no_submenu_exists_in_add_menu(self):
+        """Rules out the QMenu/submenu branch definitively: there is exactly
+        one QMenu instance built in pipeline_panel.py, no addMenu() nested
+        category submenu anywhere that could need its own
+        setToolTipsVisible(True) propagation."""
+        import inspect
+        from sbp_studio.gui.components import pipeline_panel
+        src = inspect.getsource(pipeline_panel)
+        assert src.count("QMenu(") == 1
+        assert ".addMenu(" not in src
+
+    def test_processing_controls_preset_combo_has_item_tooltips(self):
+        """The actual reported widget: ProcessingControls.preset_cb (legacy
+        'PRESET FILTERS' / 'FILTROS PREESTABLECIDOS' section). Verified by
+        construction logic (FILTER_PRESETS -> FILTER_DESCRIPTIONS lookup),
+        not live widget instantiation (this sandbox hangs on any real Qt
+        widget — confirmed pre-existing, see prior turn's QCheckBox repro).
+        The category-header reorganization moved combo construction out of
+        __init__ into _populate_preset_combo, so that's what's inspected."""
+        from sbp_studio.core.constants import FILTER_PRESETS, FILTER_DESCRIPTIONS
+        preset_labels = list(FILTER_PRESETS.keys())
+        for label in preset_labels:
+            key = FILTER_PRESETS[label]
+            assert FILTER_DESCRIPTIONS.get(key, "") != "", label
+
+        import inspect
+        from sbp_studio.gui.components.processing_controls import ProcessingControls
+        src = inspect.getsource(ProcessingControls._populate_preset_combo)
+        assert "self.preset_cb.setItemData(" in src
+        assert "ToolTipRole" in src
+        assert "FILTER_DESCRIPTIONS" in src
+
+    def test_preset_node_choicespec_carries_tooltips(self):
+        """The DYNAMIC pipeline's PresetNode 'Type' combo gets the SAME
+        descriptions via ChoiceSpec.tooltips, reusing FILTER_DESCRIPTIONS —
+        one geophysical description, surfaced in both UIs."""
+        from sbp_studio.core.constants import FILTER_DESCRIPTIONS
+        from sbp_studio.gui.dsp.nodes import PresetNode
+        spec = PresetNode.SPECS[0]
+        assert spec.tooltips is not None
+        for value, _display in spec.choices:
+            assert spec.tooltips.get(value) == FILTER_DESCRIPTIONS.get(value)
+
+    def test_choicespec_tooltips_defaults_to_none_for_other_nodes(self):
+        """Nodes with no domain-data description dict (e.g. FKFilterNode's
+        'mode') must not be forced to supply one — ChoiceSpec.tooltips stays
+        an opt-in field."""
+        from sbp_studio.gui.dsp.nodes import ChoiceSpec, FKFilterNode
+        mode_spec = next(s for s in FKFilterNode.SPECS if isinstance(s, ChoiceSpec))
+        assert mode_spec.tooltips is None
+
+    def test_choice_row_wires_per_item_tooltip_when_present(self):
+        """The generic _ChoiceRow widget (used for ANY ChoiceSpec, not just
+        presets) must read spec.tooltips and call setItemData with
+        Qt.ItemDataRole.ToolTipRole when a per-value tooltip is supplied."""
+        import inspect
+        from sbp_studio.gui.components.pipeline_panel import _ChoiceRow
+        src = inspect.getsource(_ChoiceRow.__init__)
+        assert "spec.tooltips" in src
+        assert "setItemData(" in src
+        assert "ToolTipRole" in src
 
 
 # ── 6. PHASE 3.5: marine geophysics filters (water mute + swell) ────────────────

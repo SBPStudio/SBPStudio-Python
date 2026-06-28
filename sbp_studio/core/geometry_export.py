@@ -387,6 +387,129 @@ def write_navline_geojson(
         _json.dump(fc, f, ensure_ascii=False, indent=2)
 
 
+# ── Interpretation pick-point writers (points: list of (id, x, y, description)) ─
+#
+# Reuses the EXACT same methodology as write_fix_points_shp/geojson/csv above
+# (pure stdlib struct packing for .shp, no new GIS dependency) — only the DBF
+# schema/attributes differ (id: numeric, description: free text, instead of
+# fix_num/fix_hora).
+
+def write_picks_shp(path: str, points: list) -> None:
+    """
+    Write a POINT shapefile for interpretation picks using only the stdlib.
+    points: list of (id, x, y, description).
+    Generates .shp / .shx / .dbf / .prj.
+    """
+    records = points
+
+    def _shp_record(x: float, y: float) -> bytes:
+        return struct.pack("<i dd", 1, x, y)
+
+    shp_records = []
+    offsets     = []
+    cur_offset  = 50
+
+    for rec in records:
+        x, y    = rec[1], rec[2]
+        content = _shp_record(x, y)
+        offsets.append(cur_offset)
+        shp_records.append(content)
+        cur_offset += 4 + len(content) // 2
+
+    file_length = cur_offset
+    xs_list = [r[1] for r in records] or [0.0]
+    ys_list = [r[2] for r in records] or [0.0]
+    xmin, xmax = min(xs_list), max(xs_list)
+    ymin, ymax = min(ys_list), max(ys_list)
+
+    def _file_header(file_len: int) -> bytes:
+        return (struct.pack(">iiiiiii", 9994, 0, 0, 0, 0, 0, file_len) +
+                struct.pack("<ii dddddddd", 1000, 1,
+                            xmin, ymin, xmax, ymax, 0.0, 0.0, 0.0, 0.0))
+
+    shp_path = path if path.endswith(".shp") else path + ".shp"
+    shx_path = shp_path[:-4] + ".shx"
+    dbf_path = shp_path[:-4] + ".dbf"
+    prj_path = shp_path[:-4] + ".prj"
+
+    with open(shp_path, "wb") as shp_f, open(shx_path, "wb") as shx_f:
+        shx_file_len = 50 + 4 * len(records)
+        shp_f.write(_file_header(file_length))
+        shx_f.write(_file_header(shx_file_len))
+        for idx, (content, offset) in enumerate(zip(shp_records, offsets)):
+            rec_num     = idx + 1
+            content_len = len(content) // 2
+            rec_hdr     = struct.pack(">ii", rec_num, content_len)
+            shp_f.write(rec_hdr + content)
+            shx_f.write(struct.pack(">ii", offset, content_len))
+
+    # DBF text fields are fixed-width and ASCII-only (the .dbf spec predates
+    # any encoding declaration) — non-ASCII description characters are
+    # replaced rather than raising, so an accented/emoji description never
+    # crashes the export; GeoJSON/CSV (UTF-8) are the full-fidelity formats.
+    desc_len = 80
+    fields = [
+        (b"id\x00\x00\x00\x00\x00\x00\x00\x00\x00", b"N", 10, 0),
+        (b"descr\x00\x00\x00\x00\x00\x00", b"C", desc_len, 0),
+    ]
+    record_len = 1 + sum(f[2] for f in fields)
+    header_len = 32 + 32 * len(fields) + 1
+
+    with open(dbf_path, "wb") as dbf:
+        dbf.write(struct.pack("<B B B B I H H 20s",
+                              3, 125, 1, 1, len(records),
+                              header_len, record_len, b"\x00" * 20))
+        for fname, ftype, flen, fdec in fields:
+            dbf.write(fname[:11].ljust(11, b"\x00"))
+            dbf.write(ftype)
+            dbf.write(b"\x00" * 4)
+            dbf.write(struct.pack("B", flen))
+            dbf.write(struct.pack("B", fdec))
+            dbf.write(b"\x00" * 14)
+        dbf.write(b"\r")
+        for rec in records:
+            pick_id, _x, _y, descr = rec
+            dbf.write(b" ")
+            dbf.write(str(pick_id).rjust(10).encode("ascii"))
+            dbf.write(str(descr)[:desc_len].ljust(desc_len)
+                      .encode("ascii", errors="replace"))
+        dbf.write(b"\x1a")
+
+    with open(prj_path, "w") as prj:
+        prj.write(_WGS84_PRJ)
+
+
+def write_picks_geojson(path: str, points: list) -> None:
+    """Write GeoJSON FeatureCollection of interpretation picks.
+    points: list of (id, x, y, description)."""
+    features = [
+        {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [x, y]},
+            "properties": {"id": pid, "description": descr},
+        }
+        for pid, x, y, descr in points
+    ]
+    fc = {"type": "FeatureCollection",
+          "crs": {"type": "name",
+                  "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}},
+          "features": features}
+    out_path = path if path.endswith(".geojson") else path + ".geojson"
+    with open(out_path, "w", encoding="utf-8") as f:
+        _json.dump(fc, f, ensure_ascii=False, indent=2)
+
+
+def write_picks_csv(path: str, points: list) -> None:
+    """Write CSV of interpretation picks: id, x, y, description.
+    points: list of (id, x, y, description)."""
+    out_path = path if path.lower().endswith(".csv") else path + ".csv"
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(["id", "x", "y", "description"])
+        for pid, x, y, descr in points:
+            w.writerow([pid, round(float(x), 8), round(float(y), 8), descr])
+
+
 def write_navline_csv(path: str, lons, lats, dist, wd, ts) -> None:
     """
     Write a CSV of the navigation track, one row per trace.

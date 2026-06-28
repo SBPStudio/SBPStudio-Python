@@ -6,22 +6,25 @@ GUI-side orchestration only: nodes wrap CORE math (``sbp_studio.core``) and the
 preview. The core stays the single source of DSP truth.
 """
 from .nodes import (
-    AGCNode, BandpassNode, ChoiceSpec, CLAHENode, DespikeNode, DSPContext, DSPNode,
-    FKFilterNode, LogCompressionNode, MedianFilterNode, MultipleSuppressionNode, NotchNode,
-    NODE_REGISTRY, ParamSpec, PredictiveDeconNode, PresetNode, SwellFilterNode,
-    TraceEqualizationNode, TraceMixingNode, TVGNode, WaterMuteNode, make_node,
+    AGCNode, BandpassNode, BilateralFilterNode, BoolSpec, ChoiceSpec, CLAHENode,
+    DespikeNode, DSPContext, DSPNode, FKFilterNode, LogCompressionNode, MedianFilterNode,
+    MultipleSuppressionNode, NotchNode, NODE_REGISTRY, ParamSpec, PRESET_CATEGORIES,
+    PRESET_HEADER_VALUE, PredictiveDeconNode, PresetNode, SphericalDivergenceNode,
+    SVDFilterNode, SwellFilterNode, TraceEqualizationNode, TraceMixingNode, TVGNode,
+    WaterMuteNode, make_node,
 )
-from .node_i18n import tr_node, tr_param
+from .node_i18n import tr_node, tr_param, tr_preset_category, tr_tooltip
 from .pipeline import Pipeline, VisibleWindow, extract_visible_window
 from .preview import PreviewController
 
 __all__ = [
-    "DSPNode", "DSPContext", "ParamSpec", "ChoiceSpec", "NODE_REGISTRY", "make_node",
+    "DSPNode", "DSPContext", "ParamSpec", "ChoiceSpec", "BoolSpec", "NODE_REGISTRY", "make_node",
     "AGCNode", "BandpassNode", "TVGNode", "PredictiveDeconNode", "PresetNode",
     "SwellFilterNode", "WaterMuteNode", "LogCompressionNode", "CLAHENode", "DespikeNode",
     "FKFilterNode", "MultipleSuppressionNode", "NotchNode", "TraceEqualizationNode",
-    "TraceMixingNode", "MedianFilterNode",
-    "tr_node", "tr_param",
+    "TraceMixingNode", "MedianFilterNode", "SVDFilterNode", "BilateralFilterNode",
+    "SphericalDivergenceNode", "PRESET_CATEGORIES", "PRESET_HEADER_VALUE",
+    "tr_node", "tr_param", "tr_tooltip", "tr_preset_category",
     "Pipeline", "VisibleWindow", "extract_visible_window",
     "PreviewController",
 ]

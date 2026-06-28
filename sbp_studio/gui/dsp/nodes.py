@@ -53,9 +53,22 @@ class ChoiceSpec:
     label:   str
     choices: Tuple[Tuple[str, str], ...]   # ((value, display), …)
     default: str
+    # Optional per-choice hover tooltip (value -> description), e.g.
+    # PresetNode's "Type" combo reusing core.constants.FILTER_DESCRIPTIONS.
+    # None for ChoiceSpecs with no such domain-data description (e.g.
+    # FKFilterNode's "mode") — the UI simply skips setting an item tooltip.
+    tooltips: Optional[Dict[str, str]] = None
 
 
-Spec = Union[ParamSpec, ChoiceSpec]
+@dataclass(frozen=True)
+class BoolSpec:
+    """Declarative spec for one BOOLEAN parameter (drives a checkbox)."""
+    name:    str
+    label:   str
+    default: bool = True
+
+
+Spec = Union[ParamSpec, ChoiceSpec, BoolSpec]
 
 
 # ── Acquisition context ─────────────────────────────────────────────────────────
@@ -90,6 +103,9 @@ class DSPNode(ABC):
 
     KEY:     str = ""             # stable identifier (used in cache signature)
     DISPLAY: str = ""             # English source name (localised via node_i18n)
+    TOOLTIP: str = ""             # English source 1-2 sentence geophysical
+                                   # explanation (localised via node_i18n.tr_tooltip),
+                                   # shown on hover in the "Add module" dropdown.
     SPECS:   Tuple[Spec, ...] = ()
 
     # PRE-CROP nodes need the FULL trace to be correct (e.g. water-column mute
@@ -176,6 +192,9 @@ class TraceMixingNode(DSPNode):
 
     KEY     = "trace_mix"
     DISPLAY = "Trace Mixing (Horizontal Smoothing)"
+    TOOLTIP = ("Averages each sample with its horizontal neighbour traces. "
+              "Coherent reflectors survive via constructive interference; "
+              "incoherent random noise is attenuated via destructive interference.")
     SPECS   = (
         ParamSpec("window_size", "Traces to mix", 3.0, 51.0, 3.0, 2.0, 0, "tr"),
     )
@@ -208,6 +227,9 @@ class MedianFilterNode(DSPNode):
 
     KEY     = "median_filter"
     DISPLAY = "Median Filter (Edge-Preserving)"
+    TOOLTIP = ("Replaces each sample with the median of its horizontal neighbours, "
+              "rejecting isolated noise spikes outright instead of blending them — "
+              "preserves sharp fault/reflector edges that a mean filter would blur.")
     SPECS   = (
         ParamSpec("window_size", "Traces to evaluate", 3.0, 51.0, 3.0, 2.0, 0, "tr"),
     )
@@ -223,11 +245,97 @@ class MedianFilterNode(DSPNode):
         return apply_median_filter(data, int(self.params["window_size"]))
 
 
+class SVDFilterNode(DSPNode):
+    """SVD Filter / Karhunen-Loeve Transform — wraps ``core.apply_svd_filter``.
+
+    A fundamentally different (and stronger) noise-attenuation mechanism
+    than TraceMixingNode/MedianFilterNode's local neighbour-window: rebuilds
+    the matrix from only its top ``num_components`` singular values/vectors.
+    A coherent reflector concentrates its energy into a handful of dominant
+    components; dense, spatially incoherent thermal/random noise spreads
+    thinly across all of them, so truncation keeps the former and discards
+    the latter — useful when Trace Mixing/Median Filter are too conservative
+    against widespread noise in deep, low-SNR sections.
+
+    trace_halo is deliberately GENEROUS (not tied to num_components): SVD
+    decomposes the WHOLE matrix chunk it is given, so the live preview's
+    ViewBox needs enough surrounding structural context on each side for the
+    decomposition (and thus the visible result) to be stable — too small a
+    halo would make the filtered output near the window's edges look
+    different every time the user scrolls, even though nothing in the
+    underlying data changed.
+    """
+
+    KEY     = "svd_filter"
+    DISPLAY = "SVD Filter (Eigenvalues)"
+    TOOLTIP = ("Rebuilds the section from only its top singular components. Coherent "
+              "reflectors concentrate their energy into a few components; dense "
+              "random noise spreads thinly across all of them and is discarded.")
+    SPECS   = (
+        ParamSpec("num_components", "Principal Components", 2.0, 100.0, 10.0, 1.0, 0),
+    )
+
+    def trace_halo(self, ctx: DSPContext) -> int:
+        return 50
+
+    def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
+        from sbp_studio.core import apply_svd_filter
+        return apply_svd_filter(data, int(self.params["num_components"]))
+
+
+class BilateralFilterNode(DSPNode):
+    """Bilateral Filter (Edge-Preserving Spatial Smoothing) — wraps
+    ``core.apply_bilateral_filter``.
+
+    A tunable middle ground between TraceMixingNode (smooths everywhere,
+    blurs edges) and MedianFilterNode (preserves edges, but a hard on/off
+    decision with no weighted blend): each neighbour trace's contribution is
+    weighted by BOTH spatial distance and amplitude similarity, so noise in
+    an otherwise-flat region is averaged down same as Trace Mixing, while a
+    neighbour on the far side of a fault/sharp reflector edge — whose
+    amplitude differs sharply — is automatically excluded from the average.
+
+    ``sigma_color`` ("Tolerancia de Amplitud") is unitless/relative (a
+    multiple of the chunk's own std-dev, not a raw amplitude), so the user
+    tunes "how different is too different" without knowing the data's
+    absolute amplitude scale.
+
+    ``window_size`` MUST be odd (centred window, no lateral event shift);
+    enforced again at the core-function level even if the UI slider lets an
+    even value slip through.
+    """
+
+    KEY     = "bilateral_filter"
+    DISPLAY = "Bilateral Filter (Smart Smoothing)"
+    TOOLTIP = ("Averages horizontal neighbour traces only where their amplitude is "
+              "similar — smooths random noise in flat zones while excluding "
+              "neighbours across a fault or steep edge, so the edge stays sharp.")
+    SPECS   = (
+        ParamSpec("window_size", "Traces to evaluate", 3.0, 51.0, 5.0, 2.0, 0, "tr"),
+        ParamSpec("sigma_color", "Amplitude Tolerance", 0.05, 3.0, 0.5, 0.05, 2),
+    )
+
+    def trace_halo(self, ctx: DSPContext) -> int:
+        # Same rationale as TraceMixingNode/MedianFilterNode.trace_halo:
+        # neighbours needed on each side so the weighted average is correct
+        # right up to the visible window's edges.
+        return int(self.params["window_size"]) // 2
+
+    def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
+        from sbp_studio.core import apply_bilateral_filter
+        return apply_bilateral_filter(
+            data, int(self.params["window_size"]),
+            sigma_color=self.params["sigma_color"])
+
+
 class PredictiveDeconNode(DSPNode):
     """Predictive (Wiener-Levinson) deconvolution — wraps ``core.apply_predictive_decon``."""
 
     KEY     = "decon"
     DISPLAY = "Predictive Deconvolution"
+    TOOLTIP = ("Estimates and removes the predictable (repetitive) part of each trace's "
+              "waveform, such as reverberation, to sharpen the source pulse and "
+              "improve vertical resolution.")
     SPECS   = (
         ParamSpec("op_ms",     "Operator length",   1.0, 50.0, 10.0, 1.0, 0, "ms"),
         ParamSpec("gap_ms",    "Prediction gap",    0.1, 20.0,  2.0, 0.1, 1, "ms"),
@@ -250,6 +358,9 @@ class BandpassNode(DSPNode):
 
     KEY     = "bandpass"
     DISPLAY = "Bandpass Filter"
+    TOOLTIP = ("Passes only frequencies between F-low and F-high, rejecting low-frequency "
+              "swell/heave noise and high-frequency electrical/thermal noise outside "
+              "the source's useful bandwidth.")
     SPECS   = (
         ParamSpec("flo", "F low",  500.0, 15000.0, 2000.0, 100.0, 0, "Hz"),
         ParamSpec("fhi", "F high", 500.0, 15000.0, 7000.0, 100.0, 0, "Hz"),
@@ -266,10 +377,72 @@ class BandpassNode(DSPNode):
         return apply_bandpass(data, self.params["flo"], self.params["fhi"], ctx.dt_us)
 
 
+# Sentinel ``value`` marking a category-header entry inside
+# PresetNode.SPECS' "Type" ChoiceSpec.choices (see _preset_choices). Never a
+# real FILTER_PRESETS key, so it can never be matched by combo.findData(cur)
+# / become the current selection — _ChoiceRow (pipeline_panel.py) checks for
+# this exact value to render the row as a disabled, styled header instead of
+# a selectable preset.
+PRESET_HEADER_VALUE = "__preset_category_header__"
+
+# Canonical grouping for BOTH PresetNode's dynamic "Type" combo (here) and
+# ProcessingControls' static preset combo (gui/components/processing_controls.py,
+# which imports this same tuple) — a standard marine-seismic workflow order:
+# complex-trace attributes -> structural attributes -> 2D image filters ->
+# frequency/smoothing. Each tuple is (English source category header, preset
+# KEYs in the order they should appear within it) — the header is translated
+# via node_i18n.tr_preset_category at combo-build time, not baked in here,
+# since this module-level tuple (like _preset_choices()'s output) is only
+# ever evaluated once, at PresetNode's class-definition/import time.
+PRESET_CATEGORIES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("Complex Trace Attributes",
+     ("envelope", "inst_phase", "inst_freq", "cos_phase")),
+    ("Structural Attributes",
+     ("similarity", "sobel_v", "laplacian")),
+    ("2D Image Filters",
+     ("highboost", "median5", "wiener7")),
+    ("Frequency & Smoothing Filters",
+     ("gauss1", "topas_narrow", "topas_wide", "topas_hires", "derivative", "integral")),
+)
+
+
 def _preset_choices() -> Tuple[Tuple[str, str], ...]:
-    """(key, display) pairs for every preset except 'none' (domain data, not tr'd)."""
+    """(value, display) pairs for the "Type" combo: every preset except
+    'none' (domain data, not tr'd), grouped under PRESET_CATEGORIES headers
+    in the same logical order as ProcessingControls' static preset combo —
+    see PRESET_HEADER_VALUE for how a header entry is encoded.
+    """
     from sbp_studio.core.constants import FILTER_PRESETS
-    return tuple((key, disp) for disp, key in FILTER_PRESETS.items() if key != "none")
+    key_to_display = {key: disp for disp, key in FILTER_PRESETS.items()}
+    pairs: List[Tuple[str, str]] = []
+    categorized: set = set()
+    for header_en, keys in PRESET_CATEGORIES:
+        pairs.append((PRESET_HEADER_VALUE, header_en))
+        for key in keys:
+            categorized.add(key)
+            disp = key_to_display.get(key)
+            if disp is not None:
+                pairs.append((key, disp))
+
+    # Defensive catch-all: a preset NOT listed in PRESET_CATEGORIES (e.g. a
+    # future addition nobody re-categorised yet) still appears here rather
+    # than silently vanishing from the combo — FILTER_PRESETS stays the
+    # single source of truth for "what's selectable" (same pattern as the
+    # "Add module" menu's and static preset combo's own leftover handling).
+    leftover = [k for k in key_to_display if k != "none" and k not in categorized]
+    if leftover:
+        pairs.append((PRESET_HEADER_VALUE, "Other"))
+        for key in leftover:
+            pairs.append((key, key_to_display[key]))
+    return tuple(pairs)
+
+
+def _preset_tooltips() -> Dict[str, str]:
+    """value -> hover description for every preset choice, reusing the SAME
+    domain-data dict the legacy ProcessingControls "FILTROS PREESTABLECIDOS"
+    combo already shows (FILTER_DESCRIPTIONS) — one description, two combos."""
+    from sbp_studio.core.constants import FILTER_DESCRIPTIONS
+    return dict(FILTER_DESCRIPTIONS)
 
 
 class PresetNode(DSPNode):
@@ -277,8 +450,12 @@ class PresetNode(DSPNode):
 
     KEY     = "preset"
     DISPLAY = "Filter Preset / Attribute"
+    TOOLTIP = ("Applies a named seismic attribute transform (e.g. envelope, instantaneous "
+              "phase/frequency via the Hilbert transform) used to highlight specific "
+              "geological features instead of the raw amplitude.")
     SPECS   = (
-        ChoiceSpec("preset", "Type", _preset_choices(), default="envelope"),
+        ChoiceSpec("preset", "Type", _preset_choices(), default="envelope",
+                  tooltips=_preset_tooltips()),
     )
 
     def time_halo_samples(self, ctx: DSPContext) -> int:
@@ -301,6 +478,9 @@ class TVGNode(DSPNode):
 
     KEY     = "tvg"
     DISPLAY = "TVG (Time-Variant Gain)"
+    TOOLTIP = ("Exponentially boosts amplitude with time-since-seabed to compensate "
+              "for signal attenuation with depth, so weak deep reflectors become as "
+              "visible as the strong shallow seabed return.")
     PRECROP = True                # seabed pick needs the full trace → run pre-crop
     SPECS   = (
         ParamSpec("alpha", "Attenuation coef. alpha", 0.0, 150.0, 15.0, 1.0, 0),
@@ -317,6 +497,9 @@ class AGCNode(DSPNode):
 
     KEY     = "agc"
     DISPLAY = "AGC (Automatic Gain Control)"
+    TOOLTIP = ("Statistically equalises amplitude using a sliding RMS window per trace, "
+              "boosting weak zones and damping strong ones, regardless of where they "
+              "occur — a data-driven gain, unlike TVG's fixed geometric curve.")
     SPECS   = (
         ParamSpec("win_ms", "Window", 5.0, 200.0, 20.0, 1.0, 0, "ms"),
     )
@@ -328,6 +511,46 @@ class AGCNode(DSPNode):
     def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
         from sbp_studio.core import apply_agc
         return apply_agc(data, self.params["win_ms"], ctx.dt_us)
+
+
+class SphericalDivergenceNode(DSPNode):
+    """Spherical Divergence Correction (True Amplitude Recovery) — wraps
+    ``core.apply_spherical_divergence``.
+
+    A DETERMINISTIC, physics-based gain curve (``t**exponent``) — the
+    deterministic counterpart to AGC's purely STATISTICAL windowed-RMS gain
+    just above. ``exponent=1.0`` is the theoretical pure geometric-spreading
+    loss; values above 1.0 let the user empirically push further to also
+    compensate for inelastic (absorption) attenuation, which spherical
+    spreading alone does not model.
+
+    ``reference_seabed`` (default True, the geophysically correct choice):
+    references the gain to each trace's OWN picked seafloor (via
+    ``core.pick_seabed``) instead of a single global clock shared by every
+    trace — a deep-water trace's water column is no longer blown out just
+    because a shallow-water trace's seafloor arrived early.
+
+    PRECROP: the seabed pick (and, even in the ``reference_seabed=False``
+    legacy mode, the meaning of "sample index from t=0 of the recording")
+    both require the FULL trace, not whatever fragment happens to be in the
+    live preview's ViewBox — same rationale as TVGNode/WaterMuteNode.
+    """
+
+    KEY     = "spherical_divergence"
+    DISPLAY = "Spherical Divergence (True Amplitude)"
+    TOOLTIP = ("Deterministic, physics-based gain (t^exponent) referenced to each "
+              "trace's own picked seafloor, compensating for wavefront spreading "
+              "loss without the artificial water-column boost of a global t=0 curve.")
+    PRECROP = True
+    SPECS   = (
+        ParamSpec("exponent", "Falloff Exponent", 0.0, 5.0, 1.0, 0.1, 1),
+        BoolSpec("reference_seabed", "Reference Seabed", True),
+    )
+
+    def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
+        from sbp_studio.core import apply_spherical_divergence
+        return apply_spherical_divergence(
+            data, self.params["exponent"], self.params["reference_seabed"])
 
 
 class TraceEqualizationNode(DSPNode):
@@ -352,6 +575,9 @@ class TraceEqualizationNode(DSPNode):
 
     KEY     = "trace_eq"
     DISPLAY = "Trace Equalization (RMS Balance)"
+    TOOLTIP = ("Divides each trace by its own RMS amplitude so every trace carries "
+              "comparable energy along the line, correcting for source/receiver "
+              "coupling variation before a downstream gain stage amplifies it.")
     PRECROP = True
     SPECS   = ()
 
@@ -365,6 +591,9 @@ class LogCompressionNode(DSPNode):
 
     KEY     = "log_compress"
     DISPLAY = "Log Compression (Seismic HDR)"
+    TOOLTIP = ("Phase-preserving logarithmic rescale that compresses dynamic range, "
+              "making weak reflectors visible alongside strong ones in the same "
+              "display without clipping — like HDR tone-mapping for a photograph.")
     SPECS   = (
         ParamSpec("k", "Strength (k)", 1.0, 100.0, 10.0, 1.0, 0),
     )
@@ -384,6 +613,9 @@ class CLAHENode(DSPNode):
 
     KEY     = "clahe"
     DISPLAY = "CLAHE (Adaptive Local Contrast)"
+    TOOLTIP = ("Equalises contrast independently within small local tiles instead of "
+              "globally, revealing subtle structure in both low- and high-amplitude "
+              "regions of the same section simultaneously.")
     SPECS   = (
         ParamSpec("clip_limit", "Clip Limit",    1.0, 40.0, 2.0, 0.5, 1),
         ParamSpec("tile_grid",  "Tile Grid Size", 2.0, 64.0, 8.0, 1.0, 0),
@@ -412,6 +644,9 @@ class DespikeNode(DSPNode):
 
     KEY     = "despike"
     DISPLAY = "Despike (Impulsive Noise Removal)"
+    TOOLTIP = ("Replaces samples that exceed a robust local amplitude threshold with "
+              "the local median, removing 1-2 sample impulsive spikes (electrical "
+              "transients, bad bits) while leaving genuine wavelet peaks untouched.")
     SPECS   = (
         ParamSpec("window_ms", "Window Size", 0.5, 20.0, 2.0, 0.5, 1, "ms"),
         ParamSpec("threshold", "Threshold",    2.0, 15.0, 6.0, 0.5, 1),
@@ -437,6 +672,9 @@ class SpectralWhiteningNode(DSPNode):
 
     KEY     = "whiten"
     DISPLAY = "Spectral Whitening"
+    TOOLTIP = ("Flattens the amplitude spectrum within a chosen band while preserving "
+              "phase exactly, sharpening reflectors and improving vertical resolution "
+              "by recovering frequencies the source/medium attenuated unevenly.")
     SPECS   = (
         ParamSpec("flo",       "F low",         10.0, 10000.0, 1000.0, 100.0, 0, "Hz"),
         ParamSpec("fhi",       "F high",        100.0, 15000.0, 8000.0, 100.0, 0, "Hz"),
@@ -462,6 +700,9 @@ class WaterMuteNode(DSPNode):
 
     KEY     = "water_mute"
     DISPLAY = "Water Column Mute"
+    TOOLTIP = ("Zeroes everything above each trace's own picked seafloor, removing the "
+              "water column entirely so reverberation and direct-wave energy don't "
+              "interfere with sub-bottom interpretation.")
     PRECROP = True                # seabed pick needs the full trace → run pre-crop
     SPECS   = (
         ParamSpec("threshold_pct", "Threshold", 1.0, 100.0, 30.0, 1.0, 0, "%"),
@@ -479,6 +720,9 @@ class SwellFilterNode(DSPNode):
 
     KEY     = "swell"
     DISPLAY = "Swell Filter / Heave Correction"
+    TOOLTIP = ("Removes vessel heave from sea-surface swell by aligning each trace to a "
+              "smooth spatial reference via cross-correlation, flattening the wavy "
+              "seafloor distortion that heave introduces into the section.")
     SPECS   = (
         ParamSpec("window_traces", "Trace window", 3.0, 201.0, 21.0, 2.0, 0, "tr"),
         ParamSpec("max_shift_ms",  "Max shift",    1.0,  50.0, 10.0, 1.0, 0, "ms"),
@@ -509,6 +753,9 @@ class FKFilterNode(DSPNode):
 
     KEY            = "fk"
     DISPLAY        = "F-K Dip Filter"
+    TOOLTIP        = ("Rejects coherently DIPPING events (side-echoes, diffractions, "
+                      "cable/towfish noise) by their apparent slope in the "
+                      "frequency-wavenumber domain, leaving flat reflectors untouched.")
     NEEDS_FULL_RES = True
     SPECS = (
         ParamSpec("dip",   "Reject dip",     -5.0, 5.0, 1.0, 0.1, 1, "ms/tr"),
@@ -543,6 +790,9 @@ class MultipleSuppressionNode(DSPNode):
 
     KEY     = "demultiple"
     DISPLAY = "Seabed Multiple Suppression"
+    TOOLTIP = ("Predicts and adaptively subtracts the seabed (water-bottom) multiple "
+              "reflection at roughly twice the seafloor's two-way time, which "
+              "otherwise masks weaker, genuine sub-bottom reflectors beneath it.")
     PRECROP = True
     SPECS = (
         ParamSpec("threshold_pct", "Seabed threshold", 1.0, 100.0, 30.0, 1.0, 0, "%"),
@@ -565,6 +815,9 @@ class NotchNode(DSPNode):
 
     KEY     = "notch"
     DISPLAY = "Notch Filter"
+    TOOLTIP = ("Surgically removes a single narrow interference frequency (electrical "
+              "resonance, tow-cable strum) with a zero-phase band-stop, leaving the "
+              "rest of the spectrum untouched.")
     SPECS = (
         ParamSpec("freq", "Notch frequency", 50.0, 15000.0, 1000.0, 10.0, 0, "Hz"),
         ParamSpec("q",    "Q factor",         1.0,   100.0,   30.0,  1.0, 0),
@@ -598,6 +851,8 @@ NODE_REGISTRY: List[type[DSPNode]] = [
     MultipleSuppressionNode,  # seabed de-multiple (PRECROP, needs full trace)
     TraceMixingNode,         # spatial denoise before any frequency-domain filter
     MedianFilterNode,        # edge-preserving alternative to Trace Mixing
+    BilateralFilterNode,     # weighted middle ground between mixing and median
+    SVDFilterNode,           # stronger denoise for widespread/dense random noise
     PredictiveDeconNode,
     BandpassNode,
     NotchNode,               # surgical band-stop alongside the bandpass
@@ -606,6 +861,7 @@ NODE_REGISTRY: List[type[DSPNode]] = [
     TraceEqualizationNode,   # balance per-trace energy before gain/contrast amplify it
     TVGNode,
     AGCNode,
+    SphericalDivergenceNode,  # deterministic, physics-based gain alongside TVG/AGC
     LogCompressionNode,
     CLAHENode,
 ]

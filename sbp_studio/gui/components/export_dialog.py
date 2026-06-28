@@ -123,6 +123,13 @@ class ExportDialog(QDialog):
         self.cb_maxabs.setChecked(True)
         root.addWidget(self.cb_maxabs)
 
+        # Burn the active interpretation picks (markers) into the export raster
+        # at full export resolution — see viz.render._draw_picks. Off by default:
+        # most exports are a clean section, not an annotated interpretation map.
+        self.cb_picks = QCheckBox()
+        self.cb_picks.setChecked(False)
+        root.addWidget(self.cb_picks)
+
         # ── Dynamic info panel (Part 1): native DPI, quality %, RAM estimate ──
         # Recomputed live as DPI / memory budget change so the user sees exactly
         # what the engine will do BEFORE exporting.
@@ -269,6 +276,7 @@ class ExportDialog(QDialog):
             margin_bottom=float(self.sp_mbot.value()),
             mem_budget_gb=float(self.sp_membudget.value()),
             max_abs_pool=self.cb_maxabs.isChecked(),
+            overlay_picks=self.cb_picks.isChecked(),
             # ── Baked defaults ──
             velocity=1500.0,
             pdf_page="auto",
@@ -305,6 +313,11 @@ class ExportDialog(QDialog):
             "When the export must shrink below native resolution, keep the "
             "strongest sample per block instead of averaging — preserves thin, "
             "high-amplitude reflectors."))
+        self.cb_picks.setText(self.tr("Overlay interpretation markers"))
+        self.cb_picks.setToolTip(self.tr(
+            "Burn the active interpretation picks (markers + ID labels) into "
+            "the exported image at full resolution, exactly where they sit on "
+            "the live section."))
         # Standard buttons render with no visible text under the dark QSS — set
         # explicit, translated text so they're always readable.
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(self.tr("Accept"))

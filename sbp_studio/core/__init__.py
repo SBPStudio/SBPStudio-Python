@@ -24,8 +24,9 @@ from .header_calc import (evaluate_header_expr, parse_assignment,
                           HeaderExprError)
 from .processing import (
     apply_dc_removal, apply_trace_equalization, apply_trace_mixing, apply_median_filter,
+    apply_svd_filter, apply_bilateral_filter,
     apply_predictive_decon, apply_filter_preset, apply_agc,
-    apply_bandpass, apply_tvg, apply_delay_alignment, apply_log_compression,
+    apply_bandpass, apply_tvg, apply_spherical_divergence, pick_seabed, apply_delay_alignment, apply_log_compression,
     apply_clahe, apply_despike,
     apply_water_mute, apply_swell_filter, apply_spectral_whitening,
     apply_fk_filter, apply_multiple_suppression, apply_notch,
@@ -44,6 +45,10 @@ from .geometry_export import (
     parse_timestamp, compute_fix_positions,
     write_fix_points_shp, write_fix_points_geojson, write_fix_points_csv,
     write_navline_shp, write_navline_geojson, write_navline_csv,
+    write_picks_shp, write_picks_geojson, write_picks_csv,
+)
+from .picking import (
+    PickPoint, resolve_pick_coords, save_picks_tps, load_picks_tps, export_picks,
 )
 
 __all__ = [
@@ -69,8 +74,10 @@ __all__ = [
     "available_functions", "HeaderExprError",
     # Processing
     "apply_dc_removal", "apply_trace_equalization", "apply_trace_mixing", "apply_median_filter",
+    "apply_svd_filter", "apply_bilateral_filter",
     "apply_predictive_decon", "apply_filter_preset", "apply_agc",
-    "apply_bandpass", "apply_tvg", "apply_delay_alignment", "apply_log_compression",
+    "apply_bandpass", "apply_tvg", "apply_spherical_divergence", "pick_seabed",
+    "apply_delay_alignment", "apply_log_compression",
     "apply_clahe", "apply_despike",
     "apply_water_mute", "apply_swell_filter", "apply_spectral_whitening",
     "apply_fk_filter", "apply_multiple_suppression", "apply_notch",
@@ -90,4 +97,6 @@ __all__ = [
     "parse_timestamp", "compute_fix_positions",
     "write_fix_points_shp", "write_fix_points_geojson", "write_fix_points_csv",
     "write_navline_shp", "write_navline_geojson", "write_navline_csv",
+    "write_picks_shp", "write_picks_geojson", "write_picks_csv",
+    "PickPoint", "resolve_pick_coords", "save_picks_tps", "load_picks_tps", "export_picks",
 ]

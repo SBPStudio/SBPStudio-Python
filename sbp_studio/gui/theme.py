@@ -15,7 +15,9 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtWidgets import QStyledItemDelegate
 
 # Monospace UI font used across the whole application.
 MONO = "Courier New"
@@ -124,6 +126,11 @@ def build_qss(palette: Dict[str, str]) -> str:
     QMenu {{ background-color: {c['panel']}; color: {c['text']}; border: 1px solid {c['accent']}; }}
     QMenu::item:selected {{ background-color: {c['sel']}; color: {c['bright']}; }}
     QMenu::item:checked {{ color: {c['bright']}; }}
+    /* Same fix as QSpinBox:disabled below: without this, the hardcoded
+       `color` above wins over Qt's native disabled dimming, so a
+       setEnabled(False) category-header QAction looked IDENTICAL to a
+       clickable one. */
+    QMenu::item:disabled {{ color: {c['sub']}; }}
 
     QComboBox {{
         background-color: {c['entry']};
@@ -138,6 +145,9 @@ def build_qss(palette: Dict[str, str]) -> str:
         selection-color: {c['bright']};
         border: 1px solid {c['accent']};
     }}
+    /* Same fix as QSpinBox:disabled below — restores native dimming for
+       disabled popup-list rows (e.g. preset-combo category headers). */
+    QComboBox QAbstractItemView::item:disabled {{ color: {c['sub']}; }}
     QComboBox::drop-down {{ border: 0px; width: 18px; }}
 
     QSpinBox, QDoubleSpinBox {{
@@ -265,3 +275,78 @@ def apply_theme(app, name: Optional[str] = None) -> None:
     if name:
         theme._name = name if name in THEMES else theme._name
     theme.apply(app)
+
+
+def bump_font_size(font: QFont) -> None:
+    """Increase ``font``'s size by ~1 unit, in place, without ever calling
+    ``setPointSize`` with a non-positive value.
+
+    This app's base QSS sets ``font-size: 12px`` (see build_qss) — a PIXEL
+    size, not a point size. A font resolved from pixel size reports
+    ``pointSize() == -1`` (Qt's documented "not set" sentinel for whichever
+    of the two metrics wasn't used to size the font); blindly doing
+    ``font.setPointSize(font.pointSize() + 1)`` then computes
+    ``setPointSize(0)``, which Qt logs as
+    ``QFont::setPointSize: Point size <= 0 (0), must be greater than 0``.
+    Scaling whichever metric the font actually carries avoids that.
+    """
+    if font.pixelSize() > 0:
+        font.setPixelSize(font.pixelSize() + 1)
+    elif font.pointSize() > 0:
+        font.setPointSize(font.pointSize() + 1)
+    # else: neither metric is resolved (shouldn't happen for a font that
+    # came from a real widget/option) — leave size untouched rather than
+    # risk another invalid setPointSize/setPixelSize call.
+
+
+class CategoryHeaderItemDelegate(QStyledItemDelegate):
+    """Paints disabled (category-header) rows of an item-view popup by
+    hand — larger, Black-weight, theme-accent-coloured text — instead of
+    leaving them to the active QStyle/QSS.
+
+    Shared by every categorized combo box in the app (ProcessingControls'
+    static preset combo, PresetNode's dynamic "Type" combo in _ChoiceRow)
+    so the visual treatment of a "this row is a header, not a choice" row
+    can never drift between them.
+
+    Why this exists: a merely disabled item with setEnabled(False) plus a
+    bold QFont set directly on it still rendered indistinguishable from a
+    normal row on at least one OS/style combination — the active style's
+    item-view painting doesn't have to honour a QFont set on the item, and
+    this app's QSS theme has no native ``::item:disabled`` pseudo-state
+    covering "disabled item inside a popup list" reliably either. Painting
+    the header text directly with QPainter sidesteps both failure modes:
+    nothing about the style or stylesheet can suppress text this delegate
+    draws itself. Every enabled (non-header) row falls through to the
+    default QStyledItemDelegate.paint() untouched.
+    """
+
+    def paint(self, painter, option, index) -> None:  # noqa: D102 - Qt override
+        if index.flags() & Qt.ItemFlag.ItemIsEnabled:
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        painter.fillRect(option.rect, QColor(theme.color("entry")))
+        font = QFont(option.font)
+        font.setBold(True)
+        font.setWeight(QFont.Weight.Black)
+        bump_font_size(font)
+        painter.setFont(font)
+        painter.setPen(QColor(theme.color("bright")))
+        text = index.data(Qt.ItemDataRole.DisplayRole) or ""
+        # Padding (10px horizontal / 4px vertical) deliberately matches the
+        # QLabel-based "Add module" menu header's own stylesheet exactly
+        # (pipeline_panel.py's _add_section_header) — both are the SAME
+        # visual concept (a category header) and must read as one system.
+        painter.drawText(
+            option.rect.adjusted(10, 4, -10, -4),
+            int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+            text,
+        )
+        painter.restore()
+
+    def sizeHint(self, option, index):  # noqa: D102 - Qt override
+        size = super().sizeHint(option, index)
+        if not (index.flags() & Qt.ItemFlag.ItemIsEnabled):
+            size.setHeight(int(size.height() * 1.3))
+        return size

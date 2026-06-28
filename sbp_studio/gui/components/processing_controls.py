@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QAbstractSpinBox, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFrame,
     QHBoxLayout, QLabel, QPushButton, QRadioButton, QSlider, QSpinBox,
@@ -38,6 +39,25 @@ from sbp_studio.core.constants import (
 # was replaced by the physical 'traces per cm' scale; this fixed value keeps the
 # preview column cap + HQ overlay sharpness at their historical level.
 DEFAULT_PX_PER_TRACE = 20.0
+
+# Preset combo grouping: a standard marine-seismic workflow order (complex-
+# trace attributes → structural attributes → 2D image filters → frequency/
+# smoothing) rather than FILTER_PRESETS' flat dict order. "none" (the
+# no-filter sentinel) always stays first, ungrouped — see
+# _populate_preset_combo. Imported (not redefined) from gui/dsp/nodes.py,
+# which now ALSO uses this exact grouping for PresetNode's dynamic "Type"
+# combo (_ChoiceRow in pipeline_panel.py) — one canonical category list for
+# both widgets, so they can never drift out of sync. Re-exported under the
+# original local names so existing internal references/tests are unaffected.
+from ..dsp import PRESET_CATEGORIES as _PRESET_CATEGORIES
+from ..dsp import tr_preset_category as _tr_preset_category
+
+# The header-row paint fix (QStyledItemDelegate bypassing the active
+# QStyle/QSS entirely for disabled rows — see theme.py's docstring) is
+# shared with PresetNode's dynamic "Type" combo (_ChoiceRow in
+# pipeline_panel.py) so both categorized combos render identically.
+# Re-exported under the original local name for existing references/tests.
+from ..theme import CategoryHeaderItemDelegate as _PresetHeaderDelegate
 
 
 class LabeledSlider(QWidget):
@@ -94,6 +114,11 @@ class ProcessingControls(QWidget):
     align_toggled = pyqtSignal(bool)  # delay-alignment geometry toggled (rebuild base)
     display_changed = pyqtSignal()  # cmap / clip / FIX changed → recolour preview
     interp_changed = pyqtSignal(str)  # 'nearest' | 'bilinear' → live ImageItem paint hint
+    # Interpretation & Picking (Phase 3): checkable — True while picking mode
+    # is active (double-click on the section places a marker).
+    picking_toggled = pyqtSignal(bool)
+    # "Exportar/Importar" clicked — the tab shows the export/import dialog.
+    export_import_picking_requested = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -198,7 +223,8 @@ class ProcessingControls(QWidget):
         # ── Preset filters ──
         self.sec_preset = self._section()
         self.preset_cb = QComboBox()
-        self.preset_cb.addItems(list(FILTER_PRESETS.keys()))
+        self.preset_cb.setItemDelegate(_PresetHeaderDelegate(self.preset_cb))
+        self._populate_preset_combo()
         self.preset_cb.currentTextChanged.connect(self._update_preset_desc)
         v.addWidget(self.preset_cb)
         self.lbl_preset_desc = QLabel()
@@ -495,6 +521,24 @@ class ProcessingControls(QWidget):
         self.btn_export_fix = QPushButton()
         self.btn_export_fix.clicked.connect(self.export_fix_requested.emit)
         v.addWidget(self.btn_export_fix)
+
+        # ── Interpretation & Picking (Phase 3) ──
+        # Checkable toggle: green while ACTIVE (double-click places a marker
+        # on the section), red while inactive — a strong, unmistakable
+        # on/off signal distinct from this panel's neutral button palette,
+        # since accidentally leaving picking mode on is an easy way to place
+        # unwanted markers while just trying to inspect the section.
+        self.btn_toggle_picking = QPushButton()
+        self.btn_toggle_picking.setCheckable(True)
+        self.btn_toggle_picking.toggled.connect(self._on_picking_toggled)
+        self.btn_toggle_picking.toggled.connect(self.picking_toggled.emit)
+        v.addWidget(self.btn_toggle_picking)
+        self._on_picking_toggled(False)   # paint the initial RED (inactive) state
+
+        self.btn_export_import_picking = QPushButton()
+        self.btn_export_import_picking.clicked.connect(
+            self.export_import_picking_requested.emit)
+        v.addWidget(self.btn_export_import_picking)
 
         v.addStretch(1)
 
@@ -811,9 +855,99 @@ class ProcessingControls(QWidget):
         """Whether file-seam boundary lines should be shown in the live view."""
         return self.show_boundaries.isChecked()
 
+    def _populate_preset_combo(self) -> None:
+        """Build the categorized preset list: 'none' first (ungrouped, the
+        no-filter sentinel), then each category as a DISABLED header item
+        followed by its presets, in a standard marine-seismic workflow
+        order (see _PRESET_CATEGORIES). Disabled items are automatically
+        skipped by Qt when navigating the popup with click or keyboard, so
+        _update_preset_desc's existing currentText()-based lookup needs no
+        change — a header can never become the current selection.
+
+        Re-callable on a language switch (see retranslate_ui) to refresh
+        just the (translatable) header text — the preset LABELS themselves
+        are core domain data, never translated (see this module's
+        docstring), so the current selection survives a rebuild unchanged."""
+        current = self.preset_cb.currentText()
+        self.preset_cb.blockSignals(True)
+        self.preset_cb.clear()
+        key_to_label = {key: label for label, key in FILTER_PRESETS.items()}
+
+        def _add_preset_item(key: str) -> None:
+            label = key_to_label.get(key)
+            if label is None:
+                return
+            self.preset_cb.addItem(label)
+            idx = self.preset_cb.count() - 1
+            desc = FILTER_DESCRIPTIONS.get(key, "")
+            if desc:
+                self.preset_cb.setItemData(idx, desc, Qt.ItemDataRole.ToolTipRole)
+
+        def _add_header(name: str) -> None:
+            # Clean text, no "---" decoration — _PresetHeaderDelegate's own
+            # disabled/bold/accent-colour rendering is what marks this row
+            # as a header, matching the "Add module" menu's plain-text
+            # QLabel headers exactly (one visual system, not two).
+            self.preset_cb.addItem(_tr_preset_category(name))
+            idx = self.preset_cb.count() - 1
+            item = self.preset_cb.model().item(idx)
+            item.setEnabled(False)
+            # The actual on-screen rendering of this row is handled by
+            # _PresetHeaderDelegate (set as preset_cb's item delegate),
+            # which paints disabled rows itself rather than trusting the
+            # active QStyle/QSS to dim or distinguish them — that trust
+            # turned out to be misplaced on at least one OS/style
+            # combination. The bold/Black font set here is kept anyway as
+            # the model-level source of truth for "this row is a header"
+            # (also asserted by tests) and as a harmless fallback should
+            # this item ever render through a different delegate. Size is
+            # NOT bumped here (only the delegate does that, via the safe
+            # bump_font_size) to avoid double-scaling the same row twice.
+            font = item.font()
+            font.setBold(True)
+            font.setWeight(QFont.Weight.Black)
+            item.setFont(font)
+
+        _add_preset_item("none")
+        categorized: set = set()
+        for header_en, keys in _PRESET_CATEGORIES:
+            _add_header(header_en)
+            for key in keys:
+                categorized.add(key)
+                _add_preset_item(key)
+
+        # Defensive catch-all: a preset NOT listed in _PRESET_CATEGORIES
+        # (e.g. a future addition nobody re-categorised yet) still appears
+        # here rather than silently vanishing from the combo —
+        # FILTER_PRESETS stays the single source of truth for "what's
+        # selectable".
+        leftover = [k for k in FILTER_PRESETS.values()
+                    if k != "none" and k not in categorized]
+        if leftover:
+            _add_header("Other")
+            for key in leftover:
+                _add_preset_item(key)
+
+        restore_idx = self.preset_cb.findText(current) if current else -1
+        self.preset_cb.setCurrentIndex(restore_idx if restore_idx >= 0 else 0)
+        self.preset_cb.blockSignals(False)
+
     def _update_preset_desc(self, *_) -> None:
         key = FILTER_PRESETS.get(self.preset_cb.currentText(), "none")
         self.lbl_preset_desc.setText(FILTER_DESCRIPTIONS.get(key, ""))
+
+    def _on_picking_toggled(self, checked: bool) -> None:
+        """Paint btn_toggle_picking GREEN while active, RED while inactive —
+        an explicit colour, not a theme token, since this is meant to stand
+        out from every other (neutral) button in the panel."""
+        if checked:
+            self.btn_toggle_picking.setStyleSheet(
+                "QPushButton { background-color: #2e7d32; color: white; font-weight: bold; }"
+                "QPushButton:hover { background-color: #388e3c; }")
+        else:
+            self.btn_toggle_picking.setStyleSheet(
+                "QPushButton { background-color: #c62828; color: white; font-weight: bold; }"
+                "QPushButton:hover { background-color: #d32f2f; }")
 
     def retranslate_ui(self) -> None:
         # Sections
@@ -915,4 +1049,22 @@ class ProcessingControls(QWidget):
         self.btn_export_img.setText(self.tr("💾  Export image"))
         self.btn_export_fix.setText(self.tr("🗺 Export FIX"))
         self.btn_export_fix.setToolTip(self.tr("Export FIX → SHP / GeoJSON / CSV"))
+        self.btn_toggle_picking.setText(self.tr("📍 Activate Picker"))
+        if self.btn_toggle_picking.isChecked():
+            self.btn_toggle_picking.setToolTip(self.tr(
+                "Picking mode is ON — double-click the section to place a marker. "
+                "Click to turn off."))
+        else:
+            self.btn_toggle_picking.setToolTip(self.tr(
+                "Turn on picking mode: double-click the section to place an "
+                "interpretation marker."))
+        self.btn_export_import_picking.setText(self.tr("📤 Export/Import"))
+        self.btn_export_import_picking.setToolTip(self.tr(
+            "Export interpretation markers to SHP/GeoJSON/CSV, or import a "
+            "previously saved session (.tps)."))
+        # Preset combo: only the category HEADERS are translatable UI chrome
+        # (the preset labels themselves are domain data — see this module's
+        # docstring) — rebuild to refresh them, preserving the current
+        # selection (see _populate_preset_combo).
+        self._populate_preset_combo()
         self._update_preset_desc()

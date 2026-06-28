@@ -53,6 +53,16 @@ def _cfg(dpi=600):
                 fix_color=None, theme="print", pdf_page="auto")
 
 
+def _profile_handler():
+    """A real ProfileHandler whose render_figure() path needs no live tab/state
+    — render_figure() calls render_profile_figure() directly without touching
+    self._tab/self._state — so a bare stand-in satisfies SourceHandler.__init__
+    (which only reads tab.state) without building any Qt widget."""
+    from types import SimpleNamespace
+    from sbp_studio.gui.tabs._handlers import ProfileHandler
+    return ProfileHandler(SimpleNamespace(state=None))
+
+
 def test_render_export_figure_is_pristine_and_non_mutating(tmp_path):
     from tests.make_synthetic_segy import make_synthetic_segy
     from sbp_studio.core import load_profile
@@ -63,10 +73,11 @@ def test_render_export_figure_is_pristine_and_non_mutating(tmp_path):
     cfg = _cfg(600)
     params = {"clip_lo": 0.0, "fill_value": 0.0, "draw_file_boundaries": False,
               "align": False}
+    scale_cfg = {"mode": "aspect", "ratio": 3.0, "layout_mode": "aspect"}
 
     fig, render_dpi = _render_export_figure(
-        sd, cfg, params, node_cfg=[], aspect=3.0, align_enabled=False,
-        is_chain=False, cancel=_NoCancel())
+        sd, cfg, params, node_cfg=[], scale_cfg=scale_cfg, align_enabled=False,
+        handler=_profile_handler(), cancel=_NoCancel())
 
     # DPI floored so the embedded raster carries the full native sample grid.
     figsize = compute_figsize(sd, 600, None, 3.0, 1500.0)

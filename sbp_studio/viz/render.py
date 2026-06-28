@@ -42,6 +42,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # must be called before importing Figure
 import matplotlib.colors as mcolors
+import matplotlib.patheffects as patheffects
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 
@@ -364,6 +365,68 @@ def _draw_fix_marks(ax, fixes: list, color: str = "#FFD700",
                 linewidth=0.4,
             )
         ax.text(dist, 0.97, f"{num}  ", **kw)   # trailing spaces = gap from line
+
+
+def _draw_picks(ax, picks: Optional[list], x_lo: float, x_hi: float, n_traces: int,
+                color: str = "#FFA500", edge_color: str = "#000000",
+                font_size: float = 7.0, marker_size: float = 42.0) -> None:
+    """
+    Burn interpretation picks (PickPoint: trace_index, time_ms, id) onto the
+    export raster as a coloured marker + ID label, glued to the EXACT same
+    linear pixel-grid approximation ax.imshow's own ``extent`` already uses
+    for its columns — NOT the true (possibly non-uniform) dist_km value for
+    a trace.
+
+    Why this matters: ``_colorize_for_target`` resamples the seismic array
+    to a DPI-driven target pixel width via a UNIFORM resample
+    (``scipy.ndimage.zoom`` / PIL) — it has no notion of dist_km's real
+    per-trace spacing. Column ``j`` of ``n_traces`` therefore always ends up
+    at the LINEAR FRACTION ``j / n_traces`` of the image's full width,
+    regardless of whether the real survey's trace spacing in km was uniform
+    (it usually isn't — ship speed varies). A pick plotted at the TRUE
+    ``dist_km[trace_index]`` would decouple from the column its data
+    actually renders in whenever spacing is non-uniform — interpolating
+    ``trace_index`` linearly into ``[x_lo, x_hi]`` (the SAME bounds the
+    caller already passed to ``ax.imshow``'s own extent — see
+    ``_x_axis_extent`` in render_profile_figure/render_chain_figure)
+    reproduces the IDENTICAL approximation the raster itself is built from,
+    so the marker always lands on the pixel its trace actually occupies.
+
+    This single formula already covers every ``x_axis`` mode without a
+    branch here: for "trace"/"km" mode the caller's ``x_lo, x_hi`` are
+    ``(0, n_traces)`` (one column per trace, no resampling along that axis
+    — see ``_x_axis_extent``), so the fraction collapses to plain
+    ``trace_index`` unchanged.
+
+    Y needs no equivalent correction: the sample interval (dt_ms) is
+    constant by construction (unlike trace spacing), so ``time_ms`` already
+    maps linearly and exactly onto the extent's Y bounds with no
+    chunk/approximation error — see render_profile_figure/render_chain_figure's
+    own t0/t1 extent construction, which ``p.time_ms`` is already expressed
+    in (the SAME absolute-ms timeline the live SeismicView's
+    ``_redraw_picks`` uses).
+    """
+    if not picks or n_traces <= 0:
+        return
+    xs: list = []
+    ys: list = []
+    for p in picks:
+        i = max(0, min(int(p.trace_index), n_traces - 1))
+        frac = i / n_traces
+        x = x_lo + frac * (x_hi - x_lo)
+        y = float(p.time_ms)
+        xs.append(x)
+        ys.append(y)
+        ax.annotate(
+            str(p.id), (x, y), xytext=(0, 7), textcoords="offset points",
+            ha="center", va="bottom", color=color, fontsize=font_size,
+            fontweight="bold", zorder=9, clip_on=True,
+            path_effects=[patheffects.withStroke(linewidth=1.6, foreground=edge_color)],
+        )
+    # One batched scatter call for every pick (not one call per pick) — fewer
+    # artists for large pick counts, and a single collection to query/restyle.
+    ax.scatter(xs, ys, s=marker_size, c=color, edgecolors=edge_color,
+              linewidths=0.9, zorder=8, clip_on=True)
 
 
 def _style_axes(ax, fig=None) -> None:
@@ -805,6 +868,7 @@ def render_profile_figure(
     wiggle_gain: float = WIGGLE_GAIN_DEFAULT,
     max_wiggles: int = WIGGLE_MAX_TRACES,
     max_abs_pool: bool = False,
+    picks: Optional[list] = None,
 ) -> Figure:
     """
     Render a seismic profile as a headless Matplotlib figure.
@@ -924,6 +988,8 @@ def render_profile_figure(
                        time_font_size=time_font_size, time_align=time_align,
                        colors=C)
 
+    _draw_picks(ax, picks, x_lo, x_hi, d.shape[1])
+
     fig.tight_layout(pad=1.2)
     return fig
 
@@ -966,6 +1032,7 @@ def render_chain_figure(
     wiggle_gain: float = WIGGLE_GAIN_DEFAULT,
     max_wiggles: int = WIGGLE_MAX_TRACES,
     max_abs_pool: bool = False,
+    picks: Optional[list] = None,
 ) -> Figure:
     """
     Render a ProfileChain as a headless Matplotlib figure.
@@ -1101,6 +1168,8 @@ def render_chain_figure(
                        time_tick_min, time_fmt=time_fmt,
                        time_font_size=time_font_size, time_align=time_align,
                        colors=C, boundaries_km=ch.boundaries_km)
+
+    _draw_picks(ax, picks, x_lo, x_hi, n_traces_native)
 
     fig.tight_layout(pad=1.2)
     return fig

@@ -23,23 +23,68 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor
+from PyQt6.QtCore import Qt, QCoreApplication, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDoubleSpinBox, QFormLayout, QFrame,
+    QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame,
     QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem, QMenu,
-    QMessageBox, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from ..dsp import (
-    NODE_REGISTRY, ChoiceSpec, DSPNode, ParamSpec, make_node, tr_node, tr_param,
+    NODE_REGISTRY, BoolSpec, ChoiceSpec, DSPNode, ParamSpec, PRESET_HEADER_VALUE, make_node,
+    tr_node, tr_param, tr_preset_category, tr_tooltip,
 )
 from ..i18n import language_manager
-from ..theme import theme
+from ..theme import CategoryHeaderItemDelegate, bump_font_size, theme
 
 _NODE_ROLE = Qt.ItemDataRole.UserRole
+
+# "Add module" menu grouping: a standard marine-seismic processing workflow
+# order (physical correction → deconvolution/frequency → 2D spatial →
+# gain/visual → interpretation) rather than NODE_REGISTRY's flat iteration
+# order. Each tuple is (English source section header, node KEYs in the
+# order they should appear within that section) — the header is translated
+# via self.tr() in _show_add_menu, same convention as every other UI string.
+_MENU_CATEGORIES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("Editing & Physical Correction",
+     ("water_mute", "despike", "spherical_divergence")),
+    ("Deconvolution & Frequency",
+     ("decon", "whiten", "bandpass", "notch")),
+    ("Spatial Filters (2D)",
+     ("swell", "fk", "demultiple", "svd_filter", "bilateral_filter",
+      "median_filter", "trace_mix")),
+    ("Visual Gain Adjustments",
+     ("trace_eq", "tvg", "agc", "clahe", "log_compress")),
+    ("Interpretation",
+     ("preset",)),
+)
+
+
+def _tr_section(name: str) -> str:
+    """Localised "Add module" section header. ``self.tr(variable)`` cannot be
+    extracted by pylupdate6 (it only sees literals) — same reason
+    gui/dsp/node_i18n.py restates node DISPLAY/TOOLTIP strings as explicit
+    QCoreApplication.translate(...) literals instead of ``self.tr(node.X)``.
+    """
+    table = {
+        "Editing & Physical Correction": QCoreApplication.translate(
+            "PipelinePanel", "Editing & Physical Correction"),
+        "Deconvolution & Frequency": QCoreApplication.translate(
+            "PipelinePanel", "Deconvolution & Frequency"),
+        "Spatial Filters (2D)": QCoreApplication.translate(
+            "PipelinePanel", "Spatial Filters (2D)"),
+        "Visual Gain Adjustments": QCoreApplication.translate(
+            "PipelinePanel", "Visual Gain Adjustments"),
+        "Interpretation": QCoreApplication.translate(
+            "PipelinePanel", "Interpretation"),
+        "Other": QCoreApplication.translate(
+            "PipelinePanel", "Other"),
+    }
+    return table.get(name, name)
+
 
 # User preset store: one JSON file per saved pipeline under ~/.sbp_studio/presets.
 # A preset is a flat list of {"key", "params", "enabled"} — exactly what
@@ -119,7 +164,15 @@ class _ParamRow(QWidget):
 
 
 class _ChoiceRow(QWidget):
-    """A combo box bound to one categorical node param. Emits on selection."""
+    """A combo box bound to one categorical node param. Emits on selection.
+
+    Some ChoiceSpecs (currently PresetNode's "Type") group their choices
+    under category headers — see nodes.PRESET_HEADER_VALUE for how a header
+    entry is encoded in spec.choices. Those rows are rendered disabled and
+    styled via the SAME CategoryHeaderItemDelegate ProcessingControls' own
+    categorized preset combo uses, so both widgets present an identical
+    visual hierarchy for what is, structurally, the same grouping.
+    """
 
     changed = pyqtSignal()
 
@@ -132,8 +185,29 @@ class _ChoiceRow(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         self.combo = QComboBox()
-        for value, display in spec.choices:   # choices are core domain data (not tr'd)
+        self.combo.setItemDelegate(CategoryHeaderItemDelegate(self.combo))
+        for i, (value, display) in enumerate(spec.choices):   # domain data, not tr'd
+            if value == PRESET_HEADER_VALUE:
+                # UI chrome, not domain data — translated here (at combo-build
+                # time, so a runtime language switch is honoured) rather than
+                # baked into nodes.py's frozen ChoiceSpec.choices tuple. See
+                # node_i18n.tr_preset_category's docstring for why presets
+                # themselves stay untranslated but headers don't. Clean text,
+                # no "---" decoration — CategoryHeaderItemDelegate's own
+                # disabled/bold/accent-colour rendering is what marks this row
+                # as a header, matching the "Add module" menu's plain-text
+                # QLabel headers exactly (one visual system, not two).
+                self.combo.addItem(tr_preset_category(display), value)
+                item = self.combo.model().item(i)
+                item.setEnabled(False)
+                font = item.font()
+                font.setBold(True)
+                font.setWeight(QFont.Weight.Black)
+                item.setFont(font)
+                continue
             self.combo.addItem(display, value)
+            if spec.tooltips and value in spec.tooltips:
+                self.combo.setItemData(i, spec.tooltips[value], Qt.ItemDataRole.ToolTipRole)
         cur = node.params.get(spec.name, spec.default)
         idx = self.combo.findData(cur)
         if idx >= 0:
@@ -143,6 +217,30 @@ class _ChoiceRow(QWidget):
 
     def _on_change(self, *_) -> None:
         self._node.params[self._spec.name] = self.combo.currentData()
+        self.changed.emit()
+
+
+class _BoolRow(QWidget):
+    """A checkbox bound to one boolean node param. Emits on toggle."""
+
+    changed = pyqtSignal()
+
+    def __init__(self, node: DSPNode, spec: BoolSpec,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._node = node
+        self._spec = spec
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.checkbox = QCheckBox()
+        self.checkbox.setChecked(bool(node.params.get(spec.name, spec.default)))
+        self.checkbox.toggled.connect(self._on_toggled)
+        lay.addWidget(self.checkbox, 0)
+        lay.addStretch(1)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._node.params[self._spec.name] = checked
         self.changed.emit()
 
 
@@ -311,11 +409,82 @@ class PipelinePanel(QWidget):
 
     def _show_add_menu(self) -> None:
         menu = QMenu(self)
-        for cls in NODE_REGISTRY:
-            act = QAction(tr_node(cls.KEY, cls.DISPLAY), self)
-            act.triggered.connect(lambda _=False, c=cls: self.add_node(c()))
-            menu.addAction(act)
+        # Self-documenting "Add module" dropdown: a 1-2 sentence geophysical
+        # explanation on hover. QMenu does NOT show QAction tooltips by
+        # default (a long-standing Qt quirk) — setToolTipsVisible(True) is
+        # REQUIRED, not just setToolTip() on each action, or hovering would
+        # silently show nothing.
+        menu.setToolTipsVisible(True)
+
+        by_key = {cls.KEY: cls for cls in NODE_REGISTRY}
+        categorized: set = set()
+        first = True
+        for section_en, keys in _MENU_CATEGORIES:
+            if not first:
+                menu.addSeparator()
+            first = False
+            self._add_section_header(menu, _tr_section(section_en))
+            for key in keys:
+                cls = by_key.get(key)
+                if cls is None:
+                    continue
+                categorized.add(key)
+                self._add_node_action(menu, cls)
+
+        # Defensive catch-all: a node NOT listed in _MENU_CATEGORIES (e.g. a
+        # future addition nobody re-categorised yet) still appears here
+        # rather than silently vanishing from the menu — NODE_REGISTRY stays
+        # the single source of truth for "what's addable".
+        leftover = [cls for cls in NODE_REGISTRY if cls.KEY not in categorized]
+        if leftover:
+            if not first:
+                menu.addSeparator()
+            self._add_section_header(menu, _tr_section("Other"))
+            for cls in leftover:
+                self._add_node_action(menu, cls)
+
         menu.exec(self.btn_add.mapToGlobal(self.btn_add.rect().bottomLeft()))
+
+    def _add_section_header(self, menu: QMenu, text: str) -> None:
+        """An unclickable category header with a strong visual hierarchy.
+
+        QMenu.addSection() is the "correct" native API for this, but once a
+        QSS stylesheet is applied to QMenu (this app always has one — see
+        theme.py), Qt's section-title paint path silently drops the text on
+        several styles, leaving only a bare separator line — a long-standing
+        Qt/QSS interaction quirk. A plain disabled QAction (the first fix
+        attempted here) sidesteps THAT bug, but its text colour still comes
+        from the active QStyle/QSS for a ":disabled" menu item, which only
+        ever gives a muted grey — not the distinct accent colour a header
+        needs to stand out from real, clickable entries.
+
+        A QWidgetAction wrapping a real QLabel sidesteps both problems at
+        once: the label paints itself, completely independent of QMenu's
+        item-painting path, so neither addSection()'s text-drop bug nor the
+        QSS-disabled-grey limitation can touch it. WA_TransparentForMouseEvents
+        keeps it inert (clicks/hover pass through rather than highlighting
+        or triggering it); setEnabled(False) on the action itself is a second,
+        belt-and-suspenders guard against it ever being treated as the
+        current/triggerable menu item.
+        """
+        label = QLabel(text)
+        font = label.font()
+        font.setBold(True)
+        font.setWeight(QFont.Weight.Black)
+        bump_font_size(font)
+        label.setFont(font)
+        label.setStyleSheet(f"color: {theme.color('bright')}; padding: 4px 10px;")
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        act = QWidgetAction(menu)
+        act.setDefaultWidget(label)
+        act.setEnabled(False)
+        menu.addAction(act)
+
+    def _add_node_action(self, menu: QMenu, cls: type) -> None:
+        act = QAction(tr_node(cls.KEY, cls.DISPLAY), self)
+        act.setToolTip(tr_tooltip(cls.KEY, cls.TOOLTIP))
+        act.triggered.connect(lambda _=False, c=cls: self.add_node(c()))
+        menu.addAction(act)
 
     def _remove_selected(self) -> None:
         row = self.list.currentRow()
@@ -481,8 +650,12 @@ class PipelinePanel(QWidget):
             return
         self._editor_hint.setText("")
         for spec in node.SPECS:
-            row = (_ChoiceRow(node, spec) if isinstance(spec, ChoiceSpec)
-                   else _ParamRow(node, spec))
+            if isinstance(spec, ChoiceSpec):
+                row = _ChoiceRow(node, spec)
+            elif isinstance(spec, BoolSpec):
+                row = _BoolRow(node, spec)
+            else:
+                row = _ParamRow(node, spec)
             row.changed.connect(self._schedule)   # param edit → debounced
             self._editor_rows.append(row)
             self._editor_form.addRow(tr_param(spec.label), row)

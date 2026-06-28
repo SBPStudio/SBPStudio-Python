@@ -437,8 +437,13 @@ class PreviewController(QObject):
         # expensive nan_to_num scan entirely.
         arr = np.ascontiguousarray(visible, dtype=np.float32)
         self.view.set_colormap(cmap_name, vmax, vmin=vmin)
+        # c0/c1: the FULL-RESOLUTION trace-index bounds this window's arr
+        # actually represents — lets the view keep interpretation picks
+        # glued to the image's own linear pixel-grid approximation across
+        # pan/zoom (see SeismicView._pick_x_km's docstring).
         self.view.show_preview(arr, dist0, dist1, t_top, t_bot,
-                               vmax=vmax, vmin=vmin, fit=fit)
+                               vmax=vmax, vmin=vmin, fit=fit,
+                               c0=win.c_vis0, c1=c1_idx + 1)
 
         # Emit after show_preview so the ViewBox is already fitted (fit=True):
         # the autoRange() inside show_preview fires sigRangeChanged, but
@@ -457,7 +462,8 @@ class PreviewController(QObject):
             self._ab_cache = dict(
                 raw=raw_visible, proc=proc_visible,
                 dist0=dist0, dist1=dist1, t_top=t_top, t_bot=t_bot,
-                vmax=vmax, vmin=vmin, cmap=cmap_name)
+                vmax=vmax, vmin=vmin, cmap=cmap_name,
+                c0=win.c_vis0, c1=c1_idx + 1)
             split_km = dist0 + ab_split_frac * (dist1 - dist0)
             self.view.update_ab(True, split_km, t_top, t_bot, x0=dist0, x1=dist1)
             self.view.disable_wiggle()
@@ -568,7 +574,8 @@ class PreviewController(QObject):
         self.view.set_colormap(c["cmap"], c["vmax"], vmin=c["vmin"])
         self.view.show_preview(combined, c["dist0"], c["dist1"],
                                c["t_top"], c["t_bot"],
-                               vmax=c["vmax"], vmin=c["vmin"], fit=False)
+                               vmax=c["vmax"], vmin=c["vmin"], fit=False,
+                               c0=c["c0"], c1=c["c1"])
 
     # ── On-demand advanced spectrum inputs (heavy Welch runs in a worker) ────
 

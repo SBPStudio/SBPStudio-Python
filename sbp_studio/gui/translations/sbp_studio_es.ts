@@ -180,6 +180,21 @@
         <translation>Filtro de Mediana (Edge-Preserving)</translation>
     </message>
     <message>
+        <location filename="..\dsp\node_i18n.py" line="46" />
+        <source>SVD Filter (Eigenvalues)</source>
+        <translation>Filtro SVD (Eigenvalues)</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="47" />
+        <source>Bilateral Filter (Smart Smoothing)</source>
+        <translation>Filtro Bilateral (Suavizado Inteligente)</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="48" />
+        <source>Spherical Divergence (True Amplitude)</source>
+        <translation>Divergencia Esférica (True Amplitude)</translation>
+    </message>
+    <message>
         <location filename="..\dsp\node_i18n.py" line="78" />
         <source>Traces to mix</source>
         <translation>Trazas a mezclar:</translation>
@@ -188,6 +203,126 @@
         <location filename="..\dsp\node_i18n.py" line="79" />
         <source>Traces to evaluate</source>
         <translation>Trazas a evaluar:</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="80" />
+        <source>Principal Components</source>
+        <translation>Componentes Principales:</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="81" />
+        <source>Amplitude Tolerance</source>
+        <translation>Tolerancia de Amplitud</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="82" />
+        <source>Falloff Exponent</source>
+        <translation>Exponente de caída:</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="83" />
+        <source>Reference Seabed</source>
+        <translation>Referenciar al fondo marino</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="58" />
+        <source>Estimates and removes the predictable (repetitive) part of each trace's waveform, such as reverberation, to sharpen the source pulse and improve vertical resolution.</source>
+        <translation>Estima y elimina la parte predecible (repetitiva) de la forma de onda de cada traza, como la reverberación, para agudizar el pulso de la fuente y mejorar la resolución vertical.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="63" />
+        <source>Passes only frequencies between F-low and F-high, rejecting low-frequency swell/heave noise and high-frequency electrical/thermal noise outside the source's useful bandwidth.</source>
+        <translation>Deja pasar solo las frecuencias entre F-low y F-high, rechazando el ruido de oleaje de baja frecuencia y el ruido eléctrico/térmico de alta frecuencia fuera del ancho de banda útil de la fuente.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="68" />
+        <source>Applies a named seismic attribute transform (e.g. envelope, instantaneous phase/frequency via the Hilbert transform) used to highlight specific geological features instead of the raw amplitude.</source>
+        <translation>Aplica una transformada de atributo sísmico (p. ej. envolvente, fase/frecuencia instantánea mediante la transformada de Hilbert) para resaltar rasgos geológicos específicos en lugar de la amplitud cruda.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="73" />
+        <source>Exponentially boosts amplitude with time-since-seabed to compensate for signal attenuation with depth, so weak deep reflectors become as visible as the strong shallow seabed return.</source>
+        <translation>Aumenta exponencialmente la amplitud según el tiempo transcurrido desde el fondo marino para compensar la atenuación de la señal con la profundidad, de modo que los reflectores débiles y profundos sean tan visibles como el fuerte retorno somero del fondo.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="78" />
+        <source>Statistically equalises amplitude using a sliding RMS window per trace, boosting weak zones and damping strong ones, regardless of where they occur — a data-driven gain, unlike TVG's fixed geometric curve.</source>
+        <translation>Iguala estadísticamente la amplitud mediante una ventana RMS deslizante por traza, realzando las zonas débiles y atenuando las fuertes, sin importar dónde ocurran — una ganancia basada en los datos, a diferencia de la curva geométrica fija del TVG.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="83" />
+        <source>Zeroes everything above each trace's own picked seafloor, removing the water column entirely so reverberation and direct-wave energy don't interfere with sub-bottom interpretation.</source>
+        <translation>Anula todo lo que está por encima del fondo marino detectado en cada traza, eliminando por completo la columna de agua para que la reverberación y la energía de onda directa no interfieran con la interpretación del subfondo.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="88" />
+        <source>Removes vessel heave from sea-surface swell by aligning each trace to a smooth spatial reference via cross-correlation, flattening the wavy seafloor distortion that heave introduces into the section.</source>
+        <translation>Elimina el cabeceo del buque causado por el oleaje superficial, alineando cada traza con una referencia espacial suave mediante correlación cruzada, aplanando la distorsión ondulada que el cabeceo introduce en la sección.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="93" />
+        <source>Flattens the amplitude spectrum within a chosen band while preserving phase exactly, sharpening reflectors and improving vertical resolution by recovering frequencies the source/medium attenuated unevenly.</source>
+        <translation>Aplana el espectro de amplitud dentro de una banda elegida preservando exactamente la fase, agudizando los reflectores y mejorando la resolución vertical al recuperar frecuencias que la fuente/el medio atenuó de forma desigual.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="98" />
+        <source>Rejects coherently DIPPING events (side-echoes, diffractions, cable/towfish noise) by their apparent slope in the frequency-wavenumber domain, leaving flat reflectors untouched.</source>
+        <translation>Rechaza eventos con buzamiento coherente (ecos laterales, difracciones, ruido del cable/pez remolcado) según su pendiente aparente en el dominio frecuencia-número de onda, sin afectar a los reflectores planos.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="103" />
+        <source>Predicts and adaptively subtracts the seabed (water-bottom) multiple reflection at roughly twice the seafloor's two-way time, which otherwise masks weaker, genuine sub-bottom reflectors beneath it.</source>
+        <translation>Predice y resta de forma adaptativa la reflexión múltiple del fondo marino, que aparece aproximadamente al doble del tiempo de ida y vuelta del fondo, y que de otro modo enmascara reflectores genuinos más débiles por debajo.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="108" />
+        <source>Surgically removes a single narrow interference frequency (electrical resonance, tow-cable strum) with a zero-phase band-stop, leaving the rest of the spectrum untouched.</source>
+        <translation>Elimina quirúrgicamente una única frecuencia de interferencia estrecha (resonancia eléctrica, vibración del cable de remolque) con un filtro de banda eliminada de fase cero, sin afectar al resto del espectro.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="113" />
+        <source>Phase-preserving logarithmic rescale that compresses dynamic range, making weak reflectors visible alongside strong ones in the same display without clipping — like HDR tone-mapping for a photograph.</source>
+        <translation>Reescalado logarítmico que preserva la fase y comprime el rango dinámico, haciendo visibles los reflectores débiles junto a los fuertes en la misma imagen sin saturación — como el mapeo de tonos HDR en una fotografía.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="118" />
+        <source>Equalises contrast independently within small local tiles instead of globally, revealing subtle structure in both low- and high-amplitude regions of the same section simultaneously.</source>
+        <translation>Iguala el contraste de forma independiente dentro de pequeños mosaicos locales en lugar de globalmente, revelando estructuras sutiles tanto en zonas de baja como de alta amplitud de la misma sección simultáneamente.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="123" />
+        <source>Replaces samples that exceed a robust local amplitude threshold with the local median, removing 1-2 sample impulsive spikes (electrical transients, bad bits) while leaving genuine wavelet peaks untouched.</source>
+        <translation>Sustituye las muestras que superan un umbral de amplitud local robusto por la mediana local, eliminando picos impulsivos de 1-2 muestras (transitorios eléctricos, bits erróneos) sin afectar a los picos genuinos de la wavelet.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="128" />
+        <source>Divides each trace by its own RMS amplitude so every trace carries comparable energy along the line, correcting for source/receiver coupling variation before a downstream gain stage amplifies it.</source>
+        <translation>Divide cada traza por su propia amplitud RMS para que todas las trazas conserven una energía comparable a lo largo de la línea, corrigiendo la variación de acoplamiento fuente/receptor antes de que una etapa de ganancia posterior la amplifique.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="133" />
+        <source>Averages each sample with its horizontal neighbour traces. Coherent reflectors survive via constructive interference; incoherent random noise is attenuated via destructive interference.</source>
+        <translation>Promedia cada muestra con sus trazas vecinas horizontales. Los reflectores coherentes sobreviven por interferencia constructiva; el ruido aleatorio incoherente se atenúa por interferencia destructiva.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="138" />
+        <source>Replaces each sample with the median of its horizontal neighbours, rejecting isolated noise spikes outright instead of blending them — preserves sharp fault/reflector edges that a mean filter would blur.</source>
+        <translation>Sustituye cada muestra por la mediana de sus vecinas horizontales, rechazando por completo los picos de ruido aislados en lugar de mezclarlos — preserva los bordes nítidos de fallas/reflectores que un filtro de media difuminaría.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="143" />
+        <source>Rebuilds the section from only its top singular components. Coherent reflectors concentrate their energy into a few components; dense random noise spreads thinly across all of them and is discarded.</source>
+        <translation>Reconstruye la sección usando solo sus componentes singulares principales. Los reflectores coherentes concentran su energía en pocos componentes; el ruido aleatorio denso se reparte débilmente entre todos ellos y se descarta.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="148" />
+        <source>Averages horizontal neighbour traces only where their amplitude is similar — smooths random noise in flat zones while excluding neighbours across a fault or steep edge, so the edge stays sharp.</source>
+        <translation>Promedia las trazas vecinas horizontales solo donde su amplitud es similar — suaviza el ruido aleatorio en zonas planas mientras excluye a las vecinas al otro lado de una falla o borde abrupto, manteniendo el borde nítido.</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="153" />
+        <source>Deterministic, physics-based gain (t^exponent) referenced to each trace's own picked seafloor, compensating for wavefront spreading loss without the artificial water-column boost of a global t=0 curve.</source>
+        <translation>Ganancia determinista basada en la física (t^exponente) referenciada al fondo marino detectado en cada traza, compensando la pérdida por divergencia del frente de onda sin el refuerzo artificial de la columna de agua que produce una curva global desde t=0.</translation>
     </message>
     <message>
         <location filename="..\dsp\node_i18n.py" line="62" />
@@ -253,6 +388,31 @@
         <location filename="..\dsp\node_i18n.py" line="74" />
         <source>Window Size</source>
         <translation>Tamaño de ventana</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="166" />
+        <source>Complex Trace Attributes</source>
+        <translation>Atributos de Traza Compleja</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="168" />
+        <source>Structural Attributes</source>
+        <translation>Atributos Estructurales</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="170" />
+        <source>2D Image Filters</source>
+        <translation>Filtros de Imagen 2D</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="172" />
+        <source>Frequency &amp; Smoothing Filters</source>
+        <translation>Filtros de Frecuencia y Suavizado</translation>
+    </message>
+    <message>
+        <location filename="..\dsp\node_i18n.py" line="174" />
+        <source>Other</source>
+        <translation>Otros</translation>
     </message>
 </context><context>
     <name>CRSAdvancedSearchDialog</name>
@@ -540,6 +700,16 @@
     <message>
         <source>Show grid</source>
         <translation type="vanished">Mostrar rejilla</translation>
+    </message>
+    <message>
+        <location filename="..\components\export_dialog.py" line="318" />
+        <source>Overlay interpretation markers</source>
+        <translation>Superponer marcas de interés</translation>
+    </message>
+    <message>
+        <location filename="..\components\export_dialog.py" line="319" />
+        <source>Burn the active interpretation picks (markers + ID labels) into the exported image at full resolution, exactly where they sit on the live section.</source>
+        <translation>Incorpora las marcas de interpretación activas (marcadores + etiquetas de ID) en la imagen exportada a resolución completa, exactamente donde aparecen en la sección en vivo.</translation>
     </message>
 </context><context>
     <name>HelpDialog</name>
@@ -1438,6 +1608,36 @@ Perímetro: {2}</translation>
         <source>Load failed</source>
         <translation>Error al cargar</translation>
     </message>
+    <message>
+        <location filename="..\components\pipeline_panel.py" line="74" />
+        <source>Editing &amp; Physical Correction</source>
+        <translation>Edición y Corrección Física</translation>
+    </message>
+    <message>
+        <location filename="..\components\pipeline_panel.py" line="76" />
+        <source>Deconvolution &amp; Frequency</source>
+        <translation>Deconvolución y Frecuencias</translation>
+    </message>
+    <message>
+        <location filename="..\components\pipeline_panel.py" line="78" />
+        <source>Spatial Filters (2D)</source>
+        <translation>Filtros Espaciales (2D)</translation>
+    </message>
+    <message>
+        <location filename="..\components\pipeline_panel.py" line="80" />
+        <source>Visual Gain Adjustments</source>
+        <translation>Ajustes de Ganancia Visual</translation>
+    </message>
+    <message>
+        <location filename="..\components\pipeline_panel.py" line="82" />
+        <source>Interpretation</source>
+        <translation>Interpretación</translation>
+    </message>
+    <message>
+        <location filename="..\components\pipeline_panel.py" line="84" />
+        <source>Other</source>
+        <translation>Otros</translation>
+    </message>
 </context><context>
     <name>ProcessingControls</name>
     <message>
@@ -1777,6 +1977,31 @@ Perímetro: {2}</translation>
         <source>Resolution (DPI):</source>
         <translation type="vanished">Resolución (DPI):</translation>
     </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="963" />
+        <source>📍 Activate Picker</source>
+        <translation>📍 Activar marcador</translation>
+    </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="965" />
+        <source>Picking mode is ON — double-click the section to place a marker. Click to turn off.</source>
+        <translation>El modo de marcado está ACTIVADO — haz doble clic en la sección para colocar un marcador. Haz clic para desactivarlo.</translation>
+    </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="969" />
+        <source>Turn on picking mode: double-click the section to place an interpretation marker.</source>
+        <translation>Activa el modo de marcado: haz doble clic en la sección para colocar un marcador de interpretación.</translation>
+    </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="972" />
+        <source>📤 Export/Import</source>
+        <translation>📤 Exportar/Importar</translation>
+    </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="973" />
+        <source>Export interpretation markers to SHP/GeoJSON/CSV, or import a previously saved session (.tps).</source>
+        <translation>Exporta los marcadores de interpretación a SHP/GeoJSON/CSV, o importa una sesión guardada previamente (.tps).</translation>
+    </message>
 </context><context>
     <name>ProfileHandler</name>
     <message>
@@ -2066,6 +2291,31 @@ Perímetro: {2}</translation>
         <location filename="..\components\seismic_view.py" line="939" />
         <source>Add Anomaly to Map</source>
         <translation>Añadir anomalía al mapa</translation>
+    </message>
+    <message>
+        <location filename="..\components\seismic_view.py" line="813" />
+        <source>New interpretation marker</source>
+        <translation>Nuevo marcador de interpretación</translation>
+    </message>
+    <message>
+        <location filename="..\components\seismic_view.py" line="814" />
+        <source>Name or brief description</source>
+        <translation>Nombre o breve descripción</translation>
+    </message>
+    <message>
+        <location filename="..\components\seismic_view.py" line="839" />
+        <source>Edit description</source>
+        <translation>Editar descripción</translation>
+    </message>
+    <message>
+        <location filename="..\components\seismic_view.py" line="840" />
+        <source>Delete marker</source>
+        <translation>Eliminar marcador</translation>
+    </message>
+    <message>
+        <location filename="..\components\seismic_view.py" line="849" />
+        <source>Edit marker</source>
+        <translation>Editar marcador</translation>
     </message>
 </context><context>
     <name>SpectrumView</name>
@@ -2388,6 +2638,51 @@ Continue anyway?</source>
         <source>When active: hovering the seismic section shows a live cursor on the map, and double-clicking adds a Point of Interest marker.</source>
         <translation>Si está activo: al pasar el cursor sobre la sección sísmica se muestra un cursor en vivo en el mapa, y al hacer doble clic se añade un punto de interés.</translation>
     </message>
+    <message>
+        <location filename="..\tabs\_base.py" line="961" />
+        <source>No interpretation markers to export.</source>
+        <translation>No hay marcadores de interpretación para exportar.</translation>
+    </message>
+    <message>
+        <location filename="..\tabs\_base.py" line="964" />
+        <source>Export interpretation markers</source>
+        <translation>Exportar marcadores de interpretación</translation>
+    </message>
+    <message>
+        <location filename="..\tabs\_base.py" line="967" />
+        <source>Shapefile (*.shp);;GeoJSON (*.geojson);;CSV (*.csv);;Internal session (*.tps)</source>
+        <translation>Shapefile (*.shp);;GeoJSON (*.geojson);;CSV (*.csv);;Sesión interna (*.tps)</translation>
+    </message>
+    <message>
+        <location filename="..\tabs\_base.py" line="984" />
+        <source>Exporting interpretation markers…</source>
+        <translation>Exportando marcadores de interpretación…</translation>
+    </message>
+    <message>
+        <location filename="..\tabs\_base.py" line="989" />
+        <source>{0} interpretation marker(s) exported.</source>
+        <translation>{0} marcador(es) de interpretación exportado(s).</translation>
+    </message>
+    <message>
+        <location filename="..\tabs\_base.py" line="996" />
+        <source>Import interpretation markers</source>
+        <translation>Importar marcadores de interpretación</translation>
+    </message>
+    <message>
+        <location filename="..\tabs\_base.py" line="998" />
+        <source>Internal session (*.tps)</source>
+        <translation>Sesión interna (*.tps)</translation>
+    </message>
+    <message>
+        <location filename="..\tabs\_base.py" line="1006" />
+        <source>Could not read {0}: {1}</source>
+        <translation>No se pudo leer {0}: {1}</translation>
+    </message>
+    <message>
+        <location filename="..\tabs\_base.py" line="1010" />
+        <source>{0} interpretation marker(s) imported.</source>
+        <translation>{0} marcador(es) de interpretación importado(s).</translation>
+    </message>
 </context><context>
     <name>VisualizerTab</name>
     <message>
@@ -2410,5 +2705,32 @@ Continue anyway?</source>
     <message>
         <source>Rendering profile…</source>
         <translation type="vanished">Renderizando perfil…</translation>
+    </message>
+</context><context>
+    <name>PickingExportImportDialog</name>
+    <message>
+        <location filename="..\components\picking_export_dialog.py" line="35" />
+        <source>Interpretation Markers</source>
+        <translation>Marcadores de Interpretación</translation>
+    </message>
+    <message>
+        <location filename="..\components\picking_export_dialog.py" line="60" />
+        <source>Export the current interpretation markers, or import a previously saved session (.tps).</source>
+        <translation>Exporta los marcadores de interpretación actuales, o importa una sesión guardada previamente (.tps).</translation>
+    </message>
+    <message>
+        <location filename="..\components\picking_export_dialog.py" line="63" />
+        <source>Export</source>
+        <translation>Exportar</translation>
+    </message>
+    <message>
+        <location filename="..\components\picking_export_dialog.py" line="64" />
+        <source>Import</source>
+        <translation>Importar</translation>
+    </message>
+    <message>
+        <location filename="..\components\picking_export_dialog.py" line="66" />
+        <source>Import is disabled while markers are already placed — importing replaces the current list. Clear the markers first.</source>
+        <translation>Importar está deshabilitado mientras ya hay marcadores colocados — importar reemplaza la lista actual. Elimina primero los marcadores.</translation>
     </message>
 </context></TS>

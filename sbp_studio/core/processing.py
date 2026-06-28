@@ -277,6 +277,162 @@ def apply_median_filter(data: np.ndarray, window_size: int = 3) -> np.ndarray:
     return out.astype(data.dtype, copy=False)
 
 
+# ── SVD filter / Karhunen-Loeve transform (coherent-signal enhancement) ─────────
+
+def apply_svd_filter(data: np.ndarray, num_components: int = 10) -> np.ndarray:
+    """
+    SVD Filter (Karhunen-Loeve Transform): rebuild the matrix from only its
+    ``num_components`` largest singular values/vectors —
+    ``X_clean = U_k @ diag(S_k) @ V_k^T``. A coherent reflector is spatially
+    repetitive across many traces, so it concentrates almost all of its
+    energy into a handful of dominant singular components; dense, spatially
+    incoherent thermal/random noise spreads thinly across ALL of them.
+    Truncating to the top ``num_components`` keeps the former and discards
+    the latter — a fundamentally different (and stronger) mechanism than
+    Trace Mixing/Median Filter's local neighbour-window averaging, useful
+    when those are too conservative against widespread noise in deep,
+    low-SNR sections.
+
+    Math/performance: a FULL SVD of an (ns, n_traces) matrix is O(ns·n_traces·
+    min(ns,n_traces)) time and materialises min(ns,n_traces) singular vectors
+    — wasteful when only a handful are ever kept. ``scipy.sparse.linalg.svds``
+    (ARPACK, Lanczos iteration) computes ONLY the requested top-k directly,
+    without ever forming the full decomposition — the appropriate tool here,
+    not ``np.linalg.svd``.
+
+    ``num_components`` is clipped to ``[1, min(ns, n_traces) - 1]`` (svds'
+    own hard constraint: ``k`` must be a strictly smaller than the matrix's
+    smaller dimension) — silently, so an unusually small viewport/chain chunk
+    never crashes the pipeline.
+
+    Safety: an EXACTLY all-zero chunk (e.g. a fully-muted/dead window) has no
+    nonzero starting vector for ARPACK's Lanczos iteration and would raise an
+    ``ArpackError``; detected up front and returned as a zero copy instead —
+    consistent with every other degenerate-input guard in this module.
+
+    Hardware/survey-agnostic: the only assumption is the array contract
+    itself (axis 0 = samples, axis 1 = traces) — no trace-length, sample-
+    rate, or instrument-specific constant anywhere.
+
+    Parameters
+    ----------
+    data           : (ns, n_traces) float32 (or any float dtype) — NOT mutated.
+    num_components : number of dominant singular components kept. Default 10.
+
+    Returns
+    -------
+    (ns, n_traces) — new array, same dtype as ``data``.
+    """
+    ns, n_traces = data.shape
+    max_k = min(ns, n_traces) - 1
+    if max_k < 1 or not np.any(data):
+        return data.copy()
+    k = max(1, min(int(num_components), max_k))
+
+    from scipy.sparse.linalg import svds
+    u, s, vt = svds(data.astype(np.float64, copy=False), k=k)
+    out = (u * s) @ vt
+    return out.astype(data.dtype, copy=False)
+
+
+# ── Bilateral filter (edge-preserving spatial smoothing) ────────────────────────
+
+def apply_bilateral_filter(data: np.ndarray, window_size: int = 5,
+                           sigma_space: float = 2.0, sigma_color: float = 0.5) -> np.ndarray:
+    """
+    Bilateral Filter (Edge-Preserving Spatial Smoothing): a weighted average
+    of horizontal neighbour traces, where each neighbour's weight is the
+    PRODUCT of two Gaussians — one on spatial distance (``sigma_space``,
+    "how far"), one on amplitude difference (``sigma_color``, "how similar").
+    Unlike Trace Mixing's plain mean (which weights every neighbour equally
+    regardless of how different it is), a neighbour whose amplitude differs
+    sharply from the centre trace — exactly what happens across a fault or a
+    steep reflector edge — gets a near-zero weight and is excluded from its
+    own average, so the smoothing never crosses the discontinuity. Where
+    amplitudes ARE locally similar (a quiet stretch with only random noise
+    riding on it), neighbours get full spatial weight and the noise is
+    averaged down same as Trace Mixing would. A tunable middle ground
+    between Trace Mixing (smooth everywhere, blurs edges) and Median Filter
+    (preserves edges, but a harder on/off decision with no weighted blend).
+
+    ``sigma_color`` is a UNITLESS, RELATIVE tolerance, not a raw amplitude:
+    internally it is scaled by this chunk's own amplitude spread
+    (``data.std()``), so e.g. ``sigma_color=0.5`` always means "half a
+    standard deviation of THIS data," regardless of whether the section is
+    recorded in raw counts, volts, or an already-gained display unit — the
+    user never has to guess an abstract absolute float. Standard deviation
+    (rather than max-abs) is used because a single noise spike would
+    otherwise inflate the whole tolerance window and weaken edge
+    preservation everywhere else in the chunk.
+
+    ``window_size`` MUST be odd (centred window, no lateral event shift),
+    coerced up to the next odd value if given even, floored at 1 (a no-op
+    pass-through) — same convention as Trace Mixing/Median Filter.
+
+    Implementation: a Python loop over the (small) window OFFSETS — not over
+    traces or samples — each iteration a fully vectorised NumPy pass over the
+    whole array (shift via edge-padding, squared-difference, two Gaussians,
+    accumulate). ``window_size`` iterations of O(ns·n_traces) vector ops, not
+    ``ns·n_traces`` individual Python-level pixel computations.
+
+    Safety: the centre offset (k=0) always has zero amplitude difference and
+    distance, so its weight is exactly 1 and the per-position weight sum can
+    never be zero — division-safe by construction, no epsilon flooring
+    needed. A literally constant (zero-variance) chunk has nothing to
+    normalise sigma_color against and is returned as a pass-through copy.
+    ``sigma_space``/``sigma_color`` are floored at a tiny epsilon so a
+    careless 0.0 from the UI can't divide by zero in the Gaussian exponents.
+
+    Hardware/survey-agnostic: the only assumption is the array contract
+    itself (axis 0 = samples, axis 1 = traces) — no trace-length, sample-
+    rate, or instrument-specific constant anywhere.
+
+    Parameters
+    ----------
+    data        : (ns, n_traces) float32 (or any float dtype) — NOT mutated.
+    window_size : number of traces evaluated together (odd, >= 1). Default 5.
+    sigma_space : spatial Gaussian spread, in TRACES. Default 2.0.
+    sigma_color : amplitude-similarity tolerance, as a multiple of this
+                  chunk's own std-dev. Default 0.5.
+
+    Returns
+    -------
+    (ns, n_traces) — new array, same dtype as ``data``.
+    """
+    window_size = max(1, int(window_size))
+    if window_size % 2 == 0:
+        window_size += 1
+    half = window_size // 2
+    if half == 0:
+        return data.copy()
+
+    data64 = data.astype(np.float64, copy=False)
+    scale = float(np.std(data64))
+    if scale < 1e-12:
+        return data.copy()
+
+    sigma_space = max(float(sigma_space), 1e-6)
+    sigma_color = max(float(sigma_color), 1e-6)
+    space_denom = 2.0 * sigma_space ** 2
+    color_denom = 2.0 * (sigma_color * scale) ** 2
+
+    n_traces = data64.shape[1]
+    padded = np.pad(data64, ((0, 0), (half, half)), mode="edge")
+
+    acc = np.zeros_like(data64)
+    wsum = np.zeros_like(data64)
+    for k in range(-half, half + 1):
+        neighbor = padded[:, half + k: half + k + n_traces]
+        spatial_w = np.exp(-(k * k) / space_denom)
+        diff = neighbor - data64
+        w = spatial_w * np.exp(-(diff * diff) / color_denom)
+        acc += w * neighbor
+        wsum += w
+
+    out = acc / wsum
+    return out.astype(data.dtype, copy=False)
+
+
 # ── Reference deconvolution ────────────────────────────────────────────────────
 
 def _ref_apply_predictive_decon(
@@ -738,6 +894,175 @@ def apply_tvg(data: np.ndarray, alpha: float, dt_us: int,
     t_since_seabed = np.maximum(t_sec[:, np.newaxis] - pick_t_sec[np.newaxis, :], 0.0)
     gain = np.clip(np.exp(alpha * t_since_seabed), 0.0, 1e9)
     return (data * gain).astype(np.float32)
+
+
+# ── Spherical divergence correction (deterministic, physics-based gain) ────────
+
+def pick_seabed(data: np.ndarray, threshold_pct: float = 30.0,
+                smooth_samples: int = 7) -> np.ndarray:
+    """
+    Robust, fully-vectorised seabed (first significant energy break) picker.
+
+    Algorithm: MEDIAN-smooth the rectified trace, then — per trace,
+    independently — the first sample whose smoothed envelope reaches
+    ``threshold_pct`` % of THAT trace's own peak envelope. A relative
+    (per-trace) threshold rather than an absolute one, since traces in the
+    same chunk can differ wildly in overall amplitude (coupling, range).
+
+    MEDIAN, not a box/mean average: a single impulsive water-column noise
+    spike sits in only 1 of ``smooth_samples`` window positions, so the
+    median categorically rejects it (it can never become the middle value
+    as long as it's a minority of the window) — a mean would instead drag
+    the smoothed envelope UP toward the spike's own huge amplitude and could
+    still fool the threshold test. Ignoring exactly this kind of outlier is
+    the picker's whole job.
+
+    Deliberately expressed purely in SAMPLES, not absolute time/``dt_us``:
+    early noise is typically only 1-2 samples wide regardless of sample
+    rate, so a small fixed sample-count smoother suppresses it without
+    needing the acquisition's sample interval at all — keeping this picker
+    a self-contained, reusable building block.
+
+    Fully vectorised: ONE ``median_filter`` pass (axis confined to samples
+    via a ``(smooth_samples, 1)`` footprint, C-optimised), one
+    max-reduction, one broadcasted comparison, one argmax-reduction — no
+    Python-level loop over traces, regardless of ``n_traces``.
+
+    Degenerate traces (no energy ever reaches the threshold — e.g. a fully
+    dead/muted channel, or a perfectly flat constant trace) pick index 0:
+    callers that build a "time since seabed" gain from this pick then
+    transparently fall back to a from-t=0 curve for exactly that trace,
+    rather than failing or picking a nonsensical position.
+
+    Parameters
+    ----------
+    data           : (ns, n_traces) float32 (or any float dtype).
+    threshold_pct  : per-trace envelope threshold, as a % of that trace's
+                     own peak. Default 30.0.
+    smooth_samples : median window width in SAMPLES (coerced to odd,
+                     floored at 1). Default 7.
+
+    Returns
+    -------
+    (n_traces,) int64 — the picked sample index per trace, in ``[0, ns-1]``.
+    """
+    from scipy.ndimage import median_filter
+
+    smooth_samples = max(1, int(smooth_samples))
+    if smooth_samples % 2 == 0:
+        smooth_samples += 1
+
+    env = median_filter(np.abs(data), size=(smooth_samples, 1), mode="nearest")
+    peak = np.max(env, axis=0)                          # (n_traces,)
+    thresh = (threshold_pct / 100.0) * peak
+    exceed = env >= thresh[np.newaxis, :]
+    pick = np.argmax(exceed, axis=0)                    # 0 ⇒ no break found / fallback
+    return pick.astype(np.int64)
+
+
+def apply_spherical_divergence(data: np.ndarray, exponent: float = 1.0,
+                               reference_seabed: bool = True) -> np.ndarray:
+    """
+    Spherical Divergence Correction (True Amplitude Recovery): a
+    DETERMINISTIC, physics-based gain curve ``g(t) = t**exponent`` — the
+    deterministic counterpart to AGC's purely STATISTICAL windowed-RMS gain
+    (AGC reacts to whatever amplitude each trace happens to have; this
+    applies a curve derived from the wavefront geometry, not the data).
+
+    ``exponent=1.0`` is the theoretical pure geometric-spreading loss
+    (amplitude falls off ∝ 1/range, so the compensating gain is ∝ range ∝
+    time for a roughly constant-velocity medium). ``exponent>1.0`` lets the
+    user empirically push the curve further to ALSO compensate for
+    inelastic (absorption) attenuation, which spherical spreading alone does
+    not model — geophysically, real sub-bottom losses are usually somewhat
+    stronger than the pure 1/range law, hence the >1.0 headroom.
+
+    ``reference_seabed`` (the geophysically correct default) — applying the
+    gain from a single global t=0 is a flaw: it keeps boosting EVERY trace
+    by the same growing curve regardless of where the seafloor actually is,
+    so a deep-water trace (where the seabed reflection itself arrives late)
+    gets blown out, while a shallow-water trace (seabed arrives early) is
+    comparatively washed out, even though physically the gain should always
+    be referenced to round-trip distance FROM THE SEAFLOOR'S OWN ARRIVAL,
+    not an arbitrary recording-start clock. With ``reference_seabed=True``:
+      - :func:`pick_seabed` finds each trace's OWN seabed sample.
+      - The water column (every sample ABOVE that pick) gets a flat,
+        constant gain — there is no "divergence" to correct above the
+        seafloor in this single-bounce model.
+      - Every sample AT OR BELOW the pick gets ``(t_since_seabed + 1)
+        ** exponent`` — 1-indexed (not 0) for the same reason as the
+        legacy curve below: a 0-indexed exponent>0 curve would give an
+        exact-zero gain immediately at the seafloor — a discontinuity vs.
+        the water column's flat gain just above it, with no physical basis.
+    With ``reference_seabed=False``, the legacy single global ``t**exponent``
+    curve (1-indexed sample number, identical for every trace) is used
+    instead — kept for parity/comparison and as a cheaper, geometry-blind
+    fallback when no clear seabed reflection exists in the chunk at all.
+
+    The raw curve is always computed in float64 (``t**exponent`` can reach
+    large magnitudes for long traces at the high end of the exponent range,
+    and float32 would risk overflow), then NORMALISED before being applied,
+    so the result doesn't blow out the display/export's clipping range:
+      - Legacy (``reference_seabed=False``): normalised by the WHOLE curve's
+        own mean (its only component).
+      - Dynamic (``reference_seabed=True``): normalised by the mean of ONLY
+        the post-seabed growth values, IGNORING the water column's flat
+        entries — a long flat-1.0 water column (e.g. a deep-water trace
+        where the seabed pick lands late) would otherwise dilute the mean
+        toward 1.0 regardless of how strong the actual sub-seabed growth
+        is, defeating the normalisation's purpose. This is a single GLOBAL
+        scalar for the whole chunk (not per-trace), so relative amplitude
+        relationships between traces — the entire point of "true amplitude"
+        recovery — are preserved; only the overall scale is adjusted.
+
+    Safety: for ``exponent >= 0`` and any 1-indexed sample count ``>= 1``,
+    every gain value is always ``>= 1``, so every normalising mean is always
+    ``>= 1`` — division can never be by zero, by construction (no epsilon
+    flooring needed) in either path. ``exponent`` is floored at 0.0 (a
+    negative exponent would invert the curve into an attenuation, the
+    opposite of this filter's purpose).
+
+    Parameters
+    ----------
+    data             : (ns, n_traces) float32 (or any float dtype) — NOT
+                       mutated.
+    exponent         : gain-curve power. ``0.0`` is a no-op (unity gain
+                       everywhere, in EITHER path). Default 1.0 (pure
+                       geometric spreading).
+    reference_seabed : if True (default), reference the gain to each
+                       trace's own picked seabed; if False, use the legacy
+                       single global curve from sample 0.
+
+    Returns
+    -------
+    (ns, n_traces) — new array, same dtype as ``data``.
+    """
+    exponent = max(0.0, float(exponent))
+    ns = data.shape[0]
+    idx = np.arange(ns, dtype=np.float64)[:, np.newaxis]      # (ns, 1)
+
+    if not reference_seabed:
+        t = idx + 1.0                                          # 1-indexed, shared by every trace
+        gain = t ** exponent
+        gain /= gain.mean()
+        out = data.astype(np.float64, copy=False) * gain
+        return out.astype(data.dtype, copy=False)
+
+    seabed = pick_seabed(data).astype(np.float64)[np.newaxis, :]   # (1, n_traces)
+    below = idx >= seabed                                          # (ns, n_traces) bool
+    # 1-indexed depth below the seabed (continuous with the water column's
+    # flat gain right at the boundary: t_rel=1 there, so 1**exponent=1).
+    # Clamped at 1.0 even ABOVE the seabed purely to keep the (otherwise
+    # discarded-by-np.where) power computation from raising a negative base
+    # to a fractional exponent there, which would emit a spurious warning.
+    t_rel = np.maximum(idx - seabed + 1.0, 1.0)
+    gain = np.where(below, t_rel ** exponent, 1.0)
+
+    sub_seabed_mean = gain[below].mean() if np.any(below) else 1.0
+    gain /= sub_seabed_mean
+
+    out = data.astype(np.float64, copy=False) * gain
+    return out.astype(data.dtype, copy=False)
 
 
 # ── Log compression (HDR dynamic-range compression) ─────────────────────────────

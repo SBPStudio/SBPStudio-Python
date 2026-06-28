@@ -31,7 +31,7 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QRectF, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QFont, QPainterPath
-from PyQt6.QtWidgets import QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QInputDialog, QMenu, QVBoxLayout, QWidget
 
 from ..i18n import language_manager
 from ..theme import MONO, theme
@@ -44,6 +44,28 @@ pg.setConfigOption("useOpenGL", True)   # hardware-accelerated pan/zoom
 
 # FIX mark tuple: (number, distance_km, label)
 FixMark = Tuple[int, float, str]
+
+
+class _PickScatterPlotItem(pg.ScatterPlotItem):
+    """ScatterPlotItem variant that ALSO intercepts right-clicks on its
+    points — the base class's ``mouseClickEvent`` only ever handles
+    ``Qt.MouseButton.LeftButton`` (every other button is explicitly
+    ``ev.ignore()``'d, see pyqtgraph's own source), which would let a
+    right-click on a marker bubble straight through to the ViewBox's own
+    context menu instead of this marker's Edit/Delete menu. Removing the
+    button check (and forwarding whichever button matched) is the entire
+    change — clicks that miss every point still ``ev.ignore()`` exactly as
+    before, so the normal Measure/Hide Ruler/Add Anomaly menu is untouched
+    everywhere else on the section."""
+
+    def mouseClickEvent(self, ev) -> None:
+        pts = self.pointsAt(ev.pos())
+        if len(pts) > 0:
+            self.ptsClicked = pts
+            ev.accept()
+            self.sigClicked.emit(self, self.ptsClicked, ev)
+        else:
+            ev.ignore()
 
 
 class SeismicView(QWidget):
@@ -159,6 +181,48 @@ class SeismicView(QWidget):
         # self._hide_ruler_action below), not a toolbar button.
         self._ruler_roi: Optional[pg.LineSegmentROI] = None
         self._ruler_label: Optional[pg.TextItem] = None
+
+        # Interpretation & Picking (Phase 3): double-click (while active)
+        # drops a numbered marker + a free-text description, drawn as ONE
+        # shared ScatterPlotItem (efficient: a single GPU draw call however
+        # many points exist) plus one pg.TextItem per point for its ID label
+        # (pyqtgraph has no batched text item). ``_next_pick_id`` is a
+        # monotonically increasing counter that is NEVER reset by toggling
+        # picking on/off, nor by deleting a point — only a brand-new
+        # SeismicView instance (i.e. app restart) starts it back at 1.
+        self._pick_mode: bool = False
+        self._picks: List["PickPoint"] = []
+        self._next_pick_id: int = 1
+        self._pick_source = None   # SegyProfile/ProfileChain for coord lookup
+        self._pick_scatter: Optional[_PickScatterPlotItem] = None
+        self._pick_labels: dict = {}   # pick id -> pg.TextItem
+        # Markers live directly in the ViewBox (self.plot.addItem — see
+        # _ensure_pick_scatter), NOT parented to self.img. Their X position
+        # is NOT a fixed dist_km[trace_index] lookup, though — the image
+        # itself never renders a trace AT its true km position to begin
+        # with. self.img's array is always a UNIFORM pixel resample
+        # (scipy.ndimage.zoom / PIL, see viz.render._colorize_for_target,
+        # and pyqtgraph's own ImageItem.setRect does the equivalent), with
+        # no notion of dist_km's real (non-uniform — ship speed varies) per-
+        # trace spacing: it stretches LINEARLY across whatever km window is
+        # currently shown. A pick must therefore use the SAME linear
+        # interpolation within the CURRENT window's trace-index bounds
+        # (_img_trace_lo/_img_trace_hi, set by show_preview/_apply_zoom_
+        # update/_push_full_image) to land on the pixel its data actually
+        # occupies — see _redraw_picks's docstring for the full derivation,
+        # and viz.render._draw_picks for the identical fix on the export
+        # side (where there's only ever one "window" — the whole exported
+        # raster — so no cross-zoom drift question arises there).
+        self._img_trace_lo: Optional[int] = None
+        self._img_trace_hi: Optional[int] = None
+        # The km span the CURRENTLY DISPLAYED image actually covers — tracked
+        # SEPARATELY from self._rect, which (for the static show_image/
+        # _apply_zoom_update path) keeps meaning "the full dataset's extent"
+        # even while _apply_zoom_update's re-slice shows only a sub-window
+        # of it (self._rect is still relied on elsewhere — e.g. set_aspect —
+        # for that full-extent meaning, so it can't double as this).
+        self._img_km_lo: Optional[float] = None
+        self._img_km_hi: Optional[float] = None
 
         # Display buffer state (set by show_image; used by _on_range_changed).
         self._arr: Optional[np.ndarray] = None   # (rows, cols) float32
@@ -672,10 +736,216 @@ class SeismicView(QWidget):
         label.setText(f"ΔX: {dx_m:,.1f} m | ΔT: {dt_ms:,.1f} ms")
         label.setPos((p1.x() + p2.x()) / 2.0, (p1.y() + p2.y()) / 2.0)
 
+    # ── Interpretation & Picking (Phase 3) ──────────────────────────────────
+
+    def set_pick_mode(self, active: bool) -> None:
+        """Turn picking on/off (driven by ProcessingControls.btn_toggle_picking).
+        Existing markers are left exactly as they are — only NEW double-click
+        creation is gated by this flag."""
+        self._pick_mode = bool(active)
+
+    def set_picking_source(self, obj) -> None:
+        """Called by the owning tab whenever the active profile/chain changes
+        (alongside set_distance_axis) — used ONLY to resolve x_coord/y_coord
+        for a NEWLY created pick (core.resolve_pick_coords reads obj.lons/
+        obj.lats). Re-rendering the SAME profile (a DSP tweak, a Render Full)
+        never calls this with a different object, so existing picks survive
+        that; switching to a genuinely DIFFERENT profile/chain does, and that
+        is the one case where the on-screen markers are no longer meaningful
+        (their trace_index would point into a different file's geometry) —
+        so the visible list is cleared then, but the id counter is NOT reset
+        (see __init__): ids stay unique for the lifetime of this widget."""
+        if obj is not self._pick_source:
+            self.clear_picks()
+        self._pick_source = obj
+
+    def get_picks(self) -> List["PickPoint"]:
+        """A shallow copy — callers (export) must not mutate the live list."""
+        return list(self._picks)
+
+    def set_picks(self, picks: List["PickPoint"]) -> None:
+        """Replace the current pick list wholesale (Import) and redraw.
+        ``_next_pick_id`` is advanced past the highest imported id so newly
+        created picks never collide with imported ones."""
+        self._picks = list(picks)
+        if self._picks:
+            self._next_pick_id = max(self._next_pick_id,
+                                     max(p.id for p in self._picks) + 1)
+        self._redraw_picks()
+
+    def clear_picks(self) -> None:
+        """Remove every marker from the screen AND the data list (the id
+        counter is untouched — see set_picking_source)."""
+        self._picks = []
+        self._redraw_picks()
+
+    def _ensure_pick_scatter(self) -> _PickScatterPlotItem:
+        if self._pick_scatter is None:
+            self._pick_scatter = _PickScatterPlotItem(
+                size=12, pen=pg.mkPen("#000000", width=1),
+                brush=pg.mkBrush("#ffd54f"), symbol="o")
+            self._pick_scatter.setZValue(60)   # above raster/wiggle, below A/B (70)
+            self._pick_scatter.sigClicked.connect(self._on_pick_scatter_clicked)
+            # Added directly to the ViewBox (NOT parented to self.img) and
+            # positioned in absolute (km, ms) view coordinates — see
+            # _redraw_picks's docstring for why. ignoreBounds=True matches
+            # the A/B divider/labels' own convention: a handful of marker
+            # glyphs must never skew autoRange()'s fit to the actual data.
+            self.plot.addItem(self._pick_scatter, ignoreBounds=True)
+        return self._pick_scatter
+
+    def _pick_x_km(self, trace_index: int, n_traces: Optional[int]) -> float:
+        """The km position a pick at ``trace_index`` must render at to land
+        on the SAME pixel self.img's data actually occupies there.
+
+        self.img's array is always a UNIFORM resample (pyqtgraph's
+        ImageItem.setRect stretches it linearly across whatever km window
+        is currently shown — see viz.render._colorize_for_target for the
+        identical mechanism on the export side), with no notion of
+        dist_km's real (non-uniform — ship speed varies) per-trace spacing.
+        So trace_index's pixel position is the LINEAR FRACTION of its
+        offset within the CURRENT window's trace-index bounds
+        (self._img_trace_lo/_img_trace_hi, set by show_preview/
+        _apply_zoom_update/_push_full_image), mapped into that SAME
+        window's own km bounds (self._img_km_lo/_img_km_hi — tracked
+        separately from self._rect, which keeps meaning "the full
+        dataset's extent" even while a zoom re-slice shows only part of
+        it) — NOT a direct dist_km[trace_index] lookup, which would
+        decouple from the image whenever spacing is non-uniform (this was
+        the actual reported bug: markers rendering far from their true
+        geological location).
+
+        This means a pick's RENDERED km position can shift slightly between
+        different zoom windows (each window's own linear approximation of
+        non-uniform spacing differs a little) — an intentional, unavoidable
+        trade-off: it is what keeps the marker glued to the image's actual
+        pixels in any GIVEN view, at the cost of not being a perfectly
+        fixed absolute position across views. Falls back to a direct
+        dist_km lookup when no window bounds are known yet (e.g. before the
+        first preview/show_image call).
+        """
+        lo, hi = self._img_trace_lo, self._img_trace_hi
+        d0, d1 = self._img_km_lo, self._img_km_hi
+        if lo is not None and hi is not None and hi > lo and d0 is not None and d1 != d0:
+            frac = (trace_index - lo) / (hi - lo)
+            return d0 + frac * (d1 - d0)
+        dist = self._dist_km
+        if n_traces:
+            return float(dist[trace_index])
+        return float(trace_index)
+
+    def _redraw_picks(self) -> None:
+        """Rebuild the shared scatter's spots + every ID TextItem from
+        ``self._picks``. Both the scatter and every label live directly in
+        the ViewBox (self.plot.addItem), never parented to self.img.
+
+        Called whenever the pick LIST changes (add/edit/delete/import/
+        clear) AND whenever the CURRENT zoom window changes
+        (show_preview/_apply_zoom_update/_push_full_image) — unlike a fixed
+        absolute position, the window-relative X computed by _pick_x_km
+        needs re-evaluating every time that window's own linear
+        approximation shifts. See _pick_x_km's docstring for the full
+        derivation. Y is the pick's own time_ms verbatim — the sample
+        interval is constant by construction, so it never has this problem.
+        """
+        for label in self._pick_labels.values():
+            self.plot.removeItem(label)
+            label.deleteLater()
+        self._pick_labels.clear()
+
+        if not self._picks:
+            if self._pick_scatter is not None:
+                self._pick_scatter.setData([])
+            return
+
+        scatter = self._ensure_pick_scatter()
+        dist = self._dist_km
+        n_traces = dist.size if dist is not None else None
+        spots = []
+        for p in self._picks:
+            i = p.trace_index
+            if n_traces:   # clamp defensively (e.g. an imported session from a longer line)
+                i = max(0, min(i, n_traces - 1))
+            x_km = self._pick_x_km(i, n_traces)
+            y_ms = p.time_ms
+            spots.append({"pos": (x_km, y_ms), "data": p.id})
+            label = pg.TextItem(str(p.id), anchor=(0.5, 1.2),
+                                color=theme.color("highlight"))
+            label.setZValue(61)
+            self.plot.addItem(label, ignoreBounds=True)
+            label.setPos(x_km, y_ms)
+            self._pick_labels[p.id] = label
+        scatter.setData(spots)
+
+    def _create_pick_at(self, scene_pos, trace_index: int) -> None:
+        """Double-click handler: resolve the grid position, ask for a
+        description, assign the next id, append + draw. Cancelling the
+        QInputDialog creates nothing (no id is consumed for a cancelled pick
+        — the counter only advances on an actual created point)."""
+        from sbp_studio.core import PickPoint, resolve_pick_coords
+        try:
+            time_ms = float(self.plot.getViewBox().mapSceneToView(scene_pos).y())
+        except (AttributeError, TypeError):
+            return
+        text, ok = QInputDialog.getText(
+            self, self.tr("New interpretation marker"),
+            self.tr("Name or brief description"))
+        if not ok:
+            return
+        x_coord, y_coord = resolve_pick_coords(self._pick_source, trace_index)
+        pick = PickPoint(id=self._next_pick_id, trace_index=trace_index,
+                         time_ms=time_ms, x_coord=x_coord, y_coord=y_coord,
+                         description=text.strip())
+        self._next_pick_id += 1
+        self._picks.append(pick)
+        self._redraw_picks()
+
+    def _on_pick_scatter_clicked(self, _plot, points, ev) -> None:
+        """Only RIGHT-clicks open the Edit/Delete menu (a left-click on a
+        marker is a no-op here — see _PickScatterPlotItem's docstring for
+        why right-clicks reach this handler at all)."""
+        try:
+            if ev.button() != Qt.MouseButton.RightButton or not points:
+                return
+        except AttributeError:
+            return
+        pick_id = points[0].data()
+        pick = next((p for p in self._picks if p.id == pick_id), None)
+        if pick is None:
+            return
+        menu = QMenu(self)
+        act_edit = menu.addAction(self.tr("Edit description"))
+        act_delete = menu.addAction(self.tr("Delete marker"))
+        chosen = menu.exec(ev.screenPos().toPoint())
+        if chosen is act_edit:
+            self._edit_pick_description(pick)
+        elif chosen is act_delete:
+            self._delete_pick(pick)
+
+    def _edit_pick_description(self, pick: "PickPoint") -> None:
+        text, ok = QInputDialog.getText(
+            self, self.tr("Edit marker"),
+            self.tr("Name or brief description"), text=pick.description)
+        if ok:
+            pick.description = text.strip()
+            self._redraw_picks()
+
+    def _delete_pick(self, pick: "PickPoint") -> None:
+        self._picks = [p for p in self._picks if p.id != pick.id]
+        self._redraw_picks()
+
     def _on_scene_click(self, ev) -> None:
         """Map a single left-click to the trace index under the cursor and
         emit it. pyqtgraph fires sigMouseClicked only for clicks (drags pan
-        the view), so this never interferes with panning."""
+        the view), so this never interferes with panning.
+
+        Also the picking entry point: while picking mode is active, a
+        DOUBLE left-click places a new marker instead of (not in addition
+        to) emitting trace_clicked. ``ev.isAccepted()`` is checked first —
+        GraphicsScene.sendClickEvent ALWAYS emits sigMouseClicked, even for
+        clicks an item (e.g. an existing pick marker) already accepted for
+        itself — so a double-click that lands ON an existing marker is
+        correctly ignored here rather than stacking a second point on it."""
         idx = self._index_at_scene_pos(ev.scenePos())
         if idx is None:
             return
@@ -684,7 +954,50 @@ class SeismicView(QWidget):
                 return
         except AttributeError:
             return
+        if self._pick_mode and ev.double() and not ev.isAccepted():
+            # NOT the same idx resolved above: _index_at_scene_pos finds the
+            # trace whose TRUE dist_km is closest to the clicked km, but
+            # _pick_x_km renders a pick via the CURRENT window's linear
+            # approximation, not a true dist_km lookup — using idx here
+            # would create a pick that immediately "snaps" away from the
+            # exact pixel just clicked whenever spacing is non-uniform. See
+            # _picking_trace_index_at_scene_pos's docstring.
+            pick_idx = self._picking_trace_index_at_scene_pos(ev.scenePos())
+            if pick_idx is not None:
+                self._create_pick_at(ev.scenePos(), pick_idx)
+            return
         self.trace_clicked.emit(idx)
+
+    def _picking_trace_index_at_scene_pos(self, scene_pos) -> Optional[int]:
+        """Resolve a scene position to a trace_index for PICKING
+        specifically — the exact inverse of ``_pick_x_km``'s window-relative
+        linear interpolation, NOT ``_index_at_scene_pos``'s dist_km-
+        searchsorted resolution (used by hover/single-click/the ruler).
+
+        This is what guarantees a newly created pick renders at EXACTLY the
+        pixel it was clicked on, with zero snap, even when the line's real
+        trace spacing is non-uniform: _redraw_picks will place this same
+        trace_index via the identical forward mapping, so click → render is
+        an exact round trip. Falls back to ``_index_at_scene_pos`` when the
+        current window's trace-index bounds aren't known yet (e.g. before
+        the first preview/show_image call)."""
+        try:
+            x_km = float(self.plot.getViewBox().mapSceneToView(scene_pos).x())
+        except (AttributeError, TypeError):
+            return None
+        lo, hi = self._img_trace_lo, self._img_trace_hi
+        d0, d1 = self._img_km_lo, self._img_km_hi
+        n_traces = self._dist_km.size if self._dist_km is not None else None
+        if lo is not None and hi is not None and hi > lo and d0 is not None and d1 != d0:
+            frac = (x_km - d0) / (d1 - d0)
+            i = int(round(lo + frac * (hi - lo)))
+        else:
+            i = self._index_at_scene_pos(scene_pos)
+            if i is None:
+                return None
+        if n_traces:
+            i = max(0, min(i, n_traces - 1))
+        return max(0, i)
 
     def set_link_views_enabled(self, enabled: bool) -> None:
         """Called by the owning tab whenever the "Link Views" toggle changes
@@ -745,12 +1058,20 @@ class SeismicView(QWidget):
 
     def show_preview(self, arr: np.ndarray, dist0: float, dist1: float,
                      t0: float, t1: float, *, vmax: float, vmin: float = 0.0,
-                     fit: bool = False) -> None:
+                     fit: bool = False,
+                     c0: Optional[int] = None, c1: Optional[int] = None) -> None:
         """Lean image update for the live preview — NO autoRange unless ``fit``.
 
         ``set_colormap`` must have been called first (LUT ready). On ``fit`` the
         view is auto-ranged once (initial display); subsequent pan/zoom-driven
         previews leave the user's viewport untouched.
+
+        ``c0``/``c1`` — the FULL-RESOLUTION trace-index bounds (half-open)
+        this window's ``arr`` actually represents (e.g. PreviewController's
+        ``win.c_vis0``/``win.c_vis1``) — used ONLY to keep interpretation
+        picks glued to the image's own linear pixel-grid approximation (see
+        ``_pick_x_km``'s docstring). ``None`` leaves any existing picks on
+        their last-known position rather than guessing.
         """
         self.clear_hq_overlay()   # a fresh preview supersedes any HQ overlay
         vmax_f = float(vmax) or 1.0
@@ -758,6 +1079,7 @@ class SeismicView(QWidget):
         self._vmax = vmax_f
         self._vmin = vmin_f
         self._rect = (float(dist0), float(dist1), float(t0), float(t1))
+        self._img_km_lo, self._img_km_hi = float(dist0), float(dist1)
         self.img.setImage(arr, autoLevels=False)
         new_levels = (vmin_f, vmax_f)
         if new_levels != self._img_levels:
@@ -769,8 +1091,13 @@ class SeismicView(QWidget):
         self.img.setRect(QRectF(float(dist0), float(t0),
                                 float(dist1) - float(dist0),
                                 float(t1) - float(t0)))
+        if c0 is not None and c1 is not None:
+            self._img_trace_lo = int(c0)
+            self._img_trace_hi = int(c1)
         if fit:
             self.set_aspect(self._aspect)   # autoRanges to fit the new section
+        if self._picks:
+            self._redraw_picks()
 
     def set_overlays(self, boundaries: Sequence[float] = (),
                      fixes: Sequence[FixMark] = ()) -> None:
@@ -965,6 +1292,12 @@ class SeismicView(QWidget):
         if self._lut is not None:
             self.img.setLookupTable(self._lut)
         self.img.setRect(QRectF(sub_d0, t0, sub_d1 - sub_d0, t1 - t0))
+        # The re-slice's column window IS this view's CURRENT linear
+        # approximation — picks must track it (see _pick_x_km's docstring).
+        self._img_trace_lo, self._img_trace_hi = c0, c1
+        self._img_km_lo, self._img_km_hi = sub_d0, sub_d1
+        if self._picks:
+            self._redraw_picks()
 
     # ── Internals ───────────────────────────────────────────────────────────
 
@@ -981,7 +1314,12 @@ class SeismicView(QWidget):
         self.img.setRect(QRectF(float(d0), float(t0),
                                 float(d1) - float(d0),
                                 float(t1) - float(t0)))
+        # Full buffer, 1:1 — the window IS the whole trace range.
+        self._img_trace_lo, self._img_trace_hi = 0, arr.shape[1]
+        self._img_km_lo, self._img_km_hi = float(d0), float(d1)
         self._last_zoom_key = None
+        if self._picks:
+            self._redraw_picks()
 
     def _colormap(self) -> pg.ColorMap:
         try:

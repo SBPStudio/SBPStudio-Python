@@ -19,7 +19,8 @@ from PyQt6.QtWidgets import (
 )
 
 from ..components import (
-    CRSSelectorDialog, ExportDialog, HeaderView, MapView, PipelinePanel,
+    CRSSelectorDialog, ExportDialog, HeaderView, MapView,
+    PickingExportImportDialog, PipelinePanel,
     PlaceholderView, ProcessingControls, SeismicView, SpectrumView,
 )
 from ..dsp import DSPContext, PreviewController
@@ -140,7 +141,7 @@ def _crop_for_viewport(obj, proc, t0_full, x_range, y_range):
 
 
 def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
-                          handler, cancel):
+                          handler, cancel, picks=None):
     """Shared per-item export render — used by BOTH the single export and every
     batch item so their quality can never drift.
 
@@ -150,6 +151,10 @@ def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     ``effective_export_dpi`` so the embedded raster is never decimated, then
     applies the WYSIWYG aspect fit. Returns ``(fig, render_dpi)``; the caller
     saves and closes the figure.
+
+    ``picks`` — interpretation markers to burn into the raster at full export
+    resolution (see ExportDialog's "Overlay interpretation markers" checkbox);
+    ``None``/empty draws nothing (the default — batch exports never pass it).
     """
     from sbp_studio.viz.render import build_theme
     # Full-resolution DSP pipeline (alignment + nodes) — shared with the viewport
@@ -201,7 +206,8 @@ def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
         # Reflector-safe downscale: when the export must shrink below native
         # (RAM-capped DPI), pool by max-|amplitude| instead of bilinear so thin
         # high-amplitude reflectors are preserved. Default on.
-        max_abs_pool=bool(cfg.get("max_abs_pool", True)))
+        max_abs_pool=bool(cfg.get("max_abs_pool", True)),
+        picks=picks)
     fig = handler.render_figure(obj, data, params, figsize=figsize, dpi=render_dpi,
                                 **render_opts)
     # WYSIWYG aspect fit: grow the figure so the DATA box hits the mode's effective
@@ -310,6 +316,12 @@ class SubTabbedTab(QWidget):
             self._on_hq_preview_requested)
         self.controls.export_image_requested.connect(self._on_export_image_requested)
         self.controls.export_fix_requested.connect(self._on_export_fix_requested)
+        # Interpretation & Picking (Phase 3): the toggle button drives the
+        # view's double-click behaviour directly; the export/import button
+        # opens the chooser dialog (mirrors the FIX-marks export flow).
+        self.controls.picking_toggled.connect(self._seismic.set_pick_mode)
+        self.controls.export_import_picking_requested.connect(
+            self._on_picking_export_import)
         self.controls.scale_changed.connect(self._on_scale_changed)
         self.controls.boundaries_toggled.connect(self._on_boundaries_toggled)
         self.controls.align_toggled.connect(lambda *_: self.preview.alignment_changed())
@@ -323,6 +335,15 @@ class SubTabbedTab(QWidget):
         # generated for the current configuration.
         self.state.active_profile_changed.connect(lambda *_: self._update_dpi_estimate())
         self.state.active_chain_changed.connect(lambda *_: self._update_dpi_estimate())
+        # Picking needs the active object to resolve x_coord/y_coord for any
+        # NEW marker (core.resolve_pick_coords reads obj.lons/obj.lats) — see
+        # SeismicView.set_picking_source's docstring for why switching to a
+        # genuinely different profile/chain clears the on-screen markers
+        # while a same-profile DSP/Render Full refresh never does.
+        self.state.active_profile_changed.connect(
+            lambda *_: self._seismic.set_picking_source(self._active_object()))
+        self.state.active_chain_changed.connect(
+            lambda *_: self._seismic.set_picking_source(self._active_object()))
         # Map-redraw mechanism (Task 1): ANY code path that resolves a CRS in
         # place (the Map-tab just-in-time prompt below, or the sidebar's
         # Metadata Inspector "Edit CRS…") calls state.notify_crs_updated();
@@ -654,6 +675,13 @@ class SubTabbedTab(QWidget):
         align_enabled = self.controls.align_enabled()
         params["align"] = align_enabled
 
+        # Picks must be read from the live SeismicView HERE, on the GUI thread
+        # (Qt widgets aren't thread-safe) — get_picks() already returns a
+        # shallow copy of plain PickPoint dataclasses, safe to hand to the
+        # background worker's closure below. Empty when the checkbox is off,
+        # so _render_export_figure's picks param is a no-op (see _draw_picks).
+        picks = self._seismic.get_picks() if cfg.get("overlay_picks") else []
+
         def job(progress, cancel) -> str:
             from sbp_studio.viz.render import save_figure
             # Lazy-load safety: profiles are header-only stubs and CHAINS assemble
@@ -666,7 +694,8 @@ class SubTabbedTab(QWidget):
             # Shared render pipeline (identical to every batch item): full-res DSP
             # + decimation-free DPI floor + WYSIWYG aspect fit.
             fig, render_dpi = _render_export_figure(
-                _obj, cfg, params, node_cfg, scale_cfg, align_enabled, handler, cancel)
+                _obj, cfg, params, node_cfg, scale_cfg, align_enabled, handler, cancel,
+                picks=picks)
             try:
                 save_figure(fig, out, dpi=render_dpi, fmt=fmt, pdf_page=cfg["pdf_page"])
             except OSError as exc:
@@ -923,6 +952,75 @@ class SubTabbedTab(QWidget):
         _out, n = result
         self.tasks.notify(QCoreApplication.translate(
             "SubTabbedTab", "{0} FIX marks exported.").format(n))
+
+    # ── Interpretation & Picking (Phase 3) ──────────────────────────────────
+
+    def _on_picking_export_import(self) -> None:
+        """'Exportar/Importar' clicked: show the chooser, then drive whichever
+        native QFileDialog the user picked — same dispatch-by-extension
+        convention as _on_export_fix_requested above."""
+        picks = self._seismic.get_picks()
+        dlg = PickingExportImportDialog(self, has_existing_picks=bool(picks))
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.choice() is None:
+            return
+        if dlg.choice() == PickingExportImportDialog.EXPORT:
+            self._export_picking_session(picks)
+        else:
+            self._import_picking_session()
+
+    def _export_picking_session(self, picks: list) -> None:
+        if not picks:
+            self.tasks.notify(QCoreApplication.translate(
+                "SubTabbedTab", "No interpretation markers to export."))
+            return
+        out, _ = QFileDialog.getSaveFileName(
+            self, QCoreApplication.translate("SubTabbedTab", "Export interpretation markers"),
+            f"{self._export_basename()}_picks.shp",
+            QCoreApplication.translate(
+                "SubTabbedTab",
+                "Shapefile (*.shp);;GeoJSON (*.geojson);;CSV (*.csv);;"
+                "Internal session (*.tps)"))
+        if not out:
+            return
+
+        def job(progress, cancel) -> tuple:
+            from sbp_studio.core import export_picks, save_picks_tps
+            progress(float("nan"), "")
+            if out.lower().endswith(".tps"):
+                save_picks_tps(out, picks)
+                return out, len(picks)
+            written = export_picks(out, picks)
+            return written, len(picks)
+
+        self.tasks.run_task(
+            job, self._on_picking_exported,
+            QCoreApplication.translate("SubTabbedTab", "Exporting interpretation markers…"))
+
+    def _on_picking_exported(self, result: tuple) -> None:
+        _out, n = result
+        self.tasks.notify(QCoreApplication.translate(
+            "SubTabbedTab", "{0} interpretation marker(s) exported.").format(n))
+
+    def _import_picking_session(self) -> None:
+        """Import is only reachable via the dialog when the current list is
+        EMPTY (see PickingExportImportDialog) — set_picks still replaces the
+        list wholesale, defensively, even if called some other way."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, QCoreApplication.translate("SubTabbedTab", "Import interpretation markers"),
+            "", QCoreApplication.translate(
+                "SubTabbedTab", "Internal session (*.tps)"))
+        if not path:
+            return
+        try:
+            from sbp_studio.core import load_picks_tps
+            picks = load_picks_tps(path)
+        except (OSError, ValueError) as exc:
+            self.tasks.show_error(QCoreApplication.translate(
+                "SubTabbedTab", "Could not read {0}: {1}").format(path, exc))
+            return
+        self._seismic.set_picks(picks)
+        self.tasks.notify(QCoreApplication.translate(
+            "SubTabbedTab", "{0} interpretation marker(s) imported.").format(len(picks)))
 
     # ── Construction ────────────────────────────────────────────────────────
 
