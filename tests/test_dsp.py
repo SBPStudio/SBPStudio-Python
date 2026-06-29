@@ -2611,6 +2611,66 @@ class TestColorPumpingFix:
 
         assert vmax_after != pytest.approx(vmax_before)
 
+    def test_global_levels_miss_is_dispatched_to_worker_not_inline(self):
+        """The UI-freeze fix: on a cache MISS, _refresh must NOT call
+        _compute_global_levels inline — it hands the job to the SAME
+        background worker that processes the viewport, and only applies
+        the result once that worker reports back."""
+        from sbp_studio.gui.dsp import AGCNode
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+
+        panel.nodes.append(AGCNode())             # changes the pipeline content
+        pc._on_pipeline_changed()                 # dispatches _refresh() synchronously
+        # Immediately after dispatch (BEFORE pumping events) the worker must
+        # already be running and the levels must still be PENDING — proof
+        # that _compute_global_levels did NOT run inline on this thread.
+        assert pc._worker is not None
+        assert pc._pending_levels_key is not None
+
+        self._run_to_completion(app, pc)
+        # Once the worker resolves, the result is applied AND cached.
+        assert pc._pending_levels_key is None
+        assert pc._global_levels_key in pc._global_levels_cache
+
+    def test_repeated_pipeline_signature_hits_cache(self):
+        """Toggling back to a previously-seen pipeline content (same node
+        signatures) must reuse the cached global levels instantly — no new
+        background job needed — rather than recomputing from scratch."""
+        from sbp_studio.gui.dsp import AGCNode
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+
+        # A: add AGC (cache miss → dispatch → cache fill).
+        panel.nodes.append(AGCNode())
+        pc._on_pipeline_changed()
+        self._run_to_completion(app, pc)
+        size_after_a = len(pc._global_levels_cache)
+        vmax_a = pc._global_vmax
+
+        # B: remove it (back to the empty chain — already cached from set_source).
+        panel.nodes.clear()
+        pc._on_pipeline_changed()
+        self._run_to_completion(app, pc)
+
+        # Back to A: an EQUIVALENT node (same KEY + params → same signature),
+        # not the same instance — proves the cache is keyed by content, not
+        # by object identity or the ever-incrementing pipeline_version.
+        panel.nodes.append(AGCNode())
+        pc._on_pipeline_changed()
+        # Cache HIT: applied synchronously inside _refresh, no job pending.
+        assert pc._pending_levels_key is None
+        assert pc._global_vmax == pytest.approx(vmax_a)
+        self._run_to_completion(app, pc)
+        # No new cache entry was created for the repeat.
+        assert len(pc._global_levels_cache) == size_after_a
+
     def test_ab_compare_vmax_also_locked_to_global(self):
         app = self._qt()
         obj = self._profile()

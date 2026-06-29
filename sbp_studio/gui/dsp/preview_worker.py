@@ -9,6 +9,14 @@ panning/zooming/dragging for that long. ``PipelineWorker`` runs exactly one
 ``Pipeline.process`` call on a QThread and reports the result back via a
 queued (thread-safe) Qt signal.
 
+It can ALSO, in the same background run, execute an optional
+``global_levels_job`` callable — ``PreviewController._compute_global_levels``
+bound to the not-yet-cached arguments — so that the "color pumping" fix's
+full-resolution block sampling NEVER runs synchronously on the GUI thread
+either (see PreviewController._refresh's cache-then-bundle logic). Both calls
+share this same worker thread sequentially (never concurrently), so handing
+the live ``Pipeline`` instance to both is safe — see the note below.
+
 Only one worker is ever in flight at a time — see
 ``PreviewController._refresh``, which queues further triggers in
 ``_pending``/``_pending_sync`` rather than overlapping workers. This is what
@@ -18,6 +26,8 @@ is running.
 """
 from __future__ import annotations
 
+from typing import Callable, Optional, Tuple
+
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -26,23 +36,31 @@ from .pipeline import Pipeline
 
 
 class PipelineWorker(QThread):
-    """Runs ``pipeline.process(sub, ctx, input_token=token)`` on a worker thread."""
+    """Runs ``pipeline.process(sub, ctx, input_token=token)`` on a worker
+    thread, optionally followed by ``global_levels_job()`` (also off the GUI
+    thread) — see module docstring."""
 
-    succeeded = pyqtSignal(object, object)   # (token, result array)
+    # (token, result array, global_levels result-or-None)
+    succeeded = pyqtSignal(object, object, object)
     failed = pyqtSignal(object, str)         # (token, error message)
 
     def __init__(self, pipeline: Pipeline, sub: np.ndarray, ctx: DSPContext,
-                 token: tuple, parent=None) -> None:
+                 token: tuple, *,
+                 global_levels_job: Optional[Callable[[], Tuple[float, float]]] = None,
+                 parent=None) -> None:
         super().__init__(parent)
         self._pipeline = pipeline
         self._sub = sub
         self._ctx = ctx
         self._token = token
+        self._global_levels_job = global_levels_job
 
     def run(self) -> None:  # executed on the worker thread
         try:
             result = self._pipeline.process(self._sub, self._ctx, input_token=self._token)
+            levels = (self._global_levels_job() if self._global_levels_job is not None
+                      else None)
         except Exception as exc:  # a bad node config must never hang the preview
             self.failed.emit(self._token, f"{type(exc).__name__}: {exc}")
             return
-        self.succeeded.emit(self._token, result)
+        self.succeeded.emit(self._token, result, levels)

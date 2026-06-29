@@ -54,11 +54,12 @@ MAX_PREVIEW_COLS = 4000
 # CURRENT per-window filter chain exactly as a real ViewBox window would be,
 # so the result is mathematically identical to full-resolution zoomed-in DSP,
 # just sampled at a few representative locations instead of everywhere. Kept
-# narrow (a few hundred traces total) so the synchronous recompute in
-# _refresh stays fast even with a heavier node in the chain — it only runs
-# when the source, the alignment flag, the pre-crop/window node chain, or the
-# clip percentile actually changes, never on pan/zoom (see _refresh's
-# levels_key check).
+# narrow (a few hundred traces total) so the WORKER-thread recompute (see
+# PipelineWorker's global_levels_job — never inline on the GUI thread) stays
+# fast even with a heavier node in the chain — it only runs on a cache miss,
+# when the source, the alignment flag, the pre-crop/window node chain's
+# CONTENT, or the clip percentile actually changes, never on pan/zoom (see
+# _refresh's levels_key/_global_levels_cache check).
 GLOBAL_LEVELS_BLOCKS = 5
 GLOBAL_LEVELS_BLOCK_TRACES = 150
 
@@ -160,6 +161,16 @@ class PreviewController(QObject):
         self._global_vmax: float = 1.0
         self._global_vmax_raw: float = 1.0   # A/B Compare's "raw" half ceiling
         self._global_levels_key: Optional[tuple] = None
+        # Cache of every (vmax_proc, vmax_raw) result ever computed, keyed by
+        # the pipeline's own CONTENT signature (not the ever-incrementing
+        # _pipeline_version counter) — so toggling a node off and back on,
+        # or undoing/redoing an edit, reuses a previously-computed result
+        # instantly instead of recomputing. Unbounded but cheap (two floats
+        # per entry); see _refresh for the key shape and _on_pipeline_result
+        # for where a miss gets stored. Never computed on the GUI thread —
+        # see _pending_levels_key/PipelineWorker's global_levels_job.
+        self._global_levels_cache: dict = {}
+        self._pending_levels_key: Optional[tuple] = None
 
         # A/B Compare wiper state. ``_ab_frac`` is the user's chosen split as a
         # fraction of the visible width (persists across pan/zoom — a screen-
@@ -303,11 +314,16 @@ class PreviewController(QObject):
         is mathematically identical to what full-resolution zoomed-in DSP
         would show, not an artifact of a coarsened/distorted dt. ``vmax_raw``
         (no per-window filters) is kept separately for A/B Compare, which
-        needs a fair ceiling for BOTH its raw and processed halves. Runs
-        synchronously on the GUI thread — acceptable because the sampled
-        trace count stays small AND this only runs when the source/
-        alignment/pipeline/clip actually changes (see _refresh's levels_key
-        check), never on every pan/zoom frame."""
+        needs a fair ceiling for BOTH its raw and processed halves.
+
+        Called from the WORKER thread (see PipelineWorker's
+        global_levels_job) on a cache miss, never inline on the GUI thread
+        — even though the sampled trace count stays small, a heavy node
+        (Deconvolution, F-K) running 5 extra blocks synchronously was
+        measurably enough to freeze the UI on every filter add/edit. Only
+        triggered when the source/alignment/pipeline-content/clip actually
+        changes (see _refresh's levels_key/_global_levels_cache check),
+        never on every pan/zoom frame."""
         ns, n_traces = data.shape
         block_w = min(GLOBAL_LEVELS_BLOCK_TRACES, n_traces)
         n_blocks = min(GLOBAL_LEVELS_BLOCKS, max(1, n_traces // block_w))
@@ -361,17 +377,33 @@ class PreviewController(QObject):
         disp = self._disp_cache
         clip = float(disp.get("clip", DEFAULT_CLIP_PCT))
 
-        # Recompute the LOCKED global levels only when something that actually
-        # changes the amplitude distribution has changed — the source/
-        # alignment/pre-crop chain (data_version), the per-window filter
-        # chain (pipeline_version), or the clip percentile itself. A pure
-        # pan/zoom touches none of these, so the key is unchanged and this is
-        # a no-op — the whole point of the fix (see _compute_global_levels).
-        levels_key = (self._data_version, self._pipeline_version, clip)
+        # Recompute the LOCKED global levels only when something that
+        # actually changes the amplitude distribution has changed — the
+        # source/alignment/pre-crop chain (data_version), the per-window
+        # filter chain's CONTENT (node signatures — not the ever-incrementing
+        # _pipeline_version counter, so a config seen before hits the cache
+        # below), or the clip percentile itself. A pure pan/zoom touches
+        # none of these, so the key is unchanged and this whole block is a
+        # no-op — the whole point of the fix (see _compute_global_levels).
+        #
+        # NEVER computed synchronously here on the GUI thread (that froze
+        # the UI on every filter add/edit — see GLOBAL_LEVELS_BLOCKS' note):
+        # on a cache MISS, ``global_levels_job`` below is bundled into the
+        # SAME background PipelineWorker run that already processes this
+        # refresh's viewport window, and the result is applied later in
+        # _on_pipeline_result once the worker reports back.
+        pipeline_sig = tuple(n.signature() for n in self.pipeline.nodes)
+        levels_key = (self._data_version, pipeline_sig, clip)
+        global_levels_job = None
         if levels_key != self._global_levels_key:
-            self._global_vmax, self._global_vmax_raw = (
-                self._compute_global_levels(data, dt_us, clip))
-            self._global_levels_key = levels_key
+            cached = self._global_levels_cache.get(levels_key)
+            if cached is not None:
+                self._global_vmax, self._global_vmax_raw = cached
+                self._global_levels_key = levels_key
+            else:
+                self._pending_levels_key = levels_key
+                global_levels_job = (lambda d=data, dt=dt_us, c=clip:
+                                     self._compute_global_levels(d, dt, c))
 
         # Trace halo only changes when the source or pipeline node set
         # changes; cache it so pan/zoom skips DSPContext construction + node
@@ -431,23 +463,37 @@ class PreviewController(QObject):
         self._refresh_ctx = dict(obj=obj, win=win, disp=disp, dist_km=dist_km,
                                  n_traces=n_traces, t0_full=t0_full, dt_ms=dt_ms,
                                  fit=fit, overlays=overlays)
-        worker = PipelineWorker(self.pipeline, win.sub, sub_ctx, win.token, parent=self)
+        worker = PipelineWorker(self.pipeline, win.sub, sub_ctx, win.token,
+                                global_levels_job=global_levels_job, parent=self)
         worker.succeeded.connect(self._on_pipeline_result)
         worker.failed.connect(self._on_pipeline_failed)
         worker.finished.connect(worker.deleteLater)
         self._worker = worker
         worker.start()
 
-    def _on_pipeline_result(self, token: object, processed: np.ndarray) -> None:
+    def _on_pipeline_result(self, token: object, processed: np.ndarray,
+                            levels: Optional[tuple]) -> None:
         """GUI-thread continuation of _refresh once the worker's pipeline.process
-        finishes — runs the cheap presentation logic and touches Qt widgets."""
+        (and, on a cache miss, _compute_global_levels) finishes — runs the
+        cheap presentation logic and touches Qt widgets.
+
+        ``levels`` is the ``(vmax_proc, vmax_raw)`` the worker computed in
+        the background when _refresh found no cached entry for
+        ``self._pending_levels_key`` — apply it now and cache it so the
+        SAME pipeline config never needs recomputing again."""
         ctx = self._refresh_ctx
+        if levels is not None and self._pending_levels_key is not None:
+            self._global_vmax, self._global_vmax_raw = levels
+            self._global_levels_cache[self._pending_levels_key] = levels
+            self._global_levels_key = self._pending_levels_key
+        self._pending_levels_key = None
         self._worker = None
         self._finish_refresh(processed, **ctx)
         self._dispatch_pending()
 
     def _on_pipeline_failed(self, token: object, message: str) -> None:
         self._worker = None
+        self._pending_levels_key = None   # the job that would have filled it never ran
         _LOG.error("DSP preview pipeline failed: %s", message)
         self._dispatch_pending()
 
