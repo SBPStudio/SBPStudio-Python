@@ -2619,6 +2619,11 @@ Continue anyway?</source>
         <translation>Cabeceras</translation>
     </message>
     <message>
+        <location filename="..\tabs\_base.py" line="1128" />
+        <source>Controls</source>
+        <translation>Controles</translation>
+    </message>
+    <message>
         <source>Render the view before exporting.</source>
         <translation type="vanished">Renderiza la vista antes de exportar.</translation>
     </message>

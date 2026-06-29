@@ -207,7 +207,13 @@ def build_qss(palette: Dict[str, str]) -> str:
         font-family: "{MONO}";
         font-size: 11px;
     }}
-    QTabBar::tab:selected {{ background: {c['panel']}; color: {c['text']}; }}
+    /* Active/selected tab must look highlighted, not recessed — same
+       background/text pairing used everywhere else in this stylesheet for
+       "this is the selected thing" (QListWidget::item:selected,
+       QMenu::item:selected, …), so it stays correct in BOTH palettes
+       (unlike panel/accent, whose relative brightness flips between the
+       dark and light themes). */
+    QTabBar::tab:selected {{ background: {c['sel']}; color: {c['bright']}; }}
 
     QScrollBar:vertical   {{ background: {c['bg']}; width: 12px; margin: 0; }}
     QScrollBar:horizontal {{ background: {c['bg']}; height: 12px; margin: 0; }}
@@ -225,6 +231,15 @@ def build_qss(palette: Dict[str, str]) -> str:
     QStatusBar::item {{ border: 0px; }}
 
     QSplitter::handle {{ background: {c['bg']}; }}
+
+    QDockWidget::title {{
+        background: {c['accent']};
+        color: {c['sub']};
+        padding: 4px 6px;
+        font-family: "{MONO}";
+        font-size: 11px;
+    }}
+    QDockWidget {{ titlebar-close-icon: none; titlebar-normal-icon: none; }}
     """
 
 

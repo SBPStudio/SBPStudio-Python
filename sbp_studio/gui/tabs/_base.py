@@ -14,8 +14,9 @@ from typing import Optional, TYPE_CHECKING
 
 from PyQt6.QtCore import QCoreApplication, Qt
 from PyQt6.QtWidgets import (
-    QCheckBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QMessageBox,
-    QScrollArea, QSplitter, QStackedWidget, QTabWidget, QVBoxLayout, QWidget,
+    QCheckBox, QDialog, QDockWidget, QFileDialog, QFrame, QHBoxLayout,
+    QMainWindow, QMenu, QMessageBox, QScrollArea, QStackedWidget, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 from ..components import (
@@ -249,18 +250,29 @@ class SubTabbedTab(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
 
-        split = QSplitter(Qt.Orientation.Horizontal)
-        split.addWidget(self._build_controls())
-        split.addWidget(self._build_subtabs())
-        split.setStretchFactor(0, 0)
-        split.setStretchFactor(1, 1)
-        # Wider default so every filter control is visible without scrolling, and a
-        # grippy, non-collapsible handle so the user can drag the panel edge freely.
-        split.setChildrenCollapsible(False)
-        split.setHandleWidth(6)
-        split.setSizes([360, 1000])
-        self._main_split = split
-        root.addWidget(split)
+        # Dockable workspace (multi-monitor support): an inner QMainWindow
+        # embedded as a plain child widget (a fully supported Qt pattern —
+        # the same trick Qt Designer itself uses) gives every panel a real,
+        # native QDockWidget that can be dragged out to a floating window on
+        # a second monitor, independent of the outer MainWindow. No central
+        # widget is set, so the Controls dock and the tabified Profile/Map/
+        # Spectrum/Headers docks fill the whole area themselves.
+        self._dock_host = QMainWindow()
+        self._dock_host.setWindowFlags(Qt.WindowType.Widget)
+        self._dock_host.setDockNestingEnabled(True)
+        # GroupedDragging lets the whole tabified group move as a unit by
+        # its tab strip; AllowTabbedDocks is what makes tabifyDockWidget's
+        # browser-tab-style grouping (below) possible in the first place.
+        self._dock_host.setDockOptions(
+            self._dock_host.dockOptions()
+            | QMainWindow.DockOption.GroupedDragging
+            | QMainWindow.DockOption.AllowTabbedDocks)
+        self._dock_host.setTabPosition(
+            Qt.DockWidgetArea.AllDockWidgetAreas, QTabWidget.TabPosition.North)
+        self._dock_host.addDockWidget(
+            Qt.DockWidgetArea.LeftDockWidgetArea, self._build_controls_dock())
+        self._build_view_docks()
+        root.addWidget(self._dock_host)
 
         # Eager SeismicView on the Profile page, driven by the live preview
         # controller (pan/zoom + node edits → ViewBox-limited pipeline preview).
@@ -366,7 +378,8 @@ class SubTabbedTab(QWidget):
         it to front. Used when batch-adding tracks so the result is visible even
         when no profile is active. Does NOT change the active profile or section."""
         self.pages[MAP].set_view(self._map)
-        self.subtabs.setCurrentIndex(MAP)
+        self._docks[MAP].show()
+        self._docks[MAP].raise_()
 
     # ── Map redraw (Task 1) + just-in-time CRS prompt (Task 2) ──────────────
 
@@ -395,8 +408,8 @@ class SubTabbedTab(QWidget):
         if obj is self._active_object():
             self._refresh_map_track()
 
-    def _on_subtab_changed(self, index: int) -> None:
-        if index == MAP:
+    def _on_map_dock_visible(self, visible: bool) -> None:
+        if visible:
             self._prompt_crs_if_needed()
 
     def _prompt_crs_if_needed(self) -> None:
@@ -1024,17 +1037,20 @@ class SubTabbedTab(QWidget):
 
     # ── Construction ────────────────────────────────────────────────────────
 
-    def _build_controls(self) -> QWidget:
-        # Left column = the DSP node pipeline (the new processing source) on top,
-        # and the retained presentation/output controls below (palette, clip,
-        # FIX, scale, export). The static DSP filter sections are hidden — the
-        # pipeline replaces them.
+    _DOCK_FEATURES = (QDockWidget.DockWidgetFeature.DockWidgetFloatable
+                      | QDockWidget.DockWidgetFeature.DockWidgetMovable)
+
+    def _build_controls_dock(self) -> QDockWidget:
+        # Controls dock = the DSP node pipeline (the processing source) + the
+        # retained presentation/output controls (palette, clip, FIX, scale,
+        # export). The static DSP filter sections are hidden — the pipeline
+        # replaces them. (The Link Views toggle used to live here too; it now
+        # lives at the top of the Profile/Seismic dock — see _build_view_docks.)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        # User-resizable: only a MINIMUM width is set (was a hard setFixedWidth that
-        # pinned the column and blocked the splitter handle). The user can now drag
-        # the splitter edge to widen/narrow the filter panel freely; the scroll
-        # bar remains only as a fallback for very short windows.
+        # User-resizable: only a MINIMUM width is set so the dock can still be
+        # narrowed/widened freely by dragging its edge; the scroll bar remains
+        # only as a fallback for very short windows.
         scroll.setMinimumWidth(300)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -1052,41 +1068,89 @@ class SubTabbedTab(QWidget):
         col.addWidget(self.controls)
 
         scroll.setWidget(host)
-        return scroll
 
-    def _build_subtabs(self) -> QWidget:
-        host = QWidget()
-        col = QVBoxLayout(host)
-        col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(2)
+        dock = QDockWidget()
+        dock.setFeatures(self._DOCK_FEATURES)
+        dock.setWidget(scroll)
+        self._install_restore_menu(dock)
+        self._dock_controls = dock
+        return dock
 
-        # Cross-module sync toggle (Link Views). Governs ONLY the new live
-        # navigation cursor + double-click POI features below — the existing
-        # always-on visible-segment/click-to-jump sync is unrelated and stays
-        # unconditional. Crucial: unchecked by default (see _on_link_views_toggled).
-        row = QHBoxLayout()
-        row.setContentsMargins(4, 2, 4, 2)
-        self.chk_link_views = QCheckBox()
-        self.chk_link_views.setChecked(False)
-        self.chk_link_views.toggled.connect(self._on_link_views_toggled)
-        row.addWidget(self.chk_link_views)
-        row.addStretch(1)
-        col.addLayout(row)
-
-        self.subtabs = QTabWidget()
+    def _build_view_docks(self) -> None:
+        """Profile (Seismic) / Map / Spectrum / Headers, each wrapped in its
+        own QDockWidget — multi-monitor support: DockWidgetFloatable +
+        DockWidgetMovable let the user drag any one of them out into a
+        floating window on a second screen while the rest of the app stays
+        put. ``tabifyDockWidget`` then groups all four into the SAME tab
+        strip Qt renders for tabified docks, so by default the workspace
+        looks and behaves exactly like the old QTabWidget sub-notebook —
+        the difference is purely that each "tab" can now be torn off."""
         self.pages: list[_Page] = []
-        for _ in range(4):
+        self._docks: list[QDockWidget] = []
+        for i in range(4):
             page = _Page()
             self.pages.append(page)
-            self.subtabs.addTab(page, "")
-        col.addWidget(self.subtabs)
-        # Just-in-time CRS prompting (Task 2): only check/ask when the user
-        # actually lands on the Map sub-tab, not at file-load time — loading
-        # a file for pure signal-processing work never interrupts with a
-        # dialog. Checked fresh on EVERY switch into Map, so a previously
-        # cancelled prompt is offered again rather than silently dropped.
-        self.subtabs.currentChanged.connect(self._on_subtab_changed)
-        return host
+            dock = QDockWidget()
+            dock.setFeatures(self._DOCK_FEATURES)
+            if i == PROFILE:
+                # Cross-module sync toggle (Link Views) lives at the top of
+                # the Profile/Seismic dock — its old home, a row above the
+                # tab strip, no longer exists now that the views are docks
+                # rather than tab pages. Governs ONLY the live navigation
+                # cursor + double-click POI features — the existing
+                # always-on visible-segment/click-to-jump sync is unrelated
+                # and stays unconditional. Unchecked by default (see
+                # _on_link_views_toggled).
+                profile_host = QWidget()
+                profile_col = QVBoxLayout(profile_host)
+                profile_col.setContentsMargins(0, 0, 0, 0)
+                profile_col.setSpacing(0)
+                row = QHBoxLayout()
+                row.setContentsMargins(4, 2, 4, 2)
+                self.chk_link_views = QCheckBox()
+                self.chk_link_views.setChecked(False)
+                self.chk_link_views.toggled.connect(self._on_link_views_toggled)
+                row.addWidget(self.chk_link_views)
+                row.addStretch(1)
+                profile_col.addLayout(row)
+                profile_col.addWidget(page, 1)
+                dock.setWidget(profile_host)
+            else:
+                dock.setWidget(page)
+            self._install_restore_menu(dock)
+            self._docks.append(dock)
+
+        self._dock_host.addDockWidget(
+            Qt.DockWidgetArea.RightDockWidgetArea, self._docks[PROFILE])
+        for dock in self._docks[1:]:
+            self._dock_host.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+            self._dock_host.tabifyDockWidget(self._docks[PROFILE], dock)
+        self._docks[PROFILE].raise_()           # Profile active by default
+        # Just-in-time CRS prompting (Task 2): the old subtabs.currentChanged
+        # equivalent. A tabified QDockWidget has no currentChanged(index)
+        # signal, but visibilityChanged(bool) fires exactly when it becomes
+        # the raised/visible tab (or is hidden) — the correct substitute.
+        self._docks[MAP].visibilityChanged.connect(self._on_map_dock_visible)
+
+    def _install_restore_menu(self, dock: QDockWidget) -> None:
+        """Right-click a FLOATING panel → 'Restaurar a la ventana principal'
+        re-docks it; Qt's own layout engine snaps it back to wherever it was
+        pulled from. The menu only appears while the dock is actually
+        floating — right-clicking a docked panel does nothing here."""
+        dock.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        dock.customContextMenuRequested.connect(
+            lambda pos, d=dock: self._show_dock_restore_menu(d, pos))
+
+    def _show_dock_restore_menu(self, dock: QDockWidget, pos) -> None:
+        if not dock.isFloating():
+            return
+        menu = QMenu(dock)
+        # Exact literal label requested by spec — intentionally NOT routed
+        # through self.tr()/translate() like every other string in this
+        # file, which all use an English source + a Spanish .ts entry.
+        act = menu.addAction("Restaurar a la ventana principal")
+        act.triggered.connect(lambda: dock.setFloating(False))
+        menu.exec(dock.mapToGlobal(pos))
 
     # ── i18n ────────────────────────────────────────────────────────────────
 
@@ -1101,7 +1165,9 @@ class SubTabbedTab(QWidget):
             QCoreApplication.translate("SubTabbedTab", "Headers"),
         )
         for i, title in enumerate(titles):
-            self.subtabs.setTabText(i, title)
+            self._docks[i].setWindowTitle(title)
+        self._dock_controls.setWindowTitle(
+            QCoreApplication.translate("SubTabbedTab", "Controls"))
         self.chk_link_views.setText(QCoreApplication.translate(
             "SubTabbedTab", "Link Views"))
         self.chk_link_views.setToolTip(QCoreApplication.translate(
