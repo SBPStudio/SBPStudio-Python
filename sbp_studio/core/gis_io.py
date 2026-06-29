@@ -62,6 +62,23 @@ class VectorLayer:
     # when no CRS/.prj was available, so the GUI falls back to its magnitude
     # heuristic instead of guessing (Bug #10).
     is_geographic: Optional[bool] = None
+    # Attribute table (.dbf for a shapefile) — ONE entry per ORIGINAL
+    # feature/row (NOT per exploded path: a MultiPolygon/MultiLineString
+    # feature still contributes only ONE entry here, even though it
+    # expanded into several entries in ``paths``). ``attribute_fields`` is
+    # the column name list (geometry column excluded); ``attributes[i]``
+    # and ``label_anchors[i]`` are aligned 1:1 with each other and with the
+    # feature order, so the GUI can label feature i with
+    # ``attributes[i][some_field]`` at ``label_anchors[i]`` directly, with
+    # no geometry math of its own.
+    attribute_fields: List[str] = field(default_factory=list)
+    attributes: List[dict] = field(default_factory=list)
+    # Per-feature WGS84 (lon, lat) label anchor — the feature's own
+    # coordinate for a Point, or its shapely ``.centroid`` for everything
+    # else (a MultiPoint's centroid is the mean of its constituent points;
+    # a Line/Polygon's is its true geometric centroid) — one uniform
+    # formula needs no per-geom-type branching here, see read_vector.
+    label_anchors: List[Tuple[float, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -107,7 +124,15 @@ def read_vector(path: str) -> VectorLayer:
     """Read a vector file (e.g. shapefile) and return its geometries as WGS84
     lon/lat paths. The layer's source CRS is read from the file and reprojected
     to WGS84 with the core transform; a CRS-less file is assumed to already be
-    in lon/lat."""
+    in lon/lat.
+
+    Also reads the attribute table (the .dbf columns for a shapefile) so the
+    GUI can label each feature by any field — see VectorLayer.attribute_fields/
+    attributes/label_anchors. A feature's label anchor is its own coordinate
+    for a Point, or shapely's ``.centroid`` for everything else (which also
+    correctly handles MultiPoint as the mean of its constituent points) — one
+    geometry-agnostic formula, no per-type branching needed here or in the GUI.
+    """
     try:
         import geopandas as gpd
     except ImportError as exc:                       # pragma: no cover
@@ -121,21 +146,30 @@ def read_vector(path: str) -> VectorLayer:
         if src_epsg != 4326:
             gdf = gdf.to_crs(epsg=4326)              # CRS transform via geopandas/pyproj
 
+    attr_fields = [c for c in gdf.columns if c != "geometry"]
     paths: List[np.ndarray] = []
+    attributes: List[dict] = []
+    label_anchors: List[Tuple[float, float]] = []
     fam = "line"
-    for geom in gdf.geometry:
+    for _idx, row in gdf.iterrows():
+        geom = row.geometry
         if geom is None or geom.is_empty:
             continue
         if not paths:
             fam = _family(geom.geom_type)
         _explode(geom, paths)
+        attributes.append({col: row[col] for col in attr_fields})
+        centroid = geom.centroid
+        label_anchors.append((float(centroid.x), float(centroid.y)))
 
     src = f"EPSG:{src_epsg}" if src_epsg else None
     # A CRS WAS present (so the paths are now WGS84 lon/lat) ⇒ geographic; no
     # CRS/.prj ⇒ unknown (None) so the GUI uses its heuristic — Bug #10.
     is_geographic = True if gdf.crs is not None else None
     return VectorLayer(name=Path(path).stem, geom_type=fam, paths=paths,
-                       src_crs=src, is_geographic=is_geographic)
+                       src_crs=src, is_geographic=is_geographic,
+                       attribute_fields=attr_fields, attributes=attributes,
+                       label_anchors=label_anchors)
 
 
 def write_vector(path: str, geom_type: str, paths: List[np.ndarray],

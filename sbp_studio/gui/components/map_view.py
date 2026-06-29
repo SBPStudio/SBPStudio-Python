@@ -121,6 +121,27 @@ _ROLE_LEGEND_HIDDEN = int(Qt.ItemDataRole.UserRole) + 17
 # See add_track_layer / layer_source_clicked.
 _ROLE_SOURCE_ID = int(Qt.ItemDataRole.UserRole) + 18
 
+# Dynamic attribute-table labeling ("Label with…" / "Etiquetar con…") — set
+# ONCE at registration time from the loaded VectorLayer (core/gis_io.py),
+# read-only thereafter. None for every layer kind that has no attribute
+# table at all (raster, the track, drawn/POI shapes, the basemap) — that
+# absence is exactly what gates whether the submenu appears (see
+# _on_layer_context_menu).
+_ROLE_ATTR_FIELDS = int(Qt.ItemDataRole.UserRole) + 19   # List[str] column names
+_ROLE_ATTR_VALUES = int(Qt.ItemDataRole.UserRole) + 20   # List[dict], one per feature
+# Per-feature WGS84 label anchor, aligned 1:1 with _ROLE_ATTR_VALUES — the
+# feature's own coordinate for a Point, its shapely centroid otherwise (see
+# VectorLayer.label_anchors's docstring for why one formula covers both).
+_ROLE_ATTR_ANCHORS = int(Qt.ItemDataRole.UserRole) + 21
+_ROLE_ATTR_GEOM_TYPE = int(Qt.ItemDataRole.UserRole) + 22   # 'point'|'line'|'polygon'
+# The attribute field CURRENTLY chosen to label this layer's features by;
+# None = "Ninguno" (no per-feature labels shown) — see _set_attribute_label_field.
+_ROLE_ATTR_LABEL_FIELD = int(Qt.ItemDataRole.UserRole) + 23
+# The live per-feature pg.TextItems for the CURRENT _ROLE_ATTR_LABEL_FIELD —
+# rebuilt wholesale on every field change (see _redraw_attribute_labels),
+# mirroring seismic_view.py's _pick_labels rebuild-on-change convention.
+_ROLE_ATTR_LABEL_ITEMS = int(Qt.ItemDataRole.UserRole) + 24
+
 _LABEL_DEFAULT_SIZE = 9
 
 # Bundled local basemap asset (NO network ever). A high-resolution decimated
@@ -1582,7 +1603,90 @@ class MapView(QWidget):
         if len(polygons) == 1:
             act_props = menu.addAction(self.tr("Show Properties…"))
             act_props.triggered.connect(lambda: self._show_layer_properties(polygons[0]))
+        # Dynamic attribute-table labeling ("Label with…"): only for a
+        # SINGLE selected layer that actually carries an attribute table
+        # (_ROLE_ATTR_FIELDS is only set for a vector layer loaded with a
+        # non-empty column list — see _add_vector) — a multi-selection is
+        # ambiguous (different layers can have entirely different fields).
+        if len(items) == 1 and items[0].data(_ROLE_ATTR_FIELDS):
+            menu.addSeparator()
+            self._add_label_with_submenu(menu, items[0])
         menu.exec(self.layer_list.viewport().mapToGlobal(pos))
+
+    # ── Dynamic attribute-table labeling ("Label with…") ───────────────────────
+
+    def _add_label_with_submenu(self, menu: QMenu, li: QListWidgetItem) -> None:
+        """Populate "Label with…" with one checkable QAction per attribute
+        field, plus "None" at the top to clear the per-feature labels —
+        mirrors the lambda-with-default-argument idiom already used for
+        every other per-item QMenu loop in this file (e.g.
+        _ScaleBarItem._show_context_menu's style/zoom-mode loops) to avoid
+        the classic late-binding closure bug across iterations."""
+        label_menu = menu.addMenu(self.tr("Label with…"))
+        current_field = li.data(_ROLE_ATTR_LABEL_FIELD)
+
+        act_none = label_menu.addAction(self.tr("None"))
+        act_none.setCheckable(True)
+        act_none.setChecked(current_field is None)
+        act_none.triggered.connect(
+            lambda _c=False, row=li: self._set_attribute_label_field(row, None))
+        label_menu.addSeparator()
+
+        for field in li.data(_ROLE_ATTR_FIELDS) or []:
+            act = label_menu.addAction(field)
+            act.setCheckable(True)
+            act.setChecked(field == current_field)
+            act.triggered.connect(
+                lambda _c=False, row=li, f=field: self._set_attribute_label_field(row, f))
+
+    def _set_attribute_label_field(self, li: QListWidgetItem,
+                                   field: Optional[str]) -> None:
+        li.setData(_ROLE_ATTR_LABEL_FIELD, field)
+        self._redraw_attribute_labels(li)
+
+    def _clear_attribute_labels(self, li: QListWidgetItem) -> None:
+        """Remove every per-feature TextItem this row currently owns (does
+        NOT clear _ROLE_ATTR_LABEL_FIELD — used for visibility/removal
+        teardown, where the chosen field should be remembered, vs.
+        _set_attribute_label_field(li, None), the user-facing "None" action)."""
+        for text_item in (li.data(_ROLE_ATTR_LABEL_ITEMS) or []):
+            self.plot.getViewBox().removeItem(text_item)
+        li.setData(_ROLE_ATTR_LABEL_ITEMS, [])
+
+    def _redraw_attribute_labels(self, li: QListWidgetItem) -> None:
+        """Rebuild every per-feature TextItem for ``li``'s CURRENT
+        _ROLE_ATTR_LABEL_FIELD from scratch — same clear-then-rebuild
+        convention as seismic_view.py's _redraw_picks (the list is small —
+        interpretation/labeling data, not a per-sample overlay — so a full
+        rebuild is simpler than incremental diffing).
+
+        Anchoring (per the feature spec): Points/MultiPoints get a small
+        constant ON-SCREEN offset (pg.TextItem's anchor mechanism gives
+        this for free, with no per-zoom pixel math — anchor=(0.5, 1.3)
+        puts the text just above-right of the marker, the SAME idiom
+        seismic_view.py's pick labels already use for "offset so it
+        doesn't overlap the marker"); Lines/Polygons are centered exactly
+        on their geometric centroid (anchor=(0.5, 0.5), matching this
+        file's own "Toggle Label on Map" whole-layer name label)."""
+        self._clear_attribute_labels(li)
+        field = li.data(_ROLE_ATTR_LABEL_FIELD)
+        if field is None:
+            return
+        values = li.data(_ROLE_ATTR_VALUES) or []
+        anchors = li.data(_ROLE_ATTR_ANCHORS) or []
+        is_point = li.data(_ROLE_ATTR_GEOM_TYPE) == "point"
+        text_anchor = (0.5, 1.3) if is_point else (0.5, 0.5)
+        layer_visible = li.checkState() == Qt.CheckState.Checked
+        items = []
+        for value_dict, (x, y) in zip(values, anchors):
+            text_item = pg.TextItem(str(value_dict.get(field, "")),
+                                    anchor=text_anchor, color=theme.color("text"))
+            text_item.setZValue(55)   # above the layer's own geometry
+            self.plot.getViewBox().addItem(text_item, ignoreBounds=True)
+            text_item.setPos(float(x), float(y))
+            text_item.setVisible(layer_visible)
+            items.append(text_item)
+        li.setData(_ROLE_ATTR_LABEL_ITEMS, items)
 
     # ── "Show Properties…" (Part 4: polygon area/perimeter) ────────────────────
 
@@ -2076,7 +2180,18 @@ class MapView(QWidget):
             else:
                 item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
             item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        self._register_layer(layer.name, [item], "vector", anchor=anchor)
+        li = self._register_layer(layer.name, [item], "vector", anchor=anchor)
+        # Dynamic attribute-table labeling ("Label with…"): only meaningful
+        # when the source actually carried an attribute table (a non-empty
+        # column list — see core/gis_io.read_vector). Storing the field
+        # list here is what _on_layer_context_menu gates the new submenu
+        # on, so a layer with no attributes (or none at all, e.g. a bare
+        # geometry-only GeoJSON) correctly shows no "Label with…" entry.
+        if layer.attribute_fields:
+            li.setData(_ROLE_ATTR_FIELDS, list(layer.attribute_fields))
+            li.setData(_ROLE_ATTR_VALUES, list(layer.attributes))
+            li.setData(_ROLE_ATTR_ANCHORS, list(layer.label_anchors))
+            li.setData(_ROLE_ATTR_GEOM_TYPE, layer.geom_type)
 
     def add_track_layer(self, name: str, x, y, source_id: Optional[str] = None) -> None:
         """Inject an independent navigation track as a managed GIS layer.
@@ -2263,6 +2378,11 @@ class MapView(QWidget):
             self._show_label(li)
         else:
             self._hide_label(li)
+        # Same rule for per-feature attribute labels ("Label with…") — hide
+        # with the layer, restore on re-show, without losing the chosen
+        # field (toggling visibility ≠ choosing "None").
+        for text_item in (li.data(_ROLE_ATTR_LABEL_ITEMS) or []):
+            text_item.setVisible(visible)
         self._legend_dirty()        # the legend only lists currently-visible layers
         self._invalidate_raster_cache()   # visibility change affects the Z-readout (Bug #12)
 
@@ -2294,6 +2414,7 @@ class MapView(QWidget):
         for gi in (li.data(Qt.ItemDataRole.UserRole) or []):
             self.plot.getViewBox().removeItem(gi)
         self._remove_label(li)      # a removed layer's label must not linger
+        self._clear_attribute_labels(li)   # nor its per-feature attribute labels
         self._reorder_layers()
         self._legend_dirty()
         self._invalidate_raster_cache()   # Bug #12
@@ -2950,6 +3071,8 @@ class MapView(QWidget):
             text_item = self.layer_list.item(row).data(_ROLE_LABEL_ITEM)
             if text_item is not None:
                 self._restyle_label(text_item)
+            for attr_text_item in (self.layer_list.item(row).data(_ROLE_ATTR_LABEL_ITEMS) or []):
+                self._restyle_label(attr_text_item)
         self._restyle_legend()
         if self._scale_bar is not None:
             self._scale_bar.set_color(theme.color("text"))

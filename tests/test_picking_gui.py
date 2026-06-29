@@ -825,6 +825,108 @@ class TestBoundaryLineDrift:
         assert len(sv._boundary_lines) == 1
 
 
+class TestFixMarkDrift:
+    """Regression coverage for the SAME non-linear-vs-linear-stretch bug
+    picks and boundary lines had, applied to FIX marks (navigation
+    timestamp lines) — the final ViewBox overlay still positioned at a
+    raw/absolute km value. FixMark is (num, dist_km, label) — see
+    seismic_view.FixMark's type alias. Mirrors TestBoundaryLineDrift
+    exactly: each FIX's TRUE trace-index position is resolved once (via
+    searchsorted against self._dist_km) when the lines are (re)built, then
+    _reposition_fixes re-derives its window-relative km position via
+    _pick_x_km on every show_preview/_apply_zoom_update/_push_full_image —
+    the same tracking picks and boundaries get."""
+
+    def test_fix_mark_positioned_via_pick_x_km_not_raw_km(self):
+        """A FIX at its TRUE dist_km position must render at the
+        linear-fraction position _pick_x_km computes for that trace — NOT
+        the raw km value passed to set_overlays."""
+        sv = _make_view()   # show_image(dist0=0, dist1=2, ...); dist_km = linspace(0,2,20)
+        fix_km = float(sv._dist_km[8])
+        sv.set_overlays(fixes=[(1, fix_km, "1200Z")])
+        assert len(sv._fix_lines) == 1
+        assert sv._fix_trace_indices == [8]
+        expected = sv._pick_x_km(8, sv._dist_km.size)
+        assert sv._fix_lines[0].value() == pytest.approx(expected)
+
+    def test_fix_trace_index_resolved_via_searchsorted(self):
+        sv = _make_view()
+        fix_km = 0.73   # between dist_km[6]=0.6316 and dist_km[7]=0.7368
+        sv.set_overlays(fixes=[(1, fix_km, "1200Z")])
+        expected_idx = int(np.searchsorted(sv._dist_km, fix_km))
+        assert sv._fix_trace_indices == [expected_idx]
+
+    def test_fix_reposition_tracks_a_show_preview_window_change(self):
+        """The actual fix's intent: a FIX mark's rendered km position must
+        TRACK whichever window is currently shown — mirroring picks' and
+        boundary lines' own window-tracking tests."""
+        sv = _make_view()
+        sv.set_overlays(fixes=[(1, float(sv._dist_km[8]), "1200Z")])
+        x_before = sv._fix_lines[0].value()
+
+        sv.set_colormap("viridis", 1.0)
+        narrower = np.zeros((50, 7), dtype=np.float32)
+        sv.show_preview(narrower, dist0=0.4, dist1=1.0, t0=50.0, t1=450.0,
+                        vmax=1.0, c0=2, c1=9)
+
+        x_after = sv._fix_lines[0].value()
+        assert x_after != x_before
+        assert x_after == pytest.approx(sv._pick_x_km(8, sv._dist_km.size))
+
+    def test_fix_reposition_tracks_apply_zoom_update(self):
+        """The static (non-preview) buffer-slice path must ALSO reposition
+        existing FIX lines — mirroring picks' and boundaries' own
+        _apply_zoom_update handling."""
+        sv = _make_view()
+        sv.set_overlays(fixes=[(1, float(sv._dist_km[8]), "1200Z")])
+
+        sv._rect = (0.0, 2.0, 0.0, 500.0)
+        sv._pending_ranges = [(0.5, 1.0), (0.0, 500.0)]
+        sv._last_zoom_key = None
+        sv._apply_zoom_update()
+
+        assert (sv._img_trace_lo, sv._img_trace_hi) == (5, 10)
+        assert sv._fix_lines[0].value() == \
+            pytest.approx(sv._pick_x_km(8, sv._dist_km.size))
+
+    def test_no_fixes_is_a_safe_no_op_on_reposition(self):
+        sv = _make_view()
+        sv._reposition_fixes()   # must not raise with an empty list
+
+    def test_rebuilding_overlays_clears_stale_fix_indices(self):
+        """A SECOND set_overlays call with a different FIX list must not
+        leave stale entries from the first call in _fix_trace_indices (a
+        parallel-list desync would silently mis-position a later
+        reposition)."""
+        sv = _make_view()
+        sv.set_overlays(fixes=[(1, float(sv._dist_km[3]), "a"),
+                               (2, float(sv._dist_km[8]), "b")])
+        assert sv._fix_trace_indices == [3, 8]
+        sv.set_overlays(fixes=[(1, float(sv._dist_km[15]), "c")])
+        assert sv._fix_trace_indices == [15]
+        assert len(sv._fix_lines) == 1
+
+    def test_boundaries_and_fixes_reposition_independently_in_the_same_call(self):
+        """Both line groups must be tracked and repositioned correctly
+        when BOTH are present together — proving the parallel-list
+        bookkeeping for one group never clobbers the other's."""
+        sv = _make_view()
+        sv.set_overlays(boundaries=[float(sv._dist_km[5])],
+                        fixes=[(1, float(sv._dist_km[12]), "a")])
+        assert sv._boundary_trace_indices == [5]
+        assert sv._fix_trace_indices == [12]
+
+        sv.set_colormap("viridis", 1.0)
+        narrower = np.zeros((50, 7), dtype=np.float32)
+        sv.show_preview(narrower, dist0=0.4, dist1=1.0, t0=50.0, t1=450.0,
+                        vmax=1.0, c0=2, c1=9)
+
+        assert sv._boundary_lines[0].value() == \
+            pytest.approx(sv._pick_x_km(5, sv._dist_km.size))
+        assert sv._fix_lines[0].value() == \
+            pytest.approx(sv._pick_x_km(12, sv._dist_km.size))
+
+
 class TestChainPickTraceIndexIsAlreadyGlobal:
     """The architecture does NOT need (and must NOT apply) a cumulative
     per-file trace offset when burning chain picks into the export raster.

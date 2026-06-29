@@ -167,6 +167,13 @@ class SeismicView(QWidget):
         # true (non-uniform) distance axis — the same bug picks had.
         self._boundary_trace_indices: List[int] = []
         self._boundaries_visible: bool = True
+        # FIX marks (navigation timestamps) suffer the EXACT same bug as
+        # boundary seams — each one is also plotted at a single fixed km
+        # position that decouples from the image's own per-window linear
+        # approximation whenever spacing is non-uniform. Same fix, same
+        # parallel-list pattern (see _draw_overlays/_reposition_fixes).
+        self._fix_lines: List[pg.InfiniteLine] = []
+        self._fix_trace_indices: List[int] = []
 
         # A/B Compare overlay: a vertical divider + "A (raw)" / "B (filtered)"
         # labels drawn over the raw|processed composite raster (the controller
@@ -886,17 +893,25 @@ class SeismicView(QWidget):
             self._pick_labels[p.id] = label
         scatter.setData(spots)
 
-    def _reposition_boundaries(self) -> None:
-        """Keep file-boundary seam lines glued to the image's own current
+    def _reposition_line_group(self, lines: List[pg.InfiniteLine],
+                               trace_indices: List[int]) -> None:
+        """Shared by _reposition_boundaries/_reposition_fixes: keep a group
+        of vertical InfiniteLine markers glued to the image's own CURRENT
         per-window linear approximation, exactly like picks (_pick_x_km) —
         called whenever the displayed window changes (show_preview/
-        _apply_zoom_update/_push_full_image), not just when the boundary
-        list itself is rebuilt (_draw_overlays)."""
-        if not self._boundary_lines:
+        _apply_zoom_update/_push_full_image), not just when the line group
+        itself is rebuilt (_draw_overlays)."""
+        if not lines:
             return
         n_traces = self._dist_km.size if self._dist_km is not None else None
-        for ln, trace_idx in zip(self._boundary_lines, self._boundary_trace_indices):
+        for ln, trace_idx in zip(lines, trace_indices):
             ln.setPos(self._pick_x_km(trace_idx, n_traces))
+
+    def _reposition_boundaries(self) -> None:
+        self._reposition_line_group(self._boundary_lines, self._boundary_trace_indices)
+
+    def _reposition_fixes(self) -> None:
+        self._reposition_line_group(self._fix_lines, self._fix_trace_indices)
 
     def _create_pick_at(self, scene_pos, trace_index: int) -> None:
         """Double-click handler: resolve the grid position, ask for a
@@ -1120,6 +1135,7 @@ class SeismicView(QWidget):
         if self._picks:
             self._redraw_picks()
         self._reposition_boundaries()
+        self._reposition_fixes()
 
     def set_overlays(self, boundaries: Sequence[float] = (),
                      fixes: Sequence[FixMark] = ()) -> None:
@@ -1321,6 +1337,7 @@ class SeismicView(QWidget):
         if self._picks:
             self._redraw_picks()
         self._reposition_boundaries()
+        self._reposition_fixes()
 
     # ── Internals ───────────────────────────────────────────────────────────
 
@@ -1344,6 +1361,7 @@ class SeismicView(QWidget):
         if self._picks:
             self._redraw_picks()
         self._reposition_boundaries()
+        self._reposition_fixes()
 
     def _colormap(self) -> pg.ColorMap:
         try:
@@ -1378,6 +1396,8 @@ class SeismicView(QWidget):
         self._overlay_lines.clear()
         self._boundary_lines.clear()
         self._boundary_trace_indices.clear()
+        self._fix_lines.clear()
+        self._fix_trace_indices.clear()
 
         # boundaries are RAW km values (e.g. ProfileChain.boundaries_km).
         # Resolve each to its TRUE trace-index position once here (via
@@ -1402,15 +1422,27 @@ class SeismicView(QWidget):
             self._boundary_lines.append(ln)
             self._boundary_trace_indices.append(trace_idx)
 
+        # FIX marks (navigation timestamps) suffer the EXACT same bug as
+        # boundary seams — each one is positioned by its own raw km value,
+        # which decouples from the image's per-window linear approximation
+        # whenever real trace spacing is non-uniform. Same fix: resolve to
+        # a trace index once, position via _pick_x_km, and keep tracking it
+        # in _reposition_fixes (called alongside _reposition_boundaries).
         pen_f = pg.mkPen(theme.color("highlight"), width=1, style=Qt.PenStyle.DashLine)
-        for num, dist, label in fixes:
+        for num, fix_km, label in fixes:
+            fix_idx = int(np.searchsorted(dist, float(fix_km))) if dist is not None else 0
+            if n_traces:
+                fix_idx = max(0, min(fix_idx, n_traces - 1))
+            fix_x_km = self._pick_x_km(fix_idx, n_traces)
             ln = pg.InfiniteLine(
-                pos=float(dist), angle=90, pen=pen_f,
+                pos=fix_x_km, angle=90, pen=pen_f,
                 label=f"{num}·{label}",
                 labelOpts={"color": theme.color("highlight"), "position": 0.96,
                            "rotateAxis": (1, 0)})
             self.plot.addItem(ln)
             self._overlay_lines.append(ln)
+            self._fix_lines.append(ln)
+            self._fix_trace_indices.append(fix_idx)
 
     def _restyle(self, *_) -> None:
         self.glw.setBackground(theme.color("panel"))

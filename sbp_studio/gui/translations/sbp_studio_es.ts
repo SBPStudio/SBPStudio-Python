@@ -1435,6 +1435,16 @@ Perímetro: {2}</translation>
         <source>Size (pixels):</source>
         <translation>Tamaño (píxeles):</translation>
     </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1614" />
+        <source>Label with…</source>
+        <translation>Etiquetar con...</translation>
+    </message>
+    <message>
+        <location filename="..\components\map_view.py" line="1617" />
+        <source>None</source>
+        <translation>Ninguno</translation>
+    </message>
 </context><context>
     <name>_ScaleBarItem</name>
     <message>

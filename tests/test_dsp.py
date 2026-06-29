@@ -2408,6 +2408,158 @@ class TestGisReaders:
         with pytest.raises(ValueError):
             read_gis_layer("foo.xyz")
 
+    def test_read_vector_attribute_fields_and_anchors(self, tmp_path):
+        import geopandas as gpd
+        from shapely.geometry import Polygon
+        from sbp_studio.core import read_gis_layer
+        p = str(tmp_path / "poly.shp")
+        gpd.GeoDataFrame(
+            {"name": ["a", "b"], "depth": [1.5, 2.5]},
+            geometry=[Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+                     Polygon([(10, 10), (12, 10), (12, 12), (10, 12)])],
+            crs="EPSG:4326").to_file(p)
+        layer = read_gis_layer(p)
+        assert layer.attribute_fields == ["name", "depth"]
+        assert [a["name"] for a in layer.attributes] == ["a", "b"]
+        assert len(layer.label_anchors) == 2
+        np.testing.assert_allclose(layer.label_anchors[0], (1.0, 1.0))
+        np.testing.assert_allclose(layer.label_anchors[1], (11.0, 11.0))
+
+    def test_read_vector_multipolygon_keeps_one_attribute_per_feature(self, tmp_path):
+        import geopandas as gpd
+        from shapely.geometry import MultiPolygon, Polygon
+        from sbp_studio.core import read_gis_layer
+        p = str(tmp_path / "multi.shp")
+        mp = MultiPolygon([Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
+                           Polygon([(5, 5), (6, 5), (6, 6), (5, 6)])])
+        gpd.GeoDataFrame({"id": [1]}, geometry=[mp], crs="EPSG:4326").to_file(p)
+        layer = read_gis_layer(p)
+        assert len(layer.attributes) == 1 and len(layer.label_anchors) == 1
+        assert len(layer.paths) == 2          # exploded for rendering, NOT for attrs
+
+    def test_read_vector_point_anchor_is_its_own_coordinate(self, tmp_path):
+        import geopandas as gpd
+        from shapely.geometry import Point
+        from sbp_studio.core import read_gis_layer
+        p = str(tmp_path / "pt.shp")
+        gpd.GeoDataFrame({"label": ["station1"]}, geometry=[Point(3.0, 4.0)],
+                         crs="EPSG:4326").to_file(p)
+        layer = read_gis_layer(p)
+        assert layer.geom_type == "point"
+        np.testing.assert_allclose(layer.label_anchors[0], (3.0, 4.0))
+
+
+class TestAttributeLabelingGui:
+    """Dynamic per-feature "Label with…" attribute labeling on the Map View
+    layer list (gis_io.VectorLayer.attribute_fields/attributes/label_anchors
+    consumed by MapView._add_vector / _add_label_with_submenu /
+    _set_attribute_label_field / _redraw_attribute_labels)."""
+
+    def _qt(self):
+        from PyQt6.QtWidgets import QApplication
+        return QApplication.instance() or QApplication([])
+
+    def _layer(self, geom_type="polygon"):
+        from sbp_studio.core.gis_io import VectorLayer
+        if geom_type == "point":
+            paths = [np.array([[1.0, 1.0]]), np.array([[5.0, 5.0]])]
+            anchors = [(1.0, 1.0), (5.0, 5.0)]
+        else:
+            paths = [np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 0.0]])]
+            anchors = [(1.0, 1.0)]
+        attrs = [{"name": "a", "depth": 1.5}] if geom_type != "point" else \
+                [{"name": "a"}, {"name": "b"}]
+        return VectorLayer(name="lyr", geom_type=geom_type, paths=paths,
+                           attribute_fields=list(attrs[0].keys()),
+                           attributes=attrs, label_anchors=anchors)
+
+    def test_add_vector_stores_attribute_roles(self):
+        self._qt()
+        from sbp_studio.gui.components.map_view import (
+            MapView, _ROLE_ATTR_FIELDS, _ROLE_ATTR_VALUES, _ROLE_ATTR_ANCHORS,
+            _ROLE_ATTR_GEOM_TYPE)
+        mv = MapView()
+        mv.add_layer(self._layer())
+        li = mv.layer_list.item(mv.layer_list.count() - 1)
+        assert li.data(_ROLE_ATTR_FIELDS) == ["name", "depth"]
+        assert li.data(_ROLE_ATTR_VALUES) == [{"name": "a", "depth": 1.5}]
+        assert li.data(_ROLE_ATTR_ANCHORS) == [(1.0, 1.0)]
+        assert li.data(_ROLE_ATTR_GEOM_TYPE) == "polygon"
+
+    def test_layer_without_attributes_has_no_role_set(self):
+        self._qt()
+        from sbp_studio.gui.components.map_view import MapView, _ROLE_ATTR_FIELDS
+        from sbp_studio.core.gis_io import VectorLayer
+        mv = MapView()
+        bare = VectorLayer(name="bare", geom_type="line",
+                           paths=[np.array([[0.0, 0.0], [1.0, 1.0]])])
+        mv.add_layer(bare)
+        li = mv.layer_list.item(mv.layer_list.count() - 1)
+        assert li.data(_ROLE_ATTR_FIELDS) is None
+
+    def test_set_attribute_label_field_creates_text_items(self):
+        self._qt()
+        from sbp_studio.gui.components.map_view import MapView
+        mv = MapView()
+        mv.add_layer(self._layer())
+        li = mv.layer_list.item(mv.layer_list.count() - 1)
+        mv._set_attribute_label_field(li, "name")
+        from sbp_studio.gui.components.map_view import _ROLE_ATTR_LABEL_ITEMS
+        items = li.data(_ROLE_ATTR_LABEL_ITEMS)
+        assert len(items) == 1
+        assert items[0].toPlainText() == "a"
+        assert tuple(items[0].pos()) == (1.0, 1.0)
+
+    def test_set_attribute_label_field_none_clears_items(self):
+        self._qt()
+        from sbp_studio.gui.components.map_view import MapView, _ROLE_ATTR_LABEL_ITEMS
+        mv = MapView()
+        mv.add_layer(self._layer())
+        li = mv.layer_list.item(mv.layer_list.count() - 1)
+        mv._set_attribute_label_field(li, "name")
+        assert len(li.data(_ROLE_ATTR_LABEL_ITEMS)) == 1
+        mv._set_attribute_label_field(li, None)
+        assert li.data(_ROLE_ATTR_LABEL_ITEMS) == []
+
+    def test_point_labels_use_offset_anchor_lines_use_centered_anchor(self):
+        self._qt()
+        from sbp_studio.gui.components.map_view import MapView, _ROLE_ATTR_LABEL_ITEMS
+        mv = MapView()
+        mv.add_layer(self._layer("point"))
+        li = mv.layer_list.item(mv.layer_list.count() - 1)
+        mv._set_attribute_label_field(li, "name")
+        pt_items = li.data(_ROLE_ATTR_LABEL_ITEMS)
+        assert pt_items[0].anchor == (0.5, 1.3)
+
+        mv2 = MapView()
+        mv2.add_layer(self._layer("polygon"))
+        li2 = mv2.layer_list.item(mv2.layer_list.count() - 1)
+        mv2._set_attribute_label_field(li2, "name")
+        poly_items = li2.data(_ROLE_ATTR_LABEL_ITEMS)
+        assert poly_items[0].anchor == (0.5, 0.5)
+
+    def test_redraw_replaces_rather_than_accumulates(self):
+        self._qt()
+        from sbp_studio.gui.components.map_view import MapView, _ROLE_ATTR_LABEL_ITEMS
+        mv = MapView()
+        mv.add_layer(self._layer())
+        li = mv.layer_list.item(mv.layer_list.count() - 1)
+        mv._set_attribute_label_field(li, "name")
+        mv._set_attribute_label_field(li, "depth")
+        items = li.data(_ROLE_ATTR_LABEL_ITEMS)
+        assert len(items) == 1 and items[0].toPlainText() == "1.5"
+
+    def test_remove_selected_layer_clears_attribute_labels(self):
+        self._qt()
+        from sbp_studio.gui.components.map_view import MapView, _ROLE_ATTR_LABEL_ITEMS
+        mv = MapView()
+        mv.add_layer(self._layer())
+        li = mv.layer_list.item(mv.layer_list.count() - 1)
+        mv._set_attribute_label_field(li, "name")
+        mv.layer_list.setCurrentItem(li)
+        mv._remove_selected_layer()
+        assert mv.layer_list.count() == 0   # row removed; no crash on cleanup
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
