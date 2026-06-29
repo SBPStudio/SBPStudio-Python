@@ -38,10 +38,16 @@ _FMTS = ("shp", "geojson", "csv")
 class ReprojectorTab(QWidget):
     """Tab B — CRS reprojection of profiles/chains + navline export."""
 
-    def __init__(self, state: AppState, tasks, parent: QWidget | None = None) -> None:
+    def __init__(self, state: AppState, tasks, parent: QWidget | None = None,
+                *, pipeline_panel=None) -> None:
         super().__init__(parent)
         self.state = state
         self.tasks = tasks                    # MainWindow task service (run_task/notify/show_error)
+        # The Visualizer tab's PipelinePanel (DSP filter chain), shared so
+        # "Aplicar filtros" can run the SAME active node chain the user is
+        # editing there — see _active_node_cfg. None (e.g. in a standalone
+        # test) just makes the checkbox a no-op (empty chain → byte copy).
+        self._pipeline_panel = pipeline_panel
 
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -206,6 +212,16 @@ class ReprojectorTab(QWidget):
         self.unit_cb.addItems(["1", "2", "3"])     # filled in retranslate
         self.unit_cb.setCurrentIndex(1)
         row.addWidget(self.unit_cb)
+        row.addSpacing(12)
+        # "Aplicar filtros": when checked, the SAME active DSP node chain
+        # the user is editing on the Visualizer tab's pipeline panel is run
+        # over the trace amplitudes before they're written to the
+        # reprojected file (see _active_node_cfg / _run_reprojection).
+        # Headers (text/binary/per-trace, coordinates included) are always
+        # cloned exactly regardless of this checkbox — only the amplitude
+        # payload is ever touched.
+        self.chk_filters = QCheckBox()
+        row.addWidget(self.chk_filters)
         row.addStretch(1)
         self.btn_reproject = QPushButton()
         self.btn_reproject.clicked.connect(self._run_reprojection)
@@ -328,6 +344,10 @@ class ReprojectorTab(QWidget):
 
         self.progress.setRange(0, 0)          # busy/indeterminate
         pairs = list(zip(targets, out_paths))
+        # Snapshot the active node chain on the GUI thread NOW (a plain,
+        # thread-safe [(KEY, params), …] list) — the worker thread below
+        # must never touch live Qt widgets (PipelinePanel) itself.
+        node_cfg = self._active_node_cfg() if self.chk_filters.isChecked() else []
 
         def job(progress, cancel):
             from sbp_studio.core import reproject_one, reproject_chain
@@ -335,16 +355,35 @@ class ReprojectorTab(QWidget):
             for i, (item, op) in enumerate(pairs, 1):
                 cancel.check()
                 progress(i / n, "")
+                transform = None
+                if node_cfg:
+                    from sbp_studio.gui.dsp import apply_pipeline_to_matrix
+                    dt_us = int(item.dt_us)
+                    transform = (lambda data, _dt=dt_us:
+                                apply_pipeline_to_matrix(data, node_cfg, _dt,
+                                                         cancel=cancel))
                 if is_chain:
                     outs.append(reproject_chain(item, src, dst, unit_hint,
-                                                cancel=cancel, out_path=op))
+                                                cancel=cancel, out_path=op,
+                                                amplitude_transform=transform))
                 else:
                     outs.append(reproject_one(item, src, dst, unit_hint,
-                                              cancel=cancel, out_path=op))
+                                              cancel=cancel, out_path=op,
+                                              amplitude_transform=transform))
             return outs
 
         self.tasks.run_task(job, self._on_reprojected,
                             self.tr("Reprojecting {0} item(s)…").format(len(targets)))
+
+    def _active_node_cfg(self) -> list:
+        """Thread-safe snapshot of the Visualizer tab's active DSP node
+        chain — ``[(KEY, params_dict), …]`` — see PipelinePanel.active_nodes()
+        (already excludes muted nodes). Empty when no pipeline panel was
+        wired in (e.g. a standalone/test ReprojectorTab) or nothing is
+        active; both degrade to a plain byte-faithful export."""
+        if self._pipeline_panel is None:
+            return []
+        return [(n.KEY, dict(n.params)) for n in self._pipeline_panel.active_nodes()]
 
     def _target_stem(self, item, is_chain: bool) -> str:
         """Output filename stem for a reprojection target (used in batch/folder
@@ -481,6 +520,12 @@ class ReprojectorTab(QWidget):
                  self.tr("3 – Decimal degrees"))
         for i, u in enumerate(units):
             self.unit_cb.setItemText(i, u)
+        self.chk_filters.setText(self.tr("Apply filters"))
+        self.chk_filters.setToolTip(self.tr(
+            "Run the active DSP filter chain (from the Visualizer tab's "
+            "pipeline panel) over the trace amplitudes before writing the "
+            "reprojected file. Headers and coordinates are always cloned "
+            "exactly — only the amplitude payload is affected."))
         self.btn_reproject.setText(self.tr("Reproject"))
         self.lbl_note.setText(self.tr("Reprojected files are written beside the "
                                       "source with a _REPROY suffix."))

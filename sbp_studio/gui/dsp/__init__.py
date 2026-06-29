@@ -13,6 +13,7 @@ from .nodes import (
     SVDFilterNode, SwellFilterNode, TraceEqualizationNode, TraceMixingNode, TVGNode,
     WaterMuteNode, make_node,
 )
+from .export_filter import apply_pipeline_to_matrix, fits_in_memory
 from .node_i18n import tr_node, tr_param, tr_preset_category, tr_tooltip
 from .pipeline import Pipeline, VisibleWindow, extract_visible_window
 from .preview import PreviewController
@@ -26,5 +27,5 @@ __all__ = [
     "SphericalDivergenceNode", "PRESET_CATEGORIES", "PRESET_HEADER_VALUE",
     "tr_node", "tr_param", "tr_tooltip", "tr_preset_category",
     "Pipeline", "VisibleWindow", "extract_visible_window",
-    "PreviewController",
+    "PreviewController", "apply_pipeline_to_matrix", "fits_in_memory",
 ]

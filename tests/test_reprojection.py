@@ -160,3 +160,87 @@ class TestReprojectChain:
         expected = np.arange(1, chains[0].n_traces + 1)
         np.testing.assert_array_equal(tnums, expected)
         os.remove(out)
+
+
+class TestAmplitudeTransform:
+    """``amplitude_transform`` — the 'Aplicar filtros' filtered-export
+    feature. Headers (text/binary/every trace header field) must stay
+    byte-identical to the un-filtered path; ONLY the trace amplitude
+    payload may differ, by exactly the given transform."""
+
+    def test_default_none_is_byte_identical_to_unfiltered(self, simple_segy, tmp_path):
+        """amplitude_transform=None must reproduce the EXACT pre-existing
+        behaviour — no regression for the common (filters off) case."""
+        import shutil
+        src = str(tmp_path / "src.sgy")
+        shutil.copy(simple_segy, src)
+        sd = load_profile(src)
+        out_a = reproject_one(sd, "EPSG:4326", "EPSG:32630",
+                              out_path=str(tmp_path / "a.sgy"))
+        out_b = reproject_one(sd, "EPSG:4326", "EPSG:32630",
+                              amplitude_transform=None,
+                              out_path=str(tmp_path / "b.sgy"))
+        with segyio.open(out_a, ignore_geometry=True) as fa, \
+             segyio.open(out_b, ignore_geometry=True) as fb:
+            np.testing.assert_array_equal(fa.trace.raw[:], fb.trace.raw[:])
+            for i in range(fa.tracecount):
+                assert dict(fa.header[i]) == dict(fb.header[i])
+
+    def test_only_amplitude_payload_changes_headers_cloned_exactly(
+            self, simple_segy, tmp_path):
+        """The core contract: every header field (coordinates included,
+        since amplitude_transform doesn't touch the coordinate-overwrite
+        logic) is identical to a plain (unfiltered) reprojection; only the
+        trace samples differ, by exactly the transform applied."""
+        import shutil
+        src = str(tmp_path / "src.sgy")
+        shutil.copy(simple_segy, src)
+        sd = load_profile(src)
+
+        plain = reproject_one(sd, "EPSG:4326", "EPSG:32630",
+                              out_path=str(tmp_path / "plain.sgy"))
+        filtered = reproject_one(
+            sd, "EPSG:4326", "EPSG:32630",
+            amplitude_transform=lambda d: d * 2.0,
+            out_path=str(tmp_path / "filtered.sgy"))
+
+        with segyio.open(plain, ignore_geometry=True) as fp, \
+             segyio.open(filtered, ignore_geometry=True) as ff:
+            assert fp.bin == ff.bin
+            assert fp.text[0] == ff.text[0]
+            for i in range(fp.tracecount):
+                assert dict(fp.header[i]) == dict(ff.header[i])   # EVERY field
+            np.testing.assert_allclose(
+                ff.trace.raw[:], fp.trace.raw[:] * 2.0, rtol=1e-3, atol=1e-3)
+
+    def test_shape_mismatch_raises_reprojection_error(self, simple_segy, tmp_path):
+        import shutil
+        src = str(tmp_path / "src.sgy")
+        shutil.copy(simple_segy, src)
+        sd = load_profile(src)
+        with pytest.raises(ReprojectionError):
+            reproject_one(sd, "EPSG:4326", "EPSG:32630",
+                          amplitude_transform=lambda d: d[:-1, :],
+                          out_path=str(tmp_path / "bad.sgy"))
+
+    def test_chain_applies_transform_per_constituent_file(self, chain_pair, tmp_path):
+        import shutil
+        path1, path2 = chain_pair
+        src1, src2 = str(tmp_path / "c1.sgy"), str(tmp_path / "c2.sgy")
+        shutil.copy(path1, src1); shutil.copy(path2, src2)
+        profiles = [load_profile(src1), load_profile(src2)]
+        chains = detect_chains(profiles, gap_km=1.0)
+
+        plain = reproject_chain(chains[0], "EPSG:4326", "EPSG:32630",
+                                out_path=str(tmp_path / "plain_chain.sgy"))
+        filtered = reproject_chain(
+            chains[0], "EPSG:4326", "EPSG:32630",
+            amplitude_transform=lambda d: d * 3.0,
+            out_path=str(tmp_path / "filtered_chain.sgy"))
+
+        with segyio.open(plain, ignore_geometry=True) as fp, \
+             segyio.open(filtered, ignore_geometry=True) as ff:
+            for i in range(fp.tracecount):
+                assert dict(fp.header[i]) == dict(ff.header[i])
+            np.testing.assert_allclose(
+                ff.trace.raw[:], fp.trace.raw[:] * 3.0, rtol=1e-3, atol=1e-3)

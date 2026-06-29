@@ -2209,6 +2209,16 @@ Perímetro: {2}</translation>
         <translation>3 – Grados decimales</translation>
     </message>
     <message>
+        <location filename="..\tabs\reprojector_tab.py" line="523" />
+        <source>Apply filters</source>
+        <translation>Aplicar filtros</translation>
+    </message>
+    <message>
+        <location filename="..\tabs\reprojector_tab.py" line="524" />
+        <source>Run the active DSP filter chain (from the Visualizer tab's pipeline panel) over the trace amplitudes before writing the reprojected file. Headers and coordinates are always cloned exactly — only the amplitude payload is affected.</source>
+        <translation>Ejecuta la cadena de filtros DSP activa (del panel de procesamiento de la pestaña Visualizador) sobre las amplitudes de las trazas antes de guardar el archivo reproyectado. Las cabeceras y coordenadas siempre se clonan exactamente — solo se modifica la amplitud.</translation>
+    </message>
+    <message>
         <location filename="..\tabs\reprojector_tab.py" line="471" />
         <source>Reproject</source>
         <translation>Reproyectar</translation>

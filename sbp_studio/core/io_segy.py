@@ -970,6 +970,7 @@ def reproject_one(
     progress: ProgressCallback = _noop_progress,
     cancel: Optional[CancelToken] = None,
     out_path: Optional[str] = None,
+    amplitude_transform: Optional[Callable[[np.ndarray], np.ndarray]] = None,
 ) -> str:
     """
     Reproject a single SEG-Y profile to a new CRS.
@@ -986,6 +987,16 @@ def reproject_one(
     - new_uc = 3 (geographic) or 1 (projected).
     - Coordinates clipped to ±INT32_MAX.
     - bin and text[0] copied from source.
+
+    ``amplitude_transform`` — optional ``(ns, n_traces) float32 -> (ns,
+    n_traces) float32`` callable (e.g. the active DSP filter chain, see
+    ``gui.dsp.export_filter.apply_pipeline_to_matrix``) applied to the FULL
+    trace matrix BEFORE writing. Every trace header is still cloned exactly
+    as above — ONLY the trace amplitude payload is replaced by this
+    function's output; everything else (EBCDIC text, binary header, every
+    header field, coordinates) is byte-identical to the source. ``None``
+    (the default) preserves the exact pre-existing byte-faithful behaviour
+    (``dst.trace[i] = src.trace[i]``, no full-matrix read at all).
     """
     if cancel is None:
         cancel = CancelToken.never()
@@ -1016,6 +1027,22 @@ def reproject_one(
             # count after duplicate-timestamp purging). The dedup is a display/
             # analysis feature; the reprojected file mirrors the original 1:1.
             n_src = int(src.tracecount)
+
+            # Filtered amplitudes (optional): read the FULL matrix ONCE here
+            # (NOT per-trace) so a 2-D/cross-trace filter sees every trace
+            # together, exactly as the live preview's full_depth windowing
+            # does. None ⇒ zero extra RAM, zero behaviour change (the
+            # original byte-for-byte src.trace[i] copy below).
+            processed = None
+            if amplitude_transform is not None:
+                progress(0.05, "applying filters…")
+                full = src.trace.raw[:].T.astype(np.float32)   # (ns, n_traces)
+                processed = amplitude_transform(full)
+                if processed.shape != full.shape:
+                    raise ReprojectionError(
+                        "amplitude_transform changed the array shape: "
+                        f"{full.shape} -> {processed.shape}")
+
             with segyio.create(outpath, spec) as dst:
                 dst.bin    = src.bin
                 dst.text[0] = src.text[0]
@@ -1025,6 +1052,10 @@ def reproject_one(
                         log(f"  traza {i+1}/{n_src}…")
                         progress(0.1 + 0.9 * i / n_src,
                                  f"traza {i+1}/{n_src}")
+                    # Full trace header CLONED first (preserves
+                    # DelayRecordingTime, shotpoints, every other field) —
+                    # only the 6 coordinate fields below are ever
+                    # overwritten, regardless of amplitude_transform.
                     h = dict(src.header[i])
                     h.update({
                         segyio.TraceField.SourceX:           _safe_coord(nxs[i], div),
@@ -1035,7 +1066,11 @@ def reproject_one(
                         segyio.TraceField.CoordinateUnits:   new_uc,
                     })
                     dst.header[i] = h
-                    dst.trace[i] = src.trace[i]
+                    if processed is None:
+                        dst.trace[i] = src.trace[i]
+                    else:
+                        dst.trace[i] = np.ascontiguousarray(
+                            processed[:, i], dtype=np.float32)
 
         progress(1.0, "done")
         log(f"✔ Guardado: {Path(outpath).name}")
@@ -1060,6 +1095,7 @@ def reproject_chain(
     progress: ProgressCallback = _noop_progress,
     cancel: Optional[CancelToken] = None,
     out_path: Optional[str] = None,
+    amplitude_transform: Optional[Callable[[np.ndarray], np.ndarray]] = None,
 ) -> str:
     """
     Reproject and JOIN a ProfileChain into a single SEG-Y file.
@@ -1068,6 +1104,13 @@ def reproject_chain(
     transform, then per-trace header write.
 
     Header contract: same as reproject_one, plus TraceNumber = global index.
+
+    ``amplitude_transform`` — see ``reproject_one``'s docstring. Applied
+    PER CONSTITUENT FILE (its own full (ns, n_traces) matrix), since each
+    file in the chain is a physically separate source — a 2-D filter sees
+    full cross-trace continuity WITHIN one file, but not across the join
+    seam between two chained files (no different from how the live preview
+    only ever sees one profile's own matrix at a time).
     """
     if cancel is None:
         cancel = CancelToken.never()
@@ -1107,6 +1150,19 @@ def reproject_chain(
                     # Bulk transform for this profile
                     nxs, nys = _opt_reproject_coords_bulk(src, tf, unit_hint)
 
+                    # This constituent file's own full matrix (see
+                    # reproject_one's docstring for why full-matrix-at-once,
+                    # not per trace) — None ⇒ zero extra RAM, unchanged
+                    # byte-for-byte behaviour.
+                    processed = None
+                    if amplitude_transform is not None:
+                        full = src.trace.raw[:].T.astype(np.float32)
+                        processed = amplitude_transform(full)
+                        if processed.shape != full.shape:
+                            raise ReprojectionError(
+                                "amplitude_transform changed the array shape: "
+                                f"{full.shape} -> {processed.shape}")
+
                     for i in range(int(src.tracecount)):
                         cancel.check()
                         if global_idx % 1000 == 0:
@@ -1123,7 +1179,11 @@ def reproject_chain(
                             segyio.TraceField.CoordinateUnits:   new_uc,
                             segyio.TraceField.TraceNumber:       global_idx + 1,
                         })
-                        dst.trace[global_idx] = src.trace[i]
+                        if processed is None:
+                            dst.trace[global_idx] = src.trace[i]
+                        else:
+                            dst.trace[global_idx] = np.ascontiguousarray(
+                                processed[:, i], dtype=np.float32)
                         global_idx += 1
 
         progress(1.0, "done")

@@ -1254,6 +1254,85 @@ class TestRowDecimation:
         assert 0.4 < early / max(late, 1e-9) < 2.5
 
 
+# ── PHASE: filtered SEG-Y export ("Aplicar filtros") memory strategy ───────────
+
+class TestExportFilter:
+    """gui/dsp/export_filter.py — full-matrix vs block-based DSP for the
+    Reprojector tab's filtered export. Both strategies must be numerically
+    equivalent (the whole point of full_depth=True column blocks)."""
+
+    DT_US = 200
+
+    def _matrix(self, ns=300, n_traces=500, seed=0):
+        rng = np.random.default_rng(seed)
+        return rng.standard_normal((ns, n_traces)).astype(np.float32)
+
+    def test_empty_node_cfg_is_a_noop(self):
+        from sbp_studio.gui.dsp.export_filter import apply_pipeline_to_matrix
+        data = self._matrix()
+        out = apply_pipeline_to_matrix(data, [], self.DT_US)
+        assert out is data
+
+    def test_fits_in_memory_respects_explicit_budget(self):
+        from sbp_studio.gui.dsp.export_filter import fits_in_memory
+        # A tiny matrix fits any reasonable budget…
+        assert fits_in_memory(100, 100, mem_budget_gb=1.0) is True
+        # …but a deliberately tiny budget forces the block-based path.
+        assert fits_in_memory(100, 100, mem_budget_gb=1e-9) is False
+
+    def test_full_memory_path_matches_sequential_node_apply(self):
+        """Sanity: the full-matrix branch is just node.apply() in order."""
+        from sbp_studio.gui.dsp.export_filter import apply_pipeline_to_matrix
+        from sbp_studio.gui.dsp.nodes import DSPContext, make_node
+        data = self._matrix()
+        node_cfg = [("agc", {"win_ms": 20.0})]
+        out = apply_pipeline_to_matrix(data, node_cfg, self.DT_US,
+                                       mem_budget_gb=10.0)
+        ctx = DSPContext(dt_us=self.DT_US, ns=data.shape[0], n_traces=data.shape[1])
+        expected = make_node("agc", {"win_ms": 20.0}).apply(data, ctx)
+        np.testing.assert_array_equal(out, expected)
+
+    def test_block_based_path_matches_full_memory_for_halo_free_node(self):
+        """AGC has zero trace_halo (purely per-trace) — block boundaries
+        introduce NO edge effect, so the chunked path must reproduce the
+        full-matrix result EXACTLY, proving full_depth=True keeps every
+        block's time axis intact regardless of which strategy ran."""
+        from sbp_studio.gui.dsp.export_filter import apply_pipeline_to_matrix
+        data = self._matrix(ns=300, n_traces=4500)   # > 2 blocks at width 2000
+        node_cfg = [("agc", {"win_ms": 20.0})]
+        full = apply_pipeline_to_matrix(data, node_cfg, self.DT_US,
+                                        mem_budget_gb=10.0)
+        blocked = apply_pipeline_to_matrix(data, node_cfg, self.DT_US,
+                                           mem_budget_gb=1e-9)
+        np.testing.assert_allclose(blocked, full, rtol=1e-5, atol=1e-5)
+
+    def test_block_based_path_preserves_full_row_depth_per_block(self):
+        """Direct proof of the architectural requirement: a probe node
+        records the row count it actually receives — must equal ns even
+        under the block-based (small-budget) strategy."""
+        from sbp_studio.gui.dsp.export_filter import apply_pipeline_to_matrix
+        from sbp_studio.gui.dsp.nodes import DSPNode, NODE_REGISTRY
+
+        calls = []
+
+        class _ProbeNode(DSPNode):
+            KEY = "export_probe"
+
+            def _apply(self, data, ctx):
+                calls.append(data.shape[0])
+                return data
+
+        NODE_REGISTRY.append(_ProbeNode)
+        try:
+            data = self._matrix(ns=128, n_traces=4500)
+            apply_pipeline_to_matrix(data, [("export_probe", {})], self.DT_US,
+                                     mem_budget_gb=1e-9)
+        finally:
+            NODE_REGISTRY.remove(_ProbeNode)
+        assert calls and all(rows == 128 for rows in calls)
+        assert len(calls) > 1   # actually went through multiple blocks
+
+
 # ── 5. PHASE 3: migrated nodes wrap the core math exactly ───────────────────────
 
 class TestNodeMigration:

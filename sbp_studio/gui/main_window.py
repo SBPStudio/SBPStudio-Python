@@ -366,7 +366,11 @@ class MainWindow(QMainWindow):
     def _build_tabs(self) -> QWidget:
         self.tabs = QTabWidget()
         self.tab_visualizer = VisualizerTab(self.state, self)
-        self.tab_reprojector = ReprojectorTab(self.state, self)
+        # Shares the Visualizer's live DSP filter chain so the Reprojector's
+        # "Aplicar filtros" export can run the exact same active node chain
+        # the user is editing there — see ReprojectorTab._active_node_cfg.
+        self.tab_reprojector = ReprojectorTab(
+            self.state, self, pipeline_panel=self.tab_visualizer.pipeline_panel)
         self.tabs.addTab(self.tab_visualizer, "")
         self.tabs.addTab(self.tab_reprojector, "")
         # File Switching (Part 1): clicking an "Add to map" reference track
