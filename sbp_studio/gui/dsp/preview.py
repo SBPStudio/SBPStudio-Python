@@ -23,6 +23,7 @@ from typing import Callable, Optional
 import numpy as np
 from PyQt6.QtCore import QObject
 
+from sbp_studio.core.constants import DEFAULT_CLIP_PCT
 from sbp_studio.core.logger import get_logger
 
 from .nodes import DSPContext
@@ -31,21 +32,43 @@ from .preview_worker import PipelineWorker
 
 _LOG = get_logger("dsp.preview")
 
-# Preview raster caps. Rows AND columns are decimated so the pipeline never
-# processes more than this on screen; row decimation raises the effective dt
-# (passed into the node context) so the DSP maths stay physically correct.
-# Zoomed in deeply, strides fall to 1 → full-resolution, exact processing.
-# Columns capped at 4000: a 4K monitor is only 3840 px wide, so processing
-# more traces than that is pure overdraw the screen can't even show.
+# Preview raster column cap. Rows are NEVER decimated/cropped for the live
+# preview — see _refresh's full_depth note: a time-series filter (AGC,
+# Deconvolution, Envelope) must see every sample of the FULL trace to compute
+# the same result it would at full zoom, so only the COLUMN (trace) extent is
+# capped/decimated here. Zoomed in deeply, the column stride falls to 1 →
+# full-resolution, exact processing. Capped at 4000: a 4K monitor is only
+# 3840 px wide, so processing more traces than that is pure overdraw the
+# screen can't even show.
 MAX_PREVIEW_COLS = 4000
-MAX_PREVIEW_ROWS = 4000
 
-# Higher caps used ONLY while a NEEDS_FULL_RES node (e.g. the F-K dip filter) is
-# active, so the 2-D filter sees the true viewport trace spacing. Bounded so a
-# zoomed-out viewport can't request a multi-thousand² 2-D FFT that would freeze
-# the settle; at ≤ these the window is taken at stride 1 (exact dt + spacing).
+# Global amplitude-level estimation — FULL-RESOLUTION representative blocks,
+# NOT a globally decimated grid. Row/column striding would corrupt the very
+# physics the DSP chain depends on: a temporal filter (AGC, Deconvolution,
+# Envelope) is defined in terms of the TRUE sample interval, so processing a
+# coarsened dt yields a numerically different — "fake" — amplitude that drifts
+# from whatever the user actually sees once they zoom in to full resolution.
+# Instead, GLOBAL_LEVELS_BLOCKS CONTIGUOUS spans of GLOBAL_LEVELS_BLOCK_TRACES
+# traces each, evenly spaced across the profile, are extracted with EVERY time
+# sample kept (no row skipping at all) — each block is processed by the
+# CURRENT per-window filter chain exactly as a real ViewBox window would be,
+# so the result is mathematically identical to full-resolution zoomed-in DSP,
+# just sampled at a few representative locations instead of everywhere. Kept
+# narrow (a few hundred traces total) so the synchronous recompute in
+# _refresh stays fast even with a heavier node in the chain — it only runs
+# when the source, the alignment flag, the pre-crop/window node chain, or the
+# clip percentile actually changes, never on pan/zoom (see _refresh's
+# levels_key check).
+GLOBAL_LEVELS_BLOCKS = 5
+GLOBAL_LEVELS_BLOCK_TRACES = 150
+
+# Higher column cap used ONLY while a NEEDS_FULL_RES node (e.g. the F-K dip
+# filter) is active, so the 2-D filter sees the true viewport trace spacing
+# (rows are already always full-resolution — see MAX_PREVIEW_COLS above).
+# Bounded so a zoomed-out viewport can't request a many-thousand-trace 2-D
+# FFT that would freeze the settle; at or below this the column window is
+# taken at stride 1 (exact trace spacing).
 FK_MAX_COLS = 4096
-FK_MAX_ROWS = 4096
 
 # Live wiggle tuning. Deflection of a full-scale sample ≈ one trace slot × gain.
 # Rows are capped well below the raster's so the single batched curve stays fluid
@@ -112,15 +135,31 @@ class PreviewController(QObject):
         self._disp_cache: Optional[dict] = None
         self._disp_dirty: bool = True
 
-        # Halo cache: max_time_halo + max_trace_halo only change when the source
-        # object or the pipeline node set changes — not on pan/zoom.
-        self._halo_cache: Optional[tuple] = None  # (data_ver, pipeline_ver, th, trh)
+        # Halo cache: max_trace_halo (spatial filters' lateral padding) only
+        # changes when the source object or the pipeline node set changes —
+        # not on pan/zoom. No time halo any more — see _refresh's full_depth
+        # note: every row of every selected trace is always kept, so there
+        # is no Y-edge to protect against pre-DSP.
+        self._halo_cache: Optional[tuple] = None  # (data_ver, pipeline_ver), trh
         self._pipeline_version: int = 0
 
         # Cached wiggle geometry key. When window bounds, vmax, and va_fill are
         # unchanged, _build_wiggle + arrayToQPath are skipped entirely — colormap,
         # FIX-mark, and show_raster changes pay zero geometry cost.
         self._wiggle_state_key = None
+
+        # Locked GLOBAL amplitude levels (fixes "color pumping" on pan/zoom):
+        # computed once from a few FULL-RESOLUTION representative blocks of
+        # the profile (see GLOBAL_LEVELS_BLOCKS/BLOCK_TRACES — never row/col
+        # decimated, so the DSP math matches full-zoom exactly) whenever the
+        # source, alignment, PRE-CROP nodes, per-window filter chain, or clip
+        # percentile actually changes — see the levels_key check in _refresh.
+        # NEVER recomputed from the current ViewBox, so the palette stays
+        # stable across pan/zoom and only moves when the data or DSP
+        # settings actually do.
+        self._global_vmax: float = 1.0
+        self._global_vmax_raw: float = 1.0   # A/B Compare's "raw" half ceiling
+        self._global_levels_key: Optional[tuple] = None
 
         # A/B Compare wiper state. ``_ab_frac`` is the user's chosen split as a
         # fraction of the visible width (persists across pan/zoom — a screen-
@@ -248,6 +287,51 @@ class PreviewController(QObject):
         self._pc_array, self._pc_t0, self._pc_src, self._pc_key = base, t0, obj, key
         return base, t0
 
+    def _compute_global_levels(self, data: np.ndarray, dt_us: int,
+                               clip: float) -> tuple:
+        """Zoom-independent ``(vmax_processed, vmax_raw)`` for the WHOLE
+        profile — the fix for "color pumping": these never depend on the
+        current ViewBox, only on the data itself.
+
+        ``data`` is the prepared base (alignment + pre-crop already applied,
+        see _prepared_base). Sampled as a few FULL-RESOLUTION, CONTIGUOUS
+        blocks (GLOBAL_LEVELS_BLOCKS × GLOBAL_LEVELS_BLOCK_TRACES traces,
+        every time sample kept — see the module-level comment) rather than a
+        globally decimated grid, so each block is run through the CURRENT
+        per-window filter chain at the EXACT same sample interval (``dt_us``,
+        unaltered) the real ViewBox window uses — the ceiling this produces
+        is mathematically identical to what full-resolution zoomed-in DSP
+        would show, not an artifact of a coarsened/distorted dt. ``vmax_raw``
+        (no per-window filters) is kept separately for A/B Compare, which
+        needs a fair ceiling for BOTH its raw and processed halves. Runs
+        synchronously on the GUI thread — acceptable because the sampled
+        trace count stays small AND this only runs when the source/
+        alignment/pipeline/clip actually changes (see _refresh's levels_key
+        check), never on every pan/zoom frame."""
+        ns, n_traces = data.shape
+        block_w = min(GLOBAL_LEVELS_BLOCK_TRACES, n_traces)
+        n_blocks = min(GLOBAL_LEVELS_BLOCKS, max(1, n_traces // block_w))
+        if n_blocks <= 1:
+            starts = [0]
+        else:
+            starts = np.linspace(0, n_traces - block_w, n_blocks).astype(int)
+        raw_blocks = [data[:, s:s + block_w] for s in starts]
+
+        raw_sample = np.concatenate(raw_blocks, axis=1)
+        vmax_raw = self._estimate_vmax(raw_sample, clip)
+        if not self.pipeline.nodes:
+            return vmax_raw, vmax_raw
+
+        ctx = DSPContext(dt_us=int(dt_us), ns=ns, n_traces=block_w)
+        processed_blocks = [
+            self.pipeline.process(
+                np.ascontiguousarray(block, dtype=np.float32), ctx,
+                input_token=("__global_levels__", self._data_version, i))
+            for i, block in enumerate(raw_blocks)]
+        processed_sample = np.concatenate(processed_blocks, axis=1)
+        vmax_proc = self._estimate_vmax(processed_sample, clip)
+        return vmax_proc, vmax_raw
+
     # ── The live loop ───────────────────────────────────────────────────────
 
     def _refresh(self, *, fit: bool, overlays: bool = False) -> None:
@@ -275,16 +359,28 @@ class PreviewController(QObject):
             self._disp_cache = self._get_display()
             self._disp_dirty = False
         disp = self._disp_cache
+        clip = float(disp.get("clip", DEFAULT_CLIP_PCT))
 
-        # Halo sizes only change when the source or pipeline node set changes;
-        # cache them so pan/zoom skips DSPContext construction + node iteration.
+        # Recompute the LOCKED global levels only when something that actually
+        # changes the amplitude distribution has changed — the source/
+        # alignment/pre-crop chain (data_version), the per-window filter
+        # chain (pipeline_version), or the clip percentile itself. A pure
+        # pan/zoom touches none of these, so the key is unchanged and this is
+        # a no-op — the whole point of the fix (see _compute_global_levels).
+        levels_key = (self._data_version, self._pipeline_version, clip)
+        if levels_key != self._global_levels_key:
+            self._global_vmax, self._global_vmax_raw = (
+                self._compute_global_levels(data, dt_us, clip))
+            self._global_levels_key = levels_key
+
+        # Trace halo only changes when the source or pipeline node set
+        # changes; cache it so pan/zoom skips DSPContext construction + node
+        # iteration. (No time halo any more — see the full_depth note below.)
         halo_key = (self._data_version, self._pipeline_version)
         if self._halo_cache is None or self._halo_cache[0] != halo_key:
             ctx = DSPContext.from_source(obj)
-            self._halo_cache = (halo_key,
-                                self.pipeline.max_time_halo(ctx),
-                                self.pipeline.max_trace_halo(ctx))
-        _, time_halo, trace_halo = self._halo_cache
+            self._halo_cache = (halo_key, self.pipeline.max_trace_halo(ctx))
+        _, trace_halo = self._halo_cache
 
         # ── Determine the visible window ────────────────────────────────────
         if fit:
@@ -293,32 +389,40 @@ class PreviewController(QObject):
         else:
             x_range, y_range = self.view.current_view_range()
 
-        # ViewBox-limited extraction with row+column decimation (preview only).
-        # Live horizontal detail: the "Pixels / trace" control raises the column
-        # cap so zooming in stays sharp (default 20 → the historical 4000-col cap;
-        # higher keeps more native traces, lower decimates more aggressively).
+        # ViewBox-limited extraction (preview only). Live horizontal detail:
+        # the "Pixels / trace" control raises the column cap so zooming in
+        # stays sharp (default 20 → the historical 4000-col cap; higher
+        # keeps more native traces, lower decimates more aggressively).
         ppt = float(disp.get("px_per_trace", 20.0)) or 20.0
         eff_max_cols = int(np.clip(ppt / 20.0 * MAX_PREVIEW_COLS, 1000, 16000))
         # A NEEDS_FULL_RES node (e.g. the F-K dip filter) must see the true,
         # un-decimated trace spacing of the viewport — column decimation would
         # corrupt its wavenumber axis. When one is active, extract at full
         # resolution up to a high safety cap (exact at any practical working
-        # zoom; only a viewport wider/deeper than the cap decimates gently, and
-        # there the result is handed unchanged to the decimation/render layer).
+        # zoom; only a viewport wider than the cap decimates gently).
         if any(getattr(n, "NEEDS_FULL_RES", False) for n in self.pipeline.nodes):
-            max_rows_use, max_cols_use = FK_MAX_ROWS, FK_MAX_COLS
+            max_cols_use = FK_MAX_COLS
         else:
-            max_rows_use, max_cols_use = MAX_PREVIEW_ROWS, eff_max_cols
+            max_cols_use = eff_max_cols
+        # full_depth=True: every selected trace is fetched at its FULL
+        # vertical depth (all ns samples, no Y-cropping or row decimation),
+        # NOT just the visible time window — a time-series filter (AGC,
+        # Deconvolution, Envelope) computed on a vertically-truncated trace
+        # produces a numerically different (typically suppressed) amplitude
+        # than the same filter run on the full trace, which is exactly what
+        # the GLOBAL levels were estimated from (_compute_global_levels) —
+        # so without this, zooming in would "wash out" against the locked
+        # palette. The DSP pipeline below runs on the full-depth array; the
+        # Y-range crop happens AFTER, in win.crop_visible (_finish_refresh).
         win = extract_visible_window(
             data, dist_km, t0_ms=t0_full, dt_us=dt_us,
             x_range=x_range, y_range=y_range,
-            time_halo=time_halo, trace_halo=trace_halo,
+            trace_halo=trace_halo,
             data_version=self._data_version,
-            max_rows=max_rows_use, max_cols=max_cols_use)
+            max_cols=max_cols_use, full_depth=True)
 
-        # ── Run the (memoized) pipeline on the small bbox at EFFECTIVE dt ────
-        # Row decimation raised the sample interval; the nodes must see it so
-        # AGC (and future frequency filters) use the correct sampling rate.
+        # ── Run the (memoized) pipeline on the full-depth bbox at the TRUE
+        # dt (full_depth=True ⇒ effective_dt_us == dt_us always) ───────────
         # This is the heavy step (F-K's 2-D FFT, Deconvolution, …) — it runs on
         # a worker thread (see preview_worker.PipelineWorker) so the GUI thread
         # never blocks while it computes; _finish_refresh resumes on the result.
@@ -379,9 +483,8 @@ class PreviewController(QObject):
         if visible.size == 0:
             return
 
-        # ── Presentation: clip percentile (needed below for a fair A/B vmax) ──
-        from sbp_studio.core.constants import CMAPS, DEFAULT_CLIP_PCT
-        clip = float(disp.get("clip", DEFAULT_CLIP_PCT))
+        # ── Presentation ────────────────────────────────────────────────────
+        from sbp_studio.core.constants import CMAPS
 
         # ── A/B Compare: splice RAW (left) | PROCESSED (right) ───────────────
         # The raw window is the SAME prepared base (alignment + pre-crop mute)
@@ -406,17 +509,19 @@ class PreviewController(QObject):
             n_ab = proc_visible.shape[1]
             split = int(round(min(max(self._ab_frac, 0.0), 1.0) * n_ab))
             ab_split_frac = (split / n_ab) if n_ab else 0.5
-            # Estimate vmax from EACH full half independently (not the spliced
-            # composite, whose raw/processed proportion tracks the wiper
-            # position) and take the larger: a fair, split-position-independent
-            # ceiling that never washes out or saturates whichever side ends up
-            # the minority of on-screen pixels. Locked into _ab_cache below so
-            # dragging the wiper never flickers the brightness.
-            ab_vmax = max(self._estimate_vmax(raw_visible, clip),
-                          self._estimate_vmax(proc_visible, clip))
+            # Fair ceiling for BOTH halves, locked to the GLOBAL (whole-
+            # profile) levels rather than whatever happens to be visible —
+            # otherwise A/B Compare would "pump" on pan/zoom exactly like the
+            # main view used to. _global_vmax_raw/_global_vmax are computed
+            # once in _refresh from the full prepared base (see
+            # _compute_global_levels), never from this call's visible crop.
+            ab_vmax = max(self._global_vmax_raw, self._global_vmax)
             visible = self._compose_ab(raw_visible, proc_visible, split)
 
-        vmax = ab_vmax if ab_vmax is not None else self._estimate_vmax(visible, clip)
+        # Locked to the GLOBAL (whole-profile) levels — see _refresh's
+        # levels_key check / _compute_global_levels. This is the core color-
+        # pumping fix: vmax/vmin no longer depend on the current ViewBox.
+        vmax = ab_vmax if ab_vmax is not None else self._global_vmax
         # Amplitude range: diverging maps [−vmax, vmax] (signed, colormap centred
         # on zero); sequential maps [0, vmax] (|amp|, historical default).
         vmin = -vmax if disp.get("amp_range") == "diverging" else 0.0

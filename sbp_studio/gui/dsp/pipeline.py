@@ -135,6 +135,7 @@ def extract_visible_window(
     data_version: int = 0,
     max_rows: Optional[int] = None,
     max_cols: Optional[int] = None,
+    full_depth: bool = False,
 ) -> VisibleWindow:
     """Map a PyQtGraph ViewBox (km × ms) to a (decimated) haloed sub-array.
 
@@ -153,12 +154,25 @@ def extract_visible_window(
     t0_ms       : time of sample row 0 (ms)
     dt_us       : sample interval (µs)
     x_range     : (xmin_km, xmax_km) visible distance range
-    y_range     : (ymin_ms, ymax_ms) visible time range
-    time_halo   : extra FULL-RES samples kept above/below (edge correctness)
+    y_range     : (ymin_ms, ymax_ms) visible time range — IGNORED for the row
+                  extent when ``full_depth`` is True (still used to compute
+                  the visible-row crop-back indices ``r0``/``r1``).
+    time_halo   : extra FULL-RES samples kept above/below (edge correctness).
+                  Ignored when ``full_depth`` is True (the whole trace is
+                  already kept, so no edge margin is needed).
     trace_halo  : extra traces kept left/right (spatial filters)
     data_version: bump when the underlying array changes (cache invalidation)
-    max_rows    : cap on processed samples (rows) — decimate if exceeded
+    max_rows    : cap on processed samples (rows) — decimate if exceeded.
+                  Ignored when ``full_depth`` is True.
     max_cols    : cap on processed traces (cols) — decimate if exceeded
+    full_depth  : keep EVERY sample of every selected trace (rows 0..ns,
+                  stride 1) instead of cropping/decimating to the visible
+                  Y-range — see PreviewController._refresh's docstring for
+                  why: a time-series filter (AGC, Deconvolution, Envelope)
+                  computed on a vertically truncated trace yields a
+                  different result than the same filter run on the full
+                  trace, so the live preview must process full depth and
+                  crop the Y-range only AFTER the DSP pipeline runs.
 
     Returns
     -------
@@ -177,14 +191,19 @@ def extract_visible_window(
     c0 = max(0, c_vis0 - trace_halo)
     c1 = min(n_traces, c_vis1 + trace_halo)
 
-    # ── Time → sample rows (full-res, with halo) ────────────────────────────
+    # ── Time → sample rows ───────────────────────────────────────────────────
     ymin, ymax = sorted(y_range)
     s_vis0 = int(np.floor((ymin - t0_ms) / dt_ms))
     s_vis1 = int(np.ceil((ymax - t0_ms) / dt_ms)) + 1
     s_vis0 = max(0, min(s_vis0, ns - 1))
     s_vis1 = max(s_vis0 + 1, min(s_vis1, ns))
-    sh0 = max(0, s_vis0 - time_halo)
-    sh1 = min(ns, s_vis1 + time_halo)
+    if full_depth:
+        # Every sample of every selected trace, full resolution — no halo
+        # needed (there is no crop edge to protect against pre-DSP).
+        sh0, sh1 = 0, ns
+    else:
+        sh0 = max(0, s_vis0 - time_halo)
+        sh1 = min(ns, s_vis1 + time_halo)
 
     full_sub = data[sh0:sh1, c0:c1]
     full_rows = sh1 - sh0
@@ -192,7 +211,8 @@ def extract_visible_window(
     # ── Decimation (preview only) ───────────────────────────────────────────
     # Ceil-division so the decimated size is GUARANTEED ≤ the cap (floor would
     # let e.g. 50 000 // 8 000 = 6 leave 8 334 > 8 000 columns).
-    row_stride = max(1, -(-full_rows // max_rows)) if max_rows else 1
+    row_stride = 1 if full_depth else (
+        max(1, -(-full_rows // max_rows)) if max_rows else 1)
     col_stride = max(1, -(-(c1 - c0) // max_cols)) if max_cols else 1
     if row_stride > 1 or col_stride > 1:
         sub = full_sub[::row_stride, ::col_stride]

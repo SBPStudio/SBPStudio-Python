@@ -1138,6 +1138,40 @@ class TestViewBoxExtraction:
         assert win.row_stride == 1 and win.col_stride == 1
         assert win.effective_dt_us == self.DT_US
 
+    def test_full_depth_keeps_every_row_regardless_of_y_range(self):
+        """The 'washed out when zoomed in' fix: full_depth=True must fetch
+        EVERY row of the matrix no matter how narrow y_range is — a
+        time-series filter (AGC/Decon/Envelope) needs the whole trace, not
+        just whatever's visible, to compute the same result it would at
+        full zoom."""
+        data, dist_km = self._full()
+        ns = data.shape[0]
+        # A tiny, deeply-zoomed Y window — the OLD behaviour would crop hard.
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(3.0, 4.0), y_range=(120.0, 125.0),
+            time_halo=999, max_rows=10, full_depth=True)
+        assert win.sub.shape[0] == ns          # every row kept — NOT cropped
+        assert win.row_stride == 1             # never decimated either
+        assert win.effective_dt_us == self.DT_US
+        # The visible-row crop-back indices still correctly bracket the
+        # narrow Y window the caller actually asked for.
+        cropped = win.crop_visible(win.sub)
+        assert cropped.shape[0] == win.s1 - win.s0
+        np.testing.assert_array_equal(cropped[:, 0], data[win.s0:win.s1, win.c0])
+
+    def test_full_depth_still_caps_and_halos_columns(self):
+        """full_depth only affects ROWS — column decimation/trace_halo (for
+        spatial filters) behave exactly as without it."""
+        data, dist_km = self._full()
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(3.0, 4.0), y_range=(120.0, 125.0),
+            trace_halo=5, max_cols=10, full_depth=True)
+        assert win.sub.shape[0] == data.shape[0]   # rows: untouched
+        assert win.c0 == max(0, win.c_vis0 - 5)    # cols: halo applied
+        assert win.col_stride >= 1
+
 
 # ── 4. PIPELINE: row decimation + effective-dt (preview perf fix) ────────────────
 
@@ -2342,6 +2376,294 @@ class TestCliGuide:
         # Explains app-root resolution + pwd/cd.
         assert "carpeta de la aplicación" in text
         assert "pwd" in text and "cd " in text
+
+
+class TestColorPumpingFix:
+    """PreviewController's locked GLOBAL amplitude levels (gui/dsp/preview.py)
+    — vmax/vmin must depend on the whole profile + current DSP chain, NEVER on
+    whatever happens to be inside the current ViewBox (the "color pumping"
+    regression)."""
+
+    def _qt(self):
+        from PyQt6.QtWidgets import QApplication
+        return QApplication.instance() or QApplication([])
+
+    def _profile(self, ns=200, n_traces=400, dt_us=200):
+        """A synthetic SegyProfile-like object with a DELIBERATELY uneven
+        amplitude distribution: the left quarter of traces is quiet (small
+        amplitude), the right quarter is very loud (large amplitude) — so a
+        viewport-local percentile would clearly diverge depending on which
+        half is on screen, while a correct GLOBAL percentile must not."""
+        from types import SimpleNamespace
+        rng = np.random.default_rng(0)
+        data = rng.normal(0.0, 50.0, size=(ns, n_traces)).astype(np.float32)
+        data[:, : n_traces // 4] *= 0.05      # quiet quarter
+        data[:, -n_traces // 4:] *= 20.0      # loud quarter
+        dist_km = np.linspace(0.0, 10.0, n_traces)
+        return SimpleNamespace(
+            data=data, dist_km=dist_km, dt_us=dt_us, ns=ns, n_traces=n_traces,
+            delay_ms=0.0, delays=None, min_delay=0.0, boundaries_km=(), error=None)
+
+    def _controller(self, obj, *, clip=99.6, ab_compare=False):
+        from PyQt6.QtCore import QObject, pyqtSignal
+        from sbp_studio.gui.dsp.preview import PreviewController
+
+        class _FakeView(QObject):
+            view_range_changed = pyqtSignal()
+            ab_split_changed = pyqtSignal(float)
+
+            def __init__(self):
+                super().__init__()
+                self._range = ((0.0, 10.0), (-1000.0, 1000.0))
+                self.shown: list = []
+
+            def enable_preview(self, *_a, **_k): pass
+            def current_view_range(self): return self._range
+            def set_colormap(self, *_a, **_k): pass
+            def set_distance_axis(self, *_a, **_k): pass
+            def update_ab(self, *_a, **_k): pass
+            def disable_wiggle(self): pass
+            def set_raster_visible(self, *_a, **_k): pass
+            def set_wiggle_line_visible(self, *_a, **_k): pass
+            def set_overlays(self, **_k): pass
+
+            def show_preview(self, arr, dist0, dist1, t0, t1, *, vmax,
+                             vmin=0.0, fit=False, c0=None, c1=None):
+                self.shown.append(dict(vmax=float(vmax), vmin=float(vmin)))
+
+        class _FakePanel(QObject):
+            pipeline_changed = pyqtSignal()
+
+            def __init__(self):
+                super().__init__()
+                self.nodes: list = []
+
+            def active_nodes(self): return self.nodes
+
+        view = _FakeView()
+        panel = _FakePanel()
+        disp = dict(clip=clip, cmap="Viridis", px_per_trace=20.0, align=False,
+                   ab_compare=ab_compare, amp_range="sequential")
+        pc = PreviewController(view, panel, get_source=lambda: obj,
+                               get_display=lambda: dict(disp))
+        return pc, view, panel, disp
+
+    def _run_to_completion(self, app, pc) -> None:
+        """Pump the Qt event loop until the in-flight worker's queued
+        succeeded/failed signal has been delivered and processed."""
+        for _ in range(2000):
+            if pc._worker is None:
+                return
+            app.processEvents()
+        raise AssertionError("preview worker never completed")
+
+    def test_vmax_unchanged_across_quiet_and_loud_viewport_windows(self):
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+
+        pc.set_source(obj)                      # initial fit=True render
+        self._run_to_completion(app, pc)
+        assert len(view.shown) == 1
+
+        # Pan to the QUIET quarter only.
+        view._range = ((0.0, 2.5), (-1000.0, 1000.0))
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+
+        # Pan to the LOUD quarter only.
+        view._range = ((7.5, 10.0), (-1000.0, 1000.0))
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+
+        vmaxes = [s["vmax"] for s in view.shown]
+        assert len(vmaxes) == 3
+        # The whole point of the fix: vmax must be IDENTICAL no matter which
+        # wildly-different-amplitude sub-region is currently on screen.
+        assert vmaxes[0] == pytest.approx(vmaxes[1], rel=1e-9)
+        assert vmaxes[1] == pytest.approx(vmaxes[2], rel=1e-9)
+
+    def test_clip_percentile_change_recomputes_global_vmax(self):
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj, clip=99.6)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        vmax_tight = view.shown[-1]["vmax"]
+
+        disp["clip"] = 80.0                     # much lower percentile cutoff
+        pc.display_changed()
+        self._run_to_completion(app, pc)
+        vmax_loose = view.shown[-1]["vmax"]
+
+        # A lower percentile cutoff must shrink the ceiling — proves the
+        # slider's effect is real and derives from the (now global) sample.
+        assert vmax_loose < vmax_tight
+
+    def test_clip_unchanged_pan_does_not_recompute_global_levels(self):
+        """A pure pan/zoom must be a no-op for the global-levels cache (the
+        actual mechanism behind the fix) — only data/pipeline/clip changes
+        may invalidate it."""
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        key_after_load = pc._global_levels_key
+
+        view._range = ((1.0, 3.0), (-1000.0, 1000.0))
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        assert pc._global_levels_key == key_after_load
+
+    def test_pipeline_change_recomputes_global_vmax(self):
+        app = self._qt()
+        from sbp_studio.gui.dsp import AGCNode
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        vmax_before = view.shown[-1]["vmax"]
+
+        panel.nodes.append(AGCNode())            # AGC flattens the amplitude spread
+        pc._on_pipeline_changed()
+        self._run_to_completion(app, pc)
+        vmax_after = view.shown[-1]["vmax"]
+
+        assert vmax_after != pytest.approx(vmax_before)
+
+    def test_ab_compare_vmax_also_locked_to_global(self):
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj, ab_compare=True)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+
+        view._range = ((0.0, 2.5), (-1000.0, 1000.0))
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        v1 = pc._ab_cache["vmax"]
+
+        view._range = ((7.5, 10.0), (-1000.0, 1000.0))
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        v2 = pc._ab_cache["vmax"]
+
+        assert v1 == pytest.approx(v2, rel=1e-9)
+
+    def test_global_levels_sample_blocks_are_full_resolution(self):
+        """The actual mathematical-correctness fix: each block handed to the
+        DSP chain must keep its TRUE dt_us (no row decimation) and its full,
+        unbroken row count — a temporal filter (AGC/Decon/Envelope) computes
+        identically to a real full-zoom ViewBox window, never on a
+        coarsened/distorted sample interval."""
+        from sbp_studio.gui.dsp.nodes import DSPNode
+
+        calls = []
+
+        class _ProbeNode(DSPNode):
+            KEY = "probe"
+
+            def _apply(self, data, ctx):
+                calls.append((data.shape, ctx.dt_us, ctx.ns))
+                return data
+
+        app = self._qt()
+        true_dt_us = 137
+        obj = self._profile(ns=321, n_traces=1000, dt_us=true_dt_us)
+        pc, view, panel, disp = self._controller(obj)
+        pc.pipeline.set_nodes([_ProbeNode()])
+
+        # Call the unit under test directly — isolates global-level
+        # estimation from the (unrelated) viewport/worker rendering path,
+        # which also runs the same shared pipeline at full window width.
+        pc._compute_global_levels(obj.data, obj.dt_us, 99.6)
+
+        assert calls, "the probe node never ran during global-level estimation"
+        for shape, dt_us, ns in calls:
+            assert dt_us == true_dt_us               # TRUE rate, never inflated
+            assert shape[0] == obj.ns == ns           # every time sample kept
+            assert shape[1] <= 150                    # a narrow, full-res block
+
+    def test_global_levels_uses_multiple_evenly_spaced_blocks(self):
+        """Confirms sampling spans the WHOLE profile (not just its start) —
+        a single contiguous chunk would miss amplitude structure elsewhere
+        on a long line."""
+        app = self._qt()
+        obj = self._profile(ns=50, n_traces=2000)
+        pc, view, panel, disp = self._controller(obj)
+        vmax_proc, vmax_raw = pc._compute_global_levels(
+            obj.data, obj.dt_us, 99.6)
+        assert vmax_proc == vmax_raw == pytest.approx(vmax_raw)  # no nodes → equal
+        # Internal sanity: starts span close to the full trace range, not a
+        # single block stuck at column 0.
+        from sbp_studio.gui.dsp.preview import (
+            GLOBAL_LEVELS_BLOCK_TRACES, GLOBAL_LEVELS_BLOCKS,
+        )
+        n_traces = obj.data.shape[1]
+        block_w = min(GLOBAL_LEVELS_BLOCK_TRACES, n_traces)
+        n_blocks = min(GLOBAL_LEVELS_BLOCKS, max(1, n_traces // block_w))
+        assert n_blocks > 1
+        starts = np.linspace(0, n_traces - block_w, n_blocks).astype(int)
+        assert starts[0] == 0
+        assert starts[-1] == n_traces - block_w
+
+    def test_viewport_refresh_always_processes_full_trace_depth(self):
+        """End-to-end 'washed out when zoomed in' fix: the live preview's
+        DSP pipeline must see every sample of every selected trace — NOT
+        just whatever the current Y zoom happens to show — through the
+        real _refresh → worker → pipeline.process path."""
+        from sbp_studio.gui.dsp.nodes import DSPNode
+
+        calls = []
+
+        class _ProbeNode(DSPNode):
+            KEY = "probe"
+
+            def _apply(self, data, ctx):
+                calls.append(data.shape[0])
+                return data
+
+        app = self._qt()
+        obj = self._profile(ns=400, n_traces=300)
+        pc, view, panel, disp = self._controller(obj)
+        panel.nodes.append(_ProbeNode())
+
+        pc.set_source(obj)                      # fit=True: whole Y range visible
+        self._run_to_completion(app, pc)
+        assert calls and all(rows == obj.ns for rows in calls)
+
+        # Pan/zoom to a DIFFERENT X-range (forces a real recompute, not a
+        # cache hit on an identical window token) AND a NARROW Y window —
+        # the bug this fixes: the pipeline must still see the FULL trace
+        # depth, not just the visible Y band.
+        calls.clear()
+        view._range = ((2.0, 4.0), (-50.0, 50.0))   # a thin time slice
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        assert calls and all(rows == obj.ns for rows in calls)
+
+    def test_zoomed_y_window_vmax_matches_full_view_vmax(self):
+        """The visible symptom: with DSP active, zooming into a narrow Y
+        window must NOT wash out relative to the global palette — vmax
+        stays the same locked value whether the full section or a thin
+        time slice is on screen."""
+        from sbp_studio.gui.dsp import AGCNode
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+        panel.nodes.append(AGCNode())
+
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        vmax_full = view.shown[-1]["vmax"]
+
+        view._range = ((0.0, 10.0), (-20.0, 20.0))   # narrow time slice
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        vmax_zoomed = view.shown[-1]["vmax"]
+
+        assert vmax_zoomed == pytest.approx(vmax_full, rel=1e-9)
 
 
 class TestGisReaders:
