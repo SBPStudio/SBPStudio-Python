@@ -998,3 +998,46 @@ class TestChainPickTraceIndexIsAlreadyGlobal:
         # index already inside [0, n_traces) being offset AGAIN exceeds the
         # valid range entirely).
         assert x_wrong > x_hi
+
+
+class TestViewportSettleDebounce:
+    """Phase 2 perf fix: panning/zooming with heavy DSP active must stay
+    smooth — the DSP recompute (full_depth=True) only fires once the
+    viewport actually stops moving, never on every drag frame. The
+    mechanism itself (``_settle_timer``) already existed; this locks in
+    its behaviour and tunes its interval into the requested 150-200 ms
+    "smooth settle" window."""
+
+    def test_settle_ms_is_within_the_smooth_interval_window(self):
+        from sbp_studio.gui.components.seismic_view import SeismicView
+        assert 150 <= SeismicView.SETTLE_MS <= 200
+
+    def test_burst_of_range_changes_in_preview_mode_emits_once(self):
+        """Visual continuity + non-blocking drag: a rapid burst of native
+        ViewBox range-change events (simulating a continuous drag) must
+        restart the SAME single-shot timer each time, NEVER emit
+        view_range_changed mid-burst, and fire it EXACTLY once after the
+        burst stops — proof the DSP recompute is debounced, not run per
+        frame."""
+        sv = _make_view()
+        sv.enable_preview(True)
+        received = []
+        sv.view_range_changed.connect(lambda: received.append(True))
+        vb = sv.plot.getViewBox()
+        for _ in range(10):                      # a burst of drag events
+            sv._on_range_changed(vb, [(0.0, 1.0), (0.0, 1.0)])
+        assert received == []                    # nothing fired mid-burst
+        assert sv._settle_timer.isActive()        # still waiting to settle
+        sv._settle_timer.timeout.emit()           # simulate the settle firing
+        assert received == [True]                 # exactly once, not 10x
+
+    def test_non_preview_mode_uses_the_separate_zoom_timer_unaffected(self):
+        """The non-preview (static display-buffer) path has its own,
+        separate, lighter debounce — confirms the preview-mode settle
+        timer change doesn't alter that unrelated path."""
+        sv = _make_view()
+        assert sv._preview_mode is False
+        vb = sv.plot.getViewBox()
+        sv._on_range_changed(vb, [(0.0, 1.0), (0.0, 1.0)])
+        assert sv._zoom_timer.isActive()
+        assert not sv._settle_timer.isActive()

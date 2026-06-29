@@ -114,7 +114,11 @@ class SeismicView(QWidget):
 
     # Viewport-settle debounce: DSP recompute fires this long after the LAST
     # pan/zoom event, so dragging never triggers a pipeline run mid-gesture.
-    SETTLE_MS = 300
+    # 180 ms: long enough that a continuous drag (events firing far faster
+    # than this) never lets the timer reach zero until the user actually
+    # stops, short enough that the full_depth recompute feels instant once
+    # they do (the 150-200 ms "smooth settle" window).
+    SETTLE_MS = 180
 
     # Max visible traces drawn as live wiggle before auto-falling back to the
     # raster base (keeps pan/zoom fluid). Mirrors the export budget

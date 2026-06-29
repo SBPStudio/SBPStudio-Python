@@ -2671,6 +2671,39 @@ class TestColorPumpingFix:
         # No new cache entry was created for the repeat.
         assert len(pc._global_levels_cache) == size_after_a
 
+    def test_rapid_view_changes_while_worker_busy_coalesce_to_latest(self):
+        """Phase 2 thread-safety requirement: if the (debounced) settle
+        timer fires again before the in-flight worker from a PREVIOUS
+        settle resolves, the requests must coalesce — never pile up, and
+        the eventually-applied frame must reflect the LATEST viewport, not
+        a stale intermediate one."""
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        shown_before = len(view.shown)
+
+        view._range = ((1.0, 3.0), (-1000.0, 1000.0))
+        pc._on_view_changed()                       # dispatches a worker — now busy
+        assert pc._worker is not None and pc._worker.isRunning()
+
+        # Two more "settle fires" arrive while that worker is still busy
+        # (simulating the user panning again before the first recompute
+        # even finished) — these must coalesce, not queue.
+        view._range = ((2.0, 4.0), (-1000.0, 1000.0))
+        pc._on_view_changed()
+        view._range = ((5.0, 7.0), (-1000.0, 1000.0))   # the FINAL viewport
+        pc._on_view_changed()
+        assert pc._pending == (False, False)         # one coalesced entry, not a queue
+
+        self._run_to_completion(app, pc)   # first worker resolves → replays _pending
+        self._run_to_completion(app, pc)   # the replayed worker resolves too
+        # Exactly 2 NEW frames for the whole burst (the busy dispatch +
+        # the one coalesced replay) — never 3, proving the two intermediate
+        # requests were absorbed rather than each spawning their own frame.
+        assert len(view.shown) == shown_before + 2
+
     def test_ab_compare_vmax_also_locked_to_global(self):
         app = self._qt()
         obj = self._profile()
