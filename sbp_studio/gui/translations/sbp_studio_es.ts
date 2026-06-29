@@ -1651,6 +1651,16 @@ Perímetro: {2}</translation>
 </context><context>
     <name>ProcessingControls</name>
     <message>
+        <location filename="..\components\processing_controls.py" line="1011" />
+        <source>Controls and Processing</source>
+        <translation>Controles y Procesado</translation>
+    </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="1012" />
+        <source>Marks and Export</source>
+        <translation>Marcas y Exportación</translation>
+    </message>
+    <message>
         <location filename="..\components\processing_controls.py" line="614" />
         <source>PALETTE</source>
         <translation>PALETA</translation>
@@ -1816,8 +1826,12 @@ Perímetro: {2}</translation>
         <translation>Compensar delays (alinear grupos)</translation>
     </message>
     <message>
-        <location filename="..\components\processing_controls.py" line="658" />
-        <location filename="..\components\processing_controls.py" line="657" />
+        <location filename="..\components\processing_controls.py" line="1149" />
+        <source>Show file boundaries</source>
+        <translation>Mostrar límites de archivo</translation>
+    </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="1150" />
         <source>Show file boundaries (red lines)</source>
         <translation>Mostrar límites de archivo (líneas rojas)</translation>
     </message>
@@ -1988,9 +2002,14 @@ Perímetro: {2}</translation>
         <translation type="vanished">Resolución (DPI):</translation>
     </message>
     <message>
-        <location filename="..\components\processing_controls.py" line="963" />
-        <source>📍 Activate Picker</source>
+        <location filename="..\components\processing_controls.py" line="1095" />
+        <source>📍 Activate marker</source>
         <translation>📍 Activar marcador</translation>
+    </message>
+    <message>
+        <location filename="..\components\processing_controls.py" line="1090" />
+        <source>📍 Deactivate marker</source>
+        <translation>📍 Desactivar marcador</translation>
     </message>
     <message>
         <location filename="..\components\processing_controls.py" line="965" />
@@ -2003,9 +2022,9 @@ Perímetro: {2}</translation>
         <translation>Activa el modo de marcado: haz doble clic en la sección para colocar un marcador de interpretación.</translation>
     </message>
     <message>
-        <location filename="..\components\processing_controls.py" line="972" />
-        <source>📤 Export/Import</source>
-        <translation>📤 Exportar/Importar</translation>
+        <location filename="..\components\processing_controls.py" line="1103" />
+        <source>Export/Import marker</source>
+        <translation>Exportar/Importar marcador</translation>
     </message>
     <message>
         <location filename="..\components\processing_controls.py" line="973" />

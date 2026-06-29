@@ -166,7 +166,14 @@ class SeismicView(QWidget):
         # whenever the window's local stretch diverges from the chain's
         # true (non-uniform) distance axis — the same bug picks had.
         self._boundary_trace_indices: List[int] = []
-        self._boundaries_visible: bool = True
+        # False to match ProcessingControls.show_boundaries' unchecked-by-
+        # default state (see _base.py's explicit initial sync call right
+        # after wiring boundaries_toggled) — a checkbox that starts
+        # unchecked never actually FIRES toggled(False) on construction (no
+        # real state transition happens), so this default must independently
+        # agree with the checkbox's, or the lines render visible despite an
+        # unchecked box until the user toggles it at least once.
+        self._boundaries_visible: bool = False
         # FIX marks (navigation timestamps) suffer the EXACT same bug as
         # boundary seams — each one is also plotted at a single fixed km
         # position that decouples from the image's own per-window linear
@@ -353,7 +360,7 @@ class SeismicView(QWidget):
                    boundaries: Sequence[float] = (),
                    fixes: Sequence[FixMark] = (),
                    aspect: Optional[float] = None,
-                   boundaries_visible: bool = True) -> None:
+                   boundaries_visible: bool = False) -> None:
         """Display a float32 amplitude raster with LUT colorisation.
 
         ``arr``   — (rows, cols) float32 display buffer from ``compute_section``.

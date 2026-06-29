@@ -23,9 +23,9 @@ from typing import Optional
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QAbstractSpinBox, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFrame,
-    QHBoxLayout, QLabel, QPushButton, QRadioButton, QSlider, QSpinBox,
-    QVBoxLayout, QWidget,
+    QAbstractSpinBox, QApplication, QButtonGroup, QCheckBox, QComboBox,
+    QDoubleSpinBox, QFrame, QHBoxLayout, QLabel, QPushButton, QRadioButton,
+    QSlider, QSpinBox, QStackedWidget, QTabBar, QVBoxLayout, QWidget,
 )
 
 from ..i18n import language_manager
@@ -102,6 +102,72 @@ class LabeledSlider(QWidget):
         return self._lo + self._slider.value() * self._res
 
 
+class DockDragMixin:
+    """Shared mouse-drag logic so a widget embedded INSIDE a custom
+    QDockWidget title bar can still 'tear off'/move the dock by dragging it.
+
+    Replacing a dock's NATIVE title bar (``setTitleBarWidget``) loses Qt's
+    own built-in drag-to-float handling for free — any custom widget placed
+    there needs to reimplement it. This distinguishes a plain click (e.g.
+    switching tabs) from an actual drag using Qt's own
+    ``QApplication.startDragDistance()`` threshold, then floats + moves the
+    dock directly. ``self._dock`` is ``None`` until a caller assigns the
+    QDockWidget instance (it doesn't exist yet when the embedded widget is
+    first constructed) — every method below is then a safe no-op.
+    """
+    _dock = None
+    _drag_origin = None        # QPoint, global position at mouse-down
+    _dock_press_offset = None  # QPoint, drag_origin − dock.pos() at mouse-down
+
+    def _dock_press(self, event) -> None:
+        if self._dock is not None and event.button() == Qt.MouseButton.LeftButton:
+            self._drag_origin = event.globalPosition().toPoint()
+            self._dock_press_offset = self._drag_origin - self._dock.pos()
+
+    def _dock_move(self, event) -> None:
+        if self._dock is None or self._drag_origin is None:
+            return
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
+        pos = event.globalPosition().toPoint()
+        if (pos - self._drag_origin).manhattanLength() < QApplication.startDragDistance():
+            return
+        if not self._dock.isFloating():
+            # Floating changes dock.pos()'s coordinate origin — recompute
+            # the press offset fresh the instant it happens so the dock
+            # doesn't jump under the cursor.
+            self._dock.setFloating(True)
+            self._dock_press_offset = pos - self._dock.pos()
+        self._dock.move(pos - self._dock_press_offset)
+
+    def _dock_release(self, _event) -> None:
+        self._drag_origin = None
+        self._dock_press_offset = None
+
+
+class _DraggableTabBar(QTabBar, DockDragMixin):
+    """The "Controles y Procesado" / "Marcas y Exportación" tab strip,
+    promoted into the dock's custom title bar (see _base.py's
+    _build_controls_dock) — draggable via DockDragMixin so the user can
+    still tear the panel off by dragging the tabs themselves, exactly as
+    they could with Qt's native title bar."""
+
+    def set_dock(self, dock) -> None:
+        self._dock = dock
+
+    def mousePressEvent(self, event) -> None:
+        self._dock_press(event)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        self._dock_move(event)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._dock_release(event)
+        super().mouseReleaseEvent(event)
+
+
 class ProcessingControls(QWidget):
     """Scrollable DSP controls; emits :pyattr:`render_requested` on Render."""
 
@@ -122,12 +188,54 @@ class ProcessingControls(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        v = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Two tabs so the left dock isn't one long, cluttered column:
+        # "Controles y Procesado" keeps the DSP pipeline / palette / scale /
+        # render controls; "Marcas y Exportación" groups everything about
+        # FIX marks, file-boundary lines, and the export/marker buttons.
+        #
+        # The tab STRIP and the tab CONTENT are deliberately split into two
+        # separate widgets — a QTabBar (``self.tabs_controls``) driving a
+        # plain QStackedWidget — rather than one QTabWidget. A QTabWidget
+        # bundles both into a single widget, which would make it impossible
+        # to promote JUST the strip into the dock's custom title bar (see
+        # _base.py's _build_controls_dock/DockTitleBar) while leaving the
+        # actual page content in the dock's normal scrollable body below.
+        # ``self._v`` is the CURRENT build target — every ``_section()``/
+        # ``_caption()`` call and most inline ``v.addWidget(...)`` calls
+        # below read/write through it, so simply reassigning
+        # ``v = self._v = <tab's layout>`` at a handful of points routes the
+        # REST of this unchanged construction code into whichever tab it
+        # belongs to, with zero risk to any signal/slot connection (those
+        # are independent of widget parentage/layout membership). Every
+        # single control, including the externally-owned PipelinePanel (see
+        # embed_pipeline_panel), ends up inside one of the two stacked
+        # pages — none of them sit "above" or outside the tab strip.
+        self.tabs_controls = _DraggableTabBar()
+        self._stack = QStackedWidget()
+        outer.addWidget(self._stack)
+        self.tabs_controls.currentChanged.connect(self._stack.setCurrentIndex)
+
+        tab1 = QWidget()
+        v = QVBoxLayout(tab1)
         # Compact, fully-adjusted layout from startup: tight outer margins and a
         # small inter-row spacing so every control is visible without scrolling.
         v.setContentsMargins(6, 6, 6, 4)
         v.setSpacing(2)
-        self._v = v
+        self._v = self._v1 = v
+
+        tab2 = QWidget()
+        self._v2 = QVBoxLayout(tab2)
+        self._v2.setContentsMargins(6, 6, 6, 4)
+        self._v2.setSpacing(2)
+
+        self.tabs_controls.addTab("")
+        self._stack.addWidget(tab1)
+        self.tabs_controls.addTab("")
+        self._stack.addWidget(tab2)
 
         # ── Palette ──
         self.sec_palette = self._section()
@@ -232,9 +340,11 @@ class ProcessingControls(QWidget):
         self.lbl_preset_desc.setWordWrap(True)
         v.addWidget(self.lbl_preset_desc)
 
-        # ── FIX marks ──
+        # ── FIX marks (moved to the "Marcas y Exportación" tab) ──
+        v = self._v = self._v2
         self.sec_fix = self._section()
         self.fix = QCheckBox()
+        self.fix.setChecked(False)   # default OFF (CRITICAL per spec)
         v.addWidget(self.fix)
         fix_row = QHBoxLayout()
         self.cap_fix_interval = QLabel()
@@ -246,20 +356,24 @@ class ProcessingControls(QWidget):
         fix_row.addWidget(self.fix_interval)
         fix_row.addStretch(1)
         v.addLayout(fix_row)
+        v = self._v = self._v1   # back to "Controles" for Geometry/Scale/Render
 
         # ── Geometry & Presentation (STATIC controls — NOT pipeline nodes) ──
         # Delay alignment is a static geometry correction (applied to the base
         # array before the dynamic DSP nodes), not a movable filter. File-seam
-        # boundaries are a presentation overlay toggled live in the view.
+        # boundaries are a presentation overlay toggled live in the view —
+        # moved to the "Marcas y Exportación" tab below (added straight to
+        # self._v2 regardless of the current build target, since align_delays/
+        # ab_compare on either side of it stay on this tab).
         self.sec_geometry = self._section()
         self.align_delays = QCheckBox()
         self.align_delays.setChecked(True)
         self.align_delays.toggled.connect(self.align_toggled.emit)
         v.addWidget(self.align_delays)
         self.show_boundaries = QCheckBox()
-        self.show_boundaries.setChecked(True)
+        self.show_boundaries.setChecked(False)   # default OFF (CRITICAL per spec)
         self.show_boundaries.toggled.connect(self.boundaries_toggled.emit)
-        v.addWidget(self.show_boundaries)
+        self._v2.addWidget(self.show_boundaries)   # lives on "Marcas y Exportación"
         # A/B Compare: split the section into RAW (left) vs the live DSP
         # pipeline output (right), with a labeled divider, so a filter's effect
         # is judged side-by-side. A presentation toggle → drives display_changed.
@@ -513,6 +627,13 @@ class ProcessingControls(QWidget):
             rb.toggled.connect(lambda checked: self.interp_changed.emit(self.interp_mode())
                                if checked else None)
 
+        # "Controles" content ends here — anchor it to the top of its tab.
+        v.addStretch(1)
+
+        # ── Marcas y Exportación tab: FIX marks (above) + file boundaries
+        # (above, on self._v2) + the export/marker buttons (below) ──────────
+        v = self._v = self._v2
+
         # ── Export ── (high-quality matplotlib export via a dedicated dialog)
         self.sec_export = self._section()
         self.btn_export_img = QPushButton()
@@ -561,6 +682,25 @@ class ProcessingControls(QWidget):
 
         language_manager.language_changed.connect(self.retranslate_ui)
         self.retranslate_ui()
+
+    # ── External embedding ───────────────────────────────────────────────────
+
+    def embed_pipeline_panel(self, panel: QWidget) -> None:
+        """Insert ``panel`` (the externally-owned PipelinePanel — "Flujo de
+        procesado" / "Parámetros del módulo") at the very TOP of the
+        "Controles y Procesado" tab's page, above Palette. The caller
+        (_base.py's _build_controls_dock) owns the panel's lifetime/
+        instance; this widget only places it — keeping every control inside
+        one of the two stacked tab pages, with nothing left sitting above
+        or outside the tab strip."""
+        self._v1.insertWidget(0, panel)
+
+    def tab_bar(self) -> QTabBar:
+        """The "Controles y Procesado" / "Marcas y Exportación" tab strip —
+        deliberately NOT added to this widget's own layout (see __init__);
+        the caller (_base.py's _build_controls_dock) promotes it into the
+        dock's custom title bar instead."""
+        return self.tabs_controls
 
     # ── Builders ─────────────────────────────────────────────────────────────
 
@@ -939,17 +1079,27 @@ class ProcessingControls(QWidget):
     def _on_picking_toggled(self, checked: bool) -> None:
         """Paint btn_toggle_picking GREEN while active, RED while inactive —
         an explicit colour, not a theme token, since this is meant to stand
-        out from every other (neutral) button in the panel."""
+        out from every other (neutral) button in the panel — AND flip its
+        text to name the action the next click will take ("Deactivate"
+        while active, "Activate" while inactive), so the button's own label
+        never lags behind its colour/checked state."""
         if checked:
             self.btn_toggle_picking.setStyleSheet(
                 "QPushButton { background-color: #2e7d32; color: white; font-weight: bold; }"
                 "QPushButton:hover { background-color: #388e3c; }")
+            self.btn_toggle_picking.setText(self.tr("📍 Deactivate marker"))
         else:
             self.btn_toggle_picking.setStyleSheet(
                 "QPushButton { background-color: #c62828; color: white; font-weight: bold; }"
                 "QPushButton:hover { background-color: #d32f2f; }")
+            self.btn_toggle_picking.setText(self.tr("📍 Activate marker"))
 
     def retranslate_ui(self) -> None:
+        # Tabs — the dock's own conceptual naming ("Controls") is folded
+        # straight into the tab header itself rather than repeated above it,
+        # so the tab IS the primary, human-readable label for this section.
+        self.tabs_controls.setTabText(0, self.tr("Controls and Processing"))
+        self.tabs_controls.setTabText(1, self.tr("Marks and Export"))
         # Sections
         self.sec_palette.setText(self.tr("PALETTE"))
         self.sec_decon.setText(self.tr("PREDICTIVE DECONVOLUTION"))
@@ -996,7 +1146,7 @@ class ProcessingControls(QWidget):
         self.fix.setText(self.tr("Show FIX marks"))
         self.sec_geometry.setText(self.tr("GEOMETRY & PRESENTATION"))
         self.align_delays.setText(self.tr("Compensate delays (align groups)"))
-        self.show_boundaries.setText(self.tr("Show file boundaries (red lines)"))
+        self.show_boundaries.setText(self.tr("Show file boundaries"))
         self.show_boundaries.setToolTip(self.tr("Show file boundaries (red lines)"))
         self.ab_compare.setText(self.tr("A/B Compare"))
         self.ab_compare.setToolTip(self.tr(
@@ -1049,7 +1199,11 @@ class ProcessingControls(QWidget):
         self.btn_export_img.setText(self.tr("💾  Export image"))
         self.btn_export_fix.setText(self.tr("🗺 Export FIX"))
         self.btn_export_fix.setToolTip(self.tr("Export FIX → SHP / GeoJSON / CSV"))
-        self.btn_toggle_picking.setText(self.tr("📍 Activate Picker"))
+        # Text (and colour) depend on the CURRENT checked state — re-derive
+        # both from the single source of truth in _on_picking_toggled so a
+        # language switch never reverts an active picker's label back to
+        # "Activate" while it's still actually active.
+        self._on_picking_toggled(self.btn_toggle_picking.isChecked())
         if self.btn_toggle_picking.isChecked():
             self.btn_toggle_picking.setToolTip(self.tr(
                 "Picking mode is ON — double-click the section to place a marker. "
@@ -1058,7 +1212,7 @@ class ProcessingControls(QWidget):
             self.btn_toggle_picking.setToolTip(self.tr(
                 "Turn on picking mode: double-click the section to place an "
                 "interpretation marker."))
-        self.btn_export_import_picking.setText(self.tr("📤 Export/Import"))
+        self.btn_export_import_picking.setText(self.tr("Export/Import marker"))
         self.btn_export_import_picking.setToolTip(self.tr(
             "Export interpretation markers to SHP/GeoJSON/CSV, or import a "
             "previously saved session (.tps)."))

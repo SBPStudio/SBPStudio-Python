@@ -15,8 +15,8 @@ from typing import Optional, TYPE_CHECKING
 from PyQt6.QtCore import QCoreApplication, Qt
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QDockWidget, QFileDialog, QFrame, QHBoxLayout,
-    QMainWindow, QMenu, QMessageBox, QScrollArea, QStackedWidget, QTabWidget,
-    QVBoxLayout, QWidget,
+    QMainWindow, QMenu, QMessageBox, QScrollArea, QSizePolicy, QStackedWidget,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from ..components import (
@@ -24,6 +24,7 @@ from ..components import (
     PickingExportImportDialog, PipelinePanel,
     PlaceholderView, ProcessingControls, SeismicView, SpectrumView,
 )
+from ..components.processing_controls import DockDragMixin
 from ..dsp import DSPContext, PreviewController
 from ..i18n import language_manager
 from ..state import AppState
@@ -59,6 +60,47 @@ class _Page(QStackedWidget):
     def show_placeholder(self, text: str) -> None:
         self.placeholder.set_text(text)
         self.setCurrentWidget(self.placeholder)
+
+
+class DockTitleBar(QWidget, DockDragMixin):
+    """Custom title-bar widget for the Controls dock (see
+    _build_controls_dock): hosts the "Controles y Procesado" / "Marcas y
+    Exportación" tab strip directly, via ``dock.setTitleBarWidget(this)`` —
+    promoting the tabs to the dock's absolute top and removing the native
+    title bar's now-redundant "Controles" label entirely.
+
+    DockDragMixin handles dragging the dock by this bar (including the
+    EMPTY space beside the tabs — dragging an actual tab is handled by the
+    tab bar itself, see _DraggableTabBar in processing_controls.py): a
+    custom title bar widget does not get Qt's built-in drag-to-float
+    handling for free, since installing one replaces that entirely."""
+
+    def __init__(self, dock, tab_bar, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._dock = dock
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(0)
+        # Bigger + bold so the promoted tabs read with the same visual
+        # weight the native dock title text used to have.
+        font = tab_bar.font()
+        font.setPointSize(font.pointSize() + 1)
+        font.setBold(True)
+        tab_bar.setFont(font)
+        lay.addWidget(tab_bar)
+        lay.addStretch(1)
+
+    def mousePressEvent(self, event) -> None:
+        self._dock_press(event)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        self._dock_move(event)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._dock_release(event)
+        super().mouseReleaseEvent(event)
 
 
 def _batch_output_path(src_path: str, fmt: str, used: set) -> "Path":
@@ -336,6 +378,12 @@ class SubTabbedTab(QWidget):
             self._on_picking_export_import)
         self.controls.scale_changed.connect(self._on_scale_changed)
         self.controls.boundaries_toggled.connect(self._on_boundaries_toggled)
+        # Initial sync (same idiom as set_image_interpolation below): a
+        # checkbox that starts unchecked never fires toggled() on
+        # construction (no real transition happens), so without this the
+        # view's own _boundaries_visible default could silently disagree
+        # with the checkbox's displayed (unchecked) state.
+        self._on_boundaries_toggled(self.controls.boundaries_visible())
         self.controls.align_toggled.connect(lambda *_: self.preview.alignment_changed())
         self.controls.display_changed.connect(self.preview.display_changed)
         # Live raster pixel-scaling (nearest/bilinear) — a paint-time hint on the
@@ -1048,30 +1096,46 @@ class SubTabbedTab(QWidget):
         # lives at the top of the Profile/Seismic dock — see _build_view_docks.)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        # User-resizable: only a MINIMUM width is set so the dock can still be
-        # narrowed/widened freely by dragging its edge; the scroll bar remains
-        # only as a fallback for very short windows.
+        # User-resizable, but NEVER a greedy space-consumer: a MINIMUM width
+        # so every control stays readable, and a MAXIMUM so the dock layout
+        # engine cannot hand it half of whatever new space appears when the
+        # window is maximized (Qt's QDockAreaLayout otherwise splits newly
+        # freed space ~50/50 between competing dock areas — wasting it here
+        # on a column of static-width controls instead of the seismic
+        # section). The user can still narrow it below this by dragging the
+        # splitter; only growth beyond a comfortable working width is capped.
         scroll.setMinimumWidth(300)
+        scroll.setMaximumWidth(380)
+        scroll.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Expanding)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
 
-        host = QWidget()
-        col = QVBoxLayout(host)
-        col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(0)
-
+        # ProcessingControls' stacked tab PAGES are the SOLE root content
+        # here — the pipeline panel is embedded INSIDE the "Controles y
+        # Procesado" page (at its very top, above Palette), not stacked
+        # above the tabs in a separate wrapper layout, so every control
+        # genuinely lives inside one of the two tabs. The tab STRIP itself
+        # is promoted into the dock's custom title bar below (DockTitleBar)
+        # rather than living here too — see processing_controls.py's
+        # _DraggableTabBar/tab_bar() for why the strip and the pages are two
+        # separate widgets.
         self.pipeline_panel = PipelinePanel()
-        col.addWidget(self.pipeline_panel)
-
         self.controls = ProcessingControls()
         self.controls.set_dsp_sections_visible(False)
-        col.addWidget(self.controls)
+        self.controls.embed_pipeline_panel(self.pipeline_panel)
 
-        scroll.setWidget(host)
+        scroll.setWidget(self.controls)
 
         dock = QDockWidget()
         dock.setFeatures(self._DOCK_FEATURES)
         dock.setWidget(scroll)
+        # Custom title bar: promotes the "Controles y Procesado"/"Marcas y
+        # Exportación" tabs to the dock's absolute top, replacing the
+        # native bar (which would otherwise show a now-redundant
+        # "Controles" label directly above them).
+        tab_bar = self.controls.tab_bar()
+        tab_bar.set_dock(dock)
+        dock.setTitleBarWidget(DockTitleBar(dock, tab_bar))
         self._install_restore_menu(dock)
         self._dock_controls = dock
         return dock
@@ -1089,6 +1153,12 @@ class SubTabbedTab(QWidget):
         self._docks: list[QDockWidget] = []
         for i in range(4):
             page = _Page()
+            # The greedy space-consumer: Expanding (not the QStackedWidget
+            # default of Preferred) so this is the side QMainWindow's dock
+            # layout hands ALL newly freed width to on maximize, instead of
+            # splitting it ~50/50 with the now width-capped Controls dock
+            # (see _build_controls_dock).
+            page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             self.pages.append(page)
             dock = QDockWidget()
             dock.setFeatures(self._DOCK_FEATURES)
@@ -1102,6 +1172,8 @@ class SubTabbedTab(QWidget):
                 # and stays unconditional. Unchecked by default (see
                 # _on_link_views_toggled).
                 profile_host = QWidget()
+                profile_host.setSizePolicy(
+                    QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
                 profile_col = QVBoxLayout(profile_host)
                 profile_col.setContentsMargins(0, 0, 0, 0)
                 profile_col.setSpacing(0)
@@ -1166,6 +1238,10 @@ class SubTabbedTab(QWidget):
         )
         for i, title in enumerate(titles):
             self._docks[i].setWindowTitle(title)
+        # Not shown anywhere visually any more (the custom DockTitleBar
+        # replaced the native bar that would have displayed this) — kept
+        # only as the OS-level window label (taskbar/Alt-Tab) for when this
+        # dock is torn off into a floating window.
         self._dock_controls.setWindowTitle(
             QCoreApplication.translate("SubTabbedTab", "Controls"))
         self.chk_link_views.setText(QCoreApplication.translate(
