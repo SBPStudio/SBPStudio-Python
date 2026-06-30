@@ -25,6 +25,8 @@ matrix. Neither ``_arr`` nor the LUT is involved in any export path.
 from __future__ import annotations
 
 import math
+import os
+from time import perf_counter
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -33,8 +35,15 @@ from PyQt6.QtCore import Qt, QRectF, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QFont, QPainterPath
 from PyQt6.QtWidgets import QInputDialog, QMenu, QVBoxLayout, QWidget
 
+from ...core.logger import get_logger
 from ..i18n import language_manager
 from ..theme import MONO, theme
+
+_LOG = get_logger("seismic")
+
+# Lightweight perf telemetry, off unless ``TOPAS_PERF=1`` (see preview.py's
+# matching flag) — when on, the map-highlight cost per pan frame is logged.
+_PERF = os.environ.get("TOPAS_PERF") == "1"
 
 # ── Global PyQtGraph config ───────────────────────────────────────────────────
 # row-major: arr[row, col] → row = Y (time), col = X (distance).
@@ -44,6 +53,92 @@ pg.setConfigOption("useOpenGL", True)   # hardware-accelerated pan/zoom
 
 # FIX mark tuple: (number, distance_km, label)
 FixMark = Tuple[int, float, str]
+
+
+class HorizonOverlay:
+    """Interactive mute-horizon overlay drawn as a pg.PolyLineROI.
+
+    The ROI is an open polyline with N_HANDLES draggable vertex handles,
+    initialised from a pre-computed per-trace pick array. When the user
+    finishes dragging any handle, ``horizon_edited`` is emitted with the new
+    sorted list of ``[(x_km, time_ms), …]`` control-point pairs.
+
+    Coordinate system: X = dist_km (matching the ViewBox X axis), Y = time_ms
+    (matching the ViewBox Y axis, downward-positive because the ViewBox has
+    invertY=True).
+
+    Ownership model: ``SeismicView.show_mute_horizon`` creates the overlay
+    and stores it in ``self._horizon``; ``hide_mute_horizon`` calls
+    ``overlay.clear()`` to remove all scene items then drops the reference.
+    """
+
+    # How many evenly-spaced vertex handles to place on the initial auto-pick
+    # curve. More = finer control; fewer = less clutter. 16 is a good default
+    # for marine SBP lines that are typically 1–50 km long.
+    N_HANDLES = 16
+
+    # Z-value above everything — must sit above the seismic image (z=0),
+    # pick scatter (z=60), and A/B divider (z=70).
+    _Z = 1000
+
+    # Gold: clearly distinct from both waveforms (grey) and pick scatter (red/green).
+    _COLOR = "#FFD700"
+
+    def __init__(self, plot: pg.PlotWidget,
+                 dist_km: np.ndarray, picks_ms: np.ndarray) -> None:
+        from PyQt6.QtCore import QObject, pyqtSignal as _sig
+
+        # Use a plain QObject as the signal carrier so we don't need a full
+        # QWidget.  SeismicView re-exposes horizon_edited as its own signal.
+        class _Emitter(QObject):
+            horizon_edited = _sig(list)
+
+        self._emitter = _Emitter()
+        self.horizon_edited = self._emitter.horizon_edited
+
+        self._plot = plot
+        self._roi: Optional[pg.PolyLineROI] = None
+        self._build(dist_km, picks_ms)
+
+    def _build(self, dist_km: np.ndarray, picks_ms: np.ndarray) -> None:
+        n = len(dist_km)
+        if n == 0:
+            return
+        n_handles = min(self.N_HANDLES, n)
+        idxs = np.linspace(0, n - 1, n_handles, dtype=int)
+        pts = [(float(dist_km[i]), float(picks_ms[i])) for i in idxs]
+        pen = pg.mkPen(self._COLOR, width=3)
+        handle_pen = pg.mkPen(self._COLOR, width=2)
+        self._roi = pg.PolyLineROI(
+            pts,
+            closed=False,
+            pen=pen,
+            handlePen=handle_pen,
+            movable=False,   # block whole-ROI drag; individual handles still drag
+        )
+        self._roi.setZValue(self._Z)
+        self._plot.addItem(self._roi)
+        self._roi.sigRegionChangeFinished.connect(self._on_finished)
+
+    def _on_finished(self) -> None:
+        """Convert handle positions back to sorted (x_km, time_ms) pairs."""
+        vb = self._plot.getViewBox()
+        pts = []
+        for _, scene_pos in self._roi.getSceneHandlePositions():
+            vp = vb.mapSceneToView(scene_pos)
+            pts.append((float(vp.x()), float(vp.y())))
+        pts.sort(key=lambda p: p[0])
+        self._emitter.horizon_edited.emit(pts)
+
+    def clear(self) -> None:
+        """Remove the ROI from the scene."""
+        if self._roi is not None:
+            try:
+                self._roi.sigRegionChangeFinished.disconnect(self._on_finished)
+            except RuntimeError:
+                pass
+            self._plot.removeItem(self._roi)
+            self._roi = None
 
 
 class _PickScatterPlotItem(pg.ScatterPlotItem):
@@ -112,6 +207,12 @@ class SeismicView(QWidget):
     # loop. See update_ab / _on_ab_divider_dragged.
     ab_split_changed = pyqtSignal(float)
 
+    # Emitted when the user finishes dragging a handle on the interactive mute
+    # horizon overlay (pg.PolyLineROI).  Carries the NEW control-point list as
+    # [(x_km, time_ms), …] sorted by x — the PreviewController converts these to
+    # trace fractions and stores them in the selected WaterMuteNode's params.
+    mute_horizon_edited = pyqtSignal(list)
+
     # Viewport-settle debounce: DSP recompute fires this long after the LAST
     # pan/zoom event, so dragging never triggers a pipeline run mid-gesture.
     # 180 ms: long enough that a continuous drag (events firing far faster
@@ -119,6 +220,15 @@ class SeismicView(QWidget):
     # stops, short enough that the full_depth recompute feels instant once
     # they do (the 150-200 ms "smooth settle" window).
     SETTLE_MS = 180
+
+    # Map-highlight throttle: visible_traces_changed → MapView.set_visible_range
+    # re-uploads an O(visible_traces) polyline slice to the GPU. On a large
+    # stitched cadena that fires on EVERY un-debounced pan frame and dominates
+    # the drag cost, so the emission is coalesced to at most one per this many
+    # ms (leading + trailing — see _queue_visible_traces). 60 ms ≈ 16 fps for
+    # the map marker, imperceptible lag for a navigation overview while the
+    # seismic view itself still pans natively at full frame rate.
+    VT_THROTTLE_MS = 60
 
     # Max visible traces drawn as live wiggle before auto-falling back to the
     # raster base (keeps pan/zoom fluid). Mirrors the export budget
@@ -186,8 +296,8 @@ class SeismicView(QWidget):
         self._fix_lines: List[pg.InfiniteLine] = []
         self._fix_trace_indices: List[int] = []
 
-        # A/B Compare overlay: a vertical divider + "A (raw)" / "B (filtered)"
-        # labels drawn over the raw|processed composite raster (the controller
+        # A/B Compare overlay: a vertical divider + "A (anchor)" / "B (final)"
+        # labels drawn over the anchor|processed composite raster (the controller
         # composites the image; this view only draws the marker). Lazily
         # created on first activation, then shown/hidden — see update_ab.
         self._ab_divider = None
@@ -208,6 +318,11 @@ class SeismicView(QWidget):
         # self._hide_ruler_action below), not a toolbar button.
         self._ruler_roi: Optional[pg.LineSegmentROI] = None
         self._ruler_label: Optional[pg.TextItem] = None
+
+        # Interactive mute horizon: a HorizonOverlay that's created/destroyed
+        # by show_mute_horizon / hide_mute_horizon (called by PreviewController
+        # when a WaterMuteNode is selected / deselected). None while hidden.
+        self._horizon: Optional["HorizonOverlay"] = None
 
         # Interpretation & Picking (Phase 3): double-click (while active)
         # drops a numbered marker + a free-text description, drawn as ONE
@@ -293,6 +408,18 @@ class SeismicView(QWidget):
         self._settle_timer.setSingleShot(True)
         self._settle_timer.setInterval(self.SETTLE_MS)
         self._settle_timer.timeout.connect(self.view_range_changed.emit)
+
+        # Map-highlight throttle (see VT_THROTTLE_MS). Leading+trailing: the
+        # cheap searchsorted runs on every range-change, but the GPU-bound
+        # visible_traces_changed.emit is rate-limited so a fast cadena pan
+        # doesn't re-upload the highlight polyline on every frame.
+        self._vt_timer = QTimer(self)
+        self._vt_timer.setSingleShot(True)
+        self._vt_timer.setInterval(self.VT_THROTTLE_MS)
+        self._vt_timer.timeout.connect(self._flush_visible_traces)
+        self._vt_pending: Optional[Tuple[int, int]] = None   # latest (t0, t1)
+        self._vt_last_value: Optional[Tuple[int, int]] = None  # last emitted
+        self._vt_last_emit: float = 0.0                       # perf_counter s
 
         # Cross-module sync (Link Views) state: set by the owning tab whenever
         # the "Link Views" toggle changes (see set_link_views_enabled). Drives
@@ -763,6 +890,29 @@ class SeismicView(QWidget):
         label.setText(f"ΔX: {dx_m:,.1f} m | ΔT: {dt_ms:,.1f} ms")
         label.setPos((p1.x() + p2.x()) / 2.0, (p1.y() + p2.y()) / 2.0)
 
+    # ── Interactive mute horizon ─────────────────────────────────────────────
+
+    def show_mute_horizon(self, picks_ms: np.ndarray,
+                          dist_km: np.ndarray) -> None:
+        """Create (or replace) the mute-horizon overlay from per-trace picks.
+
+        picks_ms : (n_traces,) auto-pick or merged pick array in ms
+        dist_km  : (n_traces,) distance axis in km (same order as picks_ms)
+        """
+        self.hide_mute_horizon()
+        self._horizon = HorizonOverlay(self.plot, dist_km, picks_ms)
+        self._horizon.horizon_edited.connect(self.mute_horizon_edited)
+
+    def hide_mute_horizon(self) -> None:
+        """Remove and destroy the mute-horizon overlay if one is active."""
+        if self._horizon is not None:
+            try:
+                self._horizon.horizon_edited.disconnect()
+            except RuntimeError:
+                pass
+            self._horizon.clear()
+            self._horizon = None
+
     # ── Interpretation & Picking (Phase 3) ──────────────────────────────────
 
     def set_pick_mode(self, active: bool) -> None:
@@ -858,7 +1008,7 @@ class SeismicView(QWidget):
             return d0 + frac * (d1 - d0)
         dist = self._dist_km
         if n_traces:
-            return float(dist[trace_index])
+            return float(dist[max(0, min(trace_index, n_traces - 1))])
         return float(trace_index)
 
     def _redraw_picks(self) -> None:
@@ -1103,6 +1253,24 @@ class SeismicView(QWidget):
                 self._cbar.setColorMap(self._colormap())
             self._cbar.setLevels((self._vmin, self._vmax))
 
+    def set_levels_only(self, vmax: float, vmin: float = 0.0) -> None:
+        """Instant amplitude-ceiling update with NO array resubmission, rect
+        change, or LUT rebuild — just ``self.img.setLevels(...)`` + the
+        colorbar. For the Clip slider: only [vmin, vmax] moved, the
+        underlying raster data did not, so re-running setImage()/the whole
+        show_preview() path would be wasted work. Cheap enough to track a
+        slider drag at 60 fps."""
+        vmax_f = float(vmax) or 1.0
+        vmin_f = float(vmin)
+        self._vmax = vmax_f
+        self._vmin = vmin_f
+        new_levels = (vmin_f, vmax_f)
+        if new_levels != self._img_levels:
+            self.img.setLevels([vmin_f, vmax_f])
+            self._img_levels = new_levels
+        if self._cbar is not None:
+            self._cbar.setLevels((vmin_f, vmax_f))
+
     def show_preview(self, arr: np.ndarray, dist0: float, dist1: float,
                      t0: float, t1: float, *, vmax: float, vmin: float = 0.0,
                      fit: bool = False,
@@ -1159,9 +1327,9 @@ class SeismicView(QWidget):
         """Draw / hide the A/B Compare divider (the draggable wiper) over the
         composite raster.
 
-        The controller has already spliced raw|processed into the shown image;
+        The controller has already spliced anchor|processed into the shown image;
         this only marks the boundary at ``split_km`` with a vertical DRAGGABLE
-        line and the "A (raw)" / "B (filtered)" captions, and clamps the line
+        line and the "A (anchor)" / "B (final)" captions, and clamps the line
         to the visible window [x0, x1]. Lazily creates the items the first
         time A/B is engaged, then toggles their visibility. Dragging the line
         emits :pyattr:`ab_split_changed`; the controller recomposes the split
@@ -1200,8 +1368,8 @@ class SeismicView(QWidget):
         self._ab_label_top = min(float(t_top), float(t_bot))   # cached for drag
         self._ab_divider.setPos(float(split_km))   # programmatic → no sigDragged
         self._ab_divider.setVisible(True)
-        self._ab_label_a.setText(self.tr("A (raw)"))
-        self._ab_label_b.setText(self.tr("B (filtered)"))
+        self._ab_label_a.setText(self.tr("A (anchor)"))
+        self._ab_label_b.setText(self.tr("B (final)"))
         self._position_ab_labels(float(split_km))
         self._ab_label_a.setVisible(True)
         self._ab_label_b.setVisible(True)
@@ -1271,7 +1439,34 @@ class SeismicView(QWidget):
         t1 = int(np.searchsorted(dist, x_max, side="right"))
         t0 = max(0, min(t0, n - 1))
         t1 = max(t0 + 1, min(t1, n))
-        self.visible_traces_changed.emit(t0, t1)
+        self._queue_visible_traces(t0, t1)
+
+    def _queue_visible_traces(self, t0: int, t1: int) -> None:
+        """Throttle the (GPU-bound) visible_traces_changed emission to at most
+        one per VT_THROTTLE_MS. Leading edge: if the last emit is older than
+        the interval (e.g. the first event of a pan, or an isolated update)
+        fire immediately so the map stays responsive; otherwise stash the
+        latest window and let the trailing timer flush it once the burst
+        slows — so the FINAL resting position is never dropped."""
+        self._vt_pending = (t0, t1)
+        if perf_counter() - self._vt_last_emit >= self.VT_THROTTLE_MS / 1000.0:
+            self._flush_visible_traces()              # leading edge
+        elif not self._vt_timer.isActive():
+            self._vt_timer.start()                    # schedule trailing flush
+
+    def _flush_visible_traces(self) -> None:
+        """Emit the latest pending (t0, t1), skipping a redundant emit when the
+        window is identical to the one already on the map (a pan that resolved
+        to the same trace span — common when zoomed out over a whole cadena)."""
+        if self._vt_pending is None:
+            return
+        val = self._vt_pending
+        self._vt_pending = None
+        self._vt_last_emit = perf_counter()
+        if val == self._vt_last_value:
+            return
+        self._vt_last_value = val
+        self.visible_traces_changed.emit(*val)
 
     def _on_range_changed(self, _vb, ranges) -> None:
         """Schedule a display-buffer re-slice (or a preview refresh) on pan/zoom."""

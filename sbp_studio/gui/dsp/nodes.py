@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
+from sbp_studio.core.tasks import CancelToken
+
 
 # ── Parameter descriptors ───────────────────────────────────────────────────────
 
@@ -79,6 +81,23 @@ class DSPContext:
 
     ``delays``/``min_delay`` are carried for the geometric Delay-Alignment node;
     the filter nodes use only ``dt_us``.
+
+    ``cancel`` — optional cooperative cancellation token (see
+    ``sbp_studio.core.tasks.CancelToken``), threaded through ONLY by the live
+    preview (PreviewController._refresh) so a node with a genuinely
+    interruptible inner loop (currently just PredictiveDeconNode — see its
+    ``_apply``) can bail out early on a stale, superseded request. ``None``
+    everywhere else (export, CLI, analysis) — behaviour there is unchanged.
+
+    ``preview`` — True ONLY for the live preview (set by PreviewController,
+    mirroring ``cancel``'s pattern). Lets a node skip a float64 upcast it
+    would otherwise use (see PresetNode's Sobel/Laplacian/Gaussian/Wiener/
+    gradient/integral branches) — bounded to <1e-3 relative difference from
+    the full-precision path (measured directly, see
+    core.processing._ref_apply_filter_preset's docstring), invisible on a
+    percentile-clipped display raster re-rendered on every tweak. ``False``
+    everywhere else (export, CLI, analysis) keeps their output BYTE-
+    IDENTICAL to before this flag existed.
     """
     dt_us:     int
     ns:        int
@@ -86,6 +105,8 @@ class DSPContext:
     delays:    Optional[np.ndarray] = None
     min_delay: float = 0.0
     delay_ms:  float = 0.0
+    cancel:    Optional[CancelToken] = None
+    preview:   bool = False
 
     @classmethod
     def from_source(cls, obj: Any) -> "DSPContext":
@@ -122,6 +143,28 @@ class DSPNode(ABC):
     # cap) and runs the pipeline there, THEN hands the result to the
     # decimation/render layer — see PreviewController._refresh.
     NEEDS_FULL_RES: bool = False
+
+    # GLOBAL-STATISTICS nodes compute something that depends on the ENTIRE
+    # vertical extent they're given, not just local context near each sample
+    # (unlike AGC/TVG/bandpass/F-K-vertically/etc., which are genuinely LOCAL
+    # — a sliding window or halo-bounded operation, already correctly served
+    # by ``time_halo_samples``). When ANY active node sets this, the live
+    # preview must process the WHOLE real signal band (active_lo..active_ns)
+    # instead of a cheaper visible-Y-range-plus-halo window — see
+    # PreviewController._refresh's Y-windowing (Strategy B) note. Two
+    # concrete failure modes if this were skipped:
+    #   - PredictiveDeconNode: its autocorrelation-derived filter
+    #     COEFFICIENTS are re-estimated from whatever rows it's given — a
+    #     narrower Y-window produces a DIFFERENT decon operator, so the
+    #     output would change with zoom (reintroducing the exact class of
+    #     "result changes with viewport" bug full_depth was created to fix).
+    #   - LogCompressionNode/CLAHENode: both normalise by
+    #     ``max(abs(data))`` over whatever window they're given — windowing
+    #     differently changes that normalisation scale.
+    # Default False: the vast majority of nodes (AGC, bandpass, TVG, median,
+    # despike, bilateral, notch, whiten, trace_eq, trace_mix, F-K) are
+    # correctly local and unaffected.
+    GLOBAL_STATS: bool = False
 
     def __init__(self, params: Dict[str, Any] | None = None,
                  enabled: bool = True) -> None:
@@ -161,8 +204,22 @@ class DSPNode(ABC):
         sample across the entire output. Every node funnels through here
         (Pipeline.process and the full-array export both call ``node.apply``),
         so this is the one chokepoint that shields the whole chain.
+
+        Detection is allocation-free: ``np.isfinite(data).all()`` materialises a
+        full H×W boolean array (tens of MB on a deep full_depth window, paid
+        PER node) just to AND-reduce it. But a NaN anywhere makes the float64
+        grand sum NaN, and a ±Inf makes it non-finite too, so
+        ``np.isfinite(data.sum(dtype=float64))`` is the same guard in ONE
+        reduction pass with no large temporary. float64 accumulation can't
+        realistically overflow for SBP amplitudes, so a clean array never
+        false-positives into a needless ``nan_to_num`` copy.
         """
-        if not np.isfinite(data).all():
+        # errstate: summing +Inf and −Inf yields NaN with an "invalid value"
+        # warning — that's exactly the non-finite case we WANT to catch, so
+        # silence the warning rather than let it spam the console on bad input.
+        with np.errstate(invalid="ignore", over="ignore"):
+            finite = np.isfinite(float(data.sum(dtype=np.float64)))
+        if not finite:
             data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
         return self._apply(data, ctx)
 
@@ -341,6 +398,9 @@ class PredictiveDeconNode(DSPNode):
         ParamSpec("gap_ms",    "Prediction gap",    0.1, 20.0,  2.0, 0.1, 1, "ms"),
         ParamSpec("white_pct", "Pre-whitening",     0.1, 10.0,  1.0, 0.1, 1, "%"),
     )
+    # The autocorrelation-derived filter coefficients depend on the WHOLE
+    # window given — see DSPNode.GLOBAL_STATS's docstring.
+    GLOBAL_STATS = True
 
     def time_halo_samples(self, ctx: DSPContext) -> int:
         dt_ms = ctx.dt_us / 1000.0
@@ -348,9 +408,13 @@ class PredictiveDeconNode(DSPNode):
 
     def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
         from sbp_studio.core import apply_predictive_decon
+        # ctx.cancel: this node's per-trace loop is the genuinely
+        # interruptible one in the live preview — see apply_predictive_decon's
+        # docstring. None outside the live preview (export/CLI/analysis).
         return apply_predictive_decon(
             data, ctx.dt_us, self.params["op_ms"],
-            self.params["gap_ms"], self.params["white_pct"])
+            self.params["gap_ms"], self.params["white_pct"],
+            cancel=ctx.cancel)
 
 
 class BandpassNode(DSPNode):
@@ -466,7 +530,8 @@ class PresetNode(DSPNode):
 
     def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
         from sbp_studio.core import apply_filter_preset
-        return apply_filter_preset(data, self.params["preset"], ctx.dt_us)
+        return apply_filter_preset(data, self.params["preset"], ctx.dt_us,
+                                   fast=ctx.preview)
 
 
 class TVGNode(DSPNode):
@@ -597,6 +662,9 @@ class LogCompressionNode(DSPNode):
     SPECS   = (
         ParamSpec("k", "Strength (k)", 1.0, 100.0, 10.0, 1.0, 0),
     )
+    # Normalises by max(abs(data)) over WHATEVER window it's given — see
+    # DSPNode.GLOBAL_STATS's docstring.
+    GLOBAL_STATS = True
 
     # Pointwise rescale → no halo needed.
     def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
@@ -620,6 +688,9 @@ class CLAHENode(DSPNode):
         ParamSpec("clip_limit", "Clip Limit",    1.0, 40.0, 2.0, 0.5, 1),
         ParamSpec("tile_grid",  "Tile Grid Size", 2.0, 64.0, 8.0, 1.0, 0),
     )
+    # Normalises by max(abs(data)) over WHATEVER window it's given — see
+    # DSPNode.GLOBAL_STATS's docstring.
+    GLOBAL_STATS = True
 
     # Tile-relative normalisation (own peak amplitude, own tile grid over
     # whatever window is fed in) → no halo, same contract as LogCompression.
@@ -705,14 +776,84 @@ class WaterMuteNode(DSPNode):
               "interfere with sub-bottom interpretation.")
     PRECROP = True                # seabed pick needs the full trace → run pre-crop
     SPECS   = (
-        ParamSpec("threshold_pct", "Threshold", 1.0, 100.0, 30.0, 1.0, 0, "%"),
-        ParamSpec("margin_ms",     "Margin",    0.0, 100.0,  5.0, 1.0, 0, "ms"),
+        ParamSpec("threshold_pct", "Threshold",  1.0, 100.0, 30.0, 1.0, 0, "%"),
+        ParamSpec("margin_ms",     "Margin",     0.0, 100.0,  5.0, 1.0, 0, "ms"),
+        ParamSpec("smoothing_ms",  "Smoothing",  0.0,  20.0,  0.5, 0.5, 1, "ms"),
     )
+
+    def __init__(self, params: Optional[Dict[str, Any]] = None,
+                 enabled: bool = True) -> None:
+        super().__init__(params, enabled)
+        # Manual horizon control points: [(trace_frac ∈ [0,1], time_ms), …]
+        # stored as a JSON string so signature() / serialisation pick it up.
+        # Empty string = auto-pick only.
+        self.params.setdefault("manual_picks", "")
+
+    # ── Public helpers (called by PreviewController) ──────────────────────
+
+    def set_manual_picks(self, ctrl_pts: list) -> None:
+        """Store sorted control points as JSON.  ctrl_pts = [(frac, ms), …]."""
+        import json as _json
+        self.params["manual_picks"] = _json.dumps(
+            sorted(ctrl_pts, key=lambda p: p[0]))
+
+    def clear_manual_picks(self) -> None:
+        self.params["manual_picks"] = ""
+
+    def get_manual_picks_ms(self, n_traces: int) -> Optional[np.ndarray]:
+        """Interpolate control points to a full (n_traces,) float32 in ms.
+
+        Returns None when no manual picks are stored."""
+        import json as _json
+        raw = self.params.get("manual_picks", "")
+        if not raw:
+            return None
+        try:
+            pts = _json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        if not pts:
+            return None
+        fracs = np.array([p[0] for p in pts], dtype=float)
+        times = np.array([p[1] for p in pts], dtype=float)
+        all_fracs = np.linspace(0.0, 1.0, n_traces)
+        return np.interp(all_fracs, fracs, times).astype(np.float32)
+
+    @staticmethod
+    def compute_auto_picks_ms(data: np.ndarray, dt_us: int,
+                               threshold_pct: float,
+                               smooth_ms: float) -> np.ndarray:
+        """Return per-trace seabed pick times (ms) without applying mute/margin."""
+        from scipy.ndimage import uniform_filter1d
+        ns, n_traces = data.shape
+        dt_ms = dt_us / 1000.0
+        abs_d = np.abs(data)
+        if smooth_ms > 0.0:
+            smooth_n = max(3, int(round(smooth_ms / dt_ms)))
+            if smooth_n % 2 == 0:
+                smooth_n += 1
+            env = uniform_filter1d(abs_d, size=smooth_n, axis=0)
+        else:
+            env = abs_d
+        peak    = np.nanmax(env, axis=0)
+        thresh  = (threshold_pct / 100.0) * peak
+        exceed  = env >= thresh[None, :]
+        picks_s = np.argmax(exceed, axis=0)
+        return (picks_s * dt_ms).astype(np.float32)
+
+    # ── Core apply ────────────────────────────────────────────────────────
 
     def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
         from sbp_studio.core import apply_water_mute
+        user_picks = self.get_manual_picks_ms(data.shape[1])
         return apply_water_mute(
-            data, self.params["threshold_pct"], self.params["margin_ms"], ctx.dt_us)
+            data,
+            self.params["threshold_pct"],
+            self.params["margin_ms"],
+            ctx.dt_us,
+            smooth_ms=self.params.get("smoothing_ms", 0.5),
+            user_picks_ms=user_picks,
+        )
 
 
 class SwellFilterNode(DSPNode):
@@ -841,6 +982,45 @@ class NotchNode(DSPNode):
 # a one-off geometry fix, not a reorderable DSP filter.
 
 
+class AB_AnchorNode(DSPNode):
+    """A/B Compare Anchor — transparent pass-through that snapshots the array.
+
+    Placed anywhere in the pipeline to define STATE A for the A/B Comparator
+    wiper.  STATE B is always the final pipeline output.  The node itself is
+    purely non-destructive: it returns ``data`` unchanged, and stores a
+    reference in ``_snapshot`` so :class:`PreviewController` can read it in
+    ``_finish_refresh`` once the worker thread is done.
+
+    Thread-safety: ``_snapshot`` is written by the worker thread inside
+    ``_apply`` and read by the GUI thread in ``_finish_refresh``.  Qt's queued
+    signal dispatch guarantees the worker has finished (its ``finished`` signal
+    is fully delivered) before the GUI thread enters ``_finish_refresh``, so
+    there is no race condition.
+
+    Not in the "Add module" menu — inserted/removed exclusively via the
+    dedicated A/B Anchor button in the Pipeline Panel.
+    """
+
+    KEY         = "ab_anchor"
+    DISPLAY     = "Comparador A/B"
+    TOOLTIP     = ("Non-destructive snapshot marker — defines 'State A' for the "
+                   "A/B Comparator wiper. State B is the final pipeline output. "
+                   "Passes data through unchanged.")
+    SPECS       = ()
+    MENU_HIDDEN = True  # inserted via the panel button, not the Add Module menu
+
+    def __init__(self, params: Optional[Dict[str, Any]] = None,
+                 enabled: bool = True) -> None:
+        super().__init__(params, enabled)
+        self._snapshot: Optional[np.ndarray] = None
+
+    def _apply(self, data: np.ndarray, ctx: DSPContext) -> np.ndarray:
+        # Store the array AS-IS (no copy: we read it before the next run and
+        # the pipeline never mutates arrays in-place after returning from _apply).
+        self._snapshot = data
+        return data
+
+
 # ── Registry (the Add menu reads this; order = a sensible default DSP order) ─────
 
 NODE_REGISTRY: List[type[DSPNode]] = [
@@ -864,6 +1044,10 @@ NODE_REGISTRY: List[type[DSPNode]] = [
     SphericalDivergenceNode,  # deterministic, physics-based gain alongside TVG/AGC
     LogCompressionNode,
     CLAHENode,
+    # AB_AnchorNode is NOT in the "Add module" menu (added via the dedicated
+    # pipeline-panel button) but MUST be in the registry so make_node() can
+    # deserialise a saved preset that contains it.
+    AB_AnchorNode,
 ]
 
 

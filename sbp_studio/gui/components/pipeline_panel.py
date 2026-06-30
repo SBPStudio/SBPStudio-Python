@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..dsp import (
+    AB_AnchorNode,
     NODE_REGISTRY, BoolSpec, ChoiceSpec, DSPNode, ParamSpec, PRESET_HEADER_VALUE, make_node,
     tr_node, tr_param, tr_preset_category, tr_tooltip,
 )
@@ -272,6 +273,11 @@ class PipelinePanel(QWidget):
     # LOD (a slashed column extent for the duration of the drag).
     interactionStarted = pyqtSignal()
     interactionEnded = pyqtSignal()
+    # Emitted whenever the selected node in the list changes (including when
+    # selection is cleared). Carries the DSPNode object, or None when no
+    # node is selected. Consumed by PreviewController to show/hide the
+    # interactive mute-horizon overlay in SeismicView.
+    node_selection_changed = pyqtSignal(object)
 
     DEBOUNCE_MS = 200
 
@@ -340,6 +346,13 @@ class PipelinePanel(QWidget):
         line.setObjectName("hline")
         root.addWidget(line)
 
+        # ── A/B Compare checkbox (between pipeline list and parameter editor) ──
+        # Checking inserts an AB_AnchorNode at the first post-PRECROP position;
+        # unchecking removes it. The anchor is the sole driver of A/B mode.
+        self.chk_ab = QCheckBox()
+        self.chk_ab.toggled.connect(self._on_ab_checkbox_changed)
+        root.addWidget(self.chk_ab)
+
         # ── Property editor (rebuilt per selection) ──
         self._hdr_props = QLabel()
         self._hdr_props.setObjectName("section")
@@ -358,6 +371,7 @@ class PipelinePanel(QWidget):
         root.addStretch(1)
 
         language_manager.language_changed.connect(self.retranslate_ui)
+        self.pipeline_changed.connect(self._update_ab_checkbox)
         self.retranslate_ui()
         self._rebuild_editor()
         self._refresh_presets()
@@ -379,6 +393,11 @@ class PipelinePanel(QWidget):
         Both the live preview and the export read this, so a muted node is
         bypassed everywhere (Node Mute / bypass)."""
         return [n for n in self.nodes() if getattr(n, "enabled", True)]
+
+    def selected_node(self) -> Optional[DSPNode]:
+        """Return the currently selected DSPNode, or None if nothing is selected."""
+        item = self.list.currentItem()
+        return item.data(_NODE_ROLE) if item is not None else None
 
     def add_node(self, node: DSPNode) -> None:
         item = QListWidgetItem(tr_node(node.KEY, node.DISPLAY))
@@ -414,18 +433,21 @@ class PipelinePanel(QWidget):
     def _apply_muted_style(self, item: QListWidgetItem, enabled: bool) -> None:
         """Grey + strike-through a muted row so it reads as 'bypassed'.
 
-        BUG FIX: the enabled case used to reset the foreground to ``QColor()``
-        — an INVALID QColor, which Qt paints as black. That per-item
-        Qt::ForegroundRole override always wins over the stylesheet's
-        ``QListWidget { color: ... }`` rule, so every enabled row rendered as
-        unreadable black-on-dark-gray regardless of theme. Must use the
-        theme's actual text colour instead (live via ``theme.color``, so a
-        runtime theme switch still applies correctly)."""
+        A/B Anchor rows are always rendered in red (when enabled) so they stand
+        out as the comparison split point — the red survives mute/unmute by
+        being re-applied here after the base grey/text logic.
+        """
         font = item.font()
         font.setStrikeOut(not enabled)
         item.setFont(font)
-        item.setForeground(QColor(Qt.GlobalColor.gray) if not enabled
-                           else QColor(theme.color("text")))
+        node = item.data(_NODE_ROLE)
+        if isinstance(node, AB_AnchorNode):
+            # Red == "this is the A/B split point"; grey-out if muted
+            item.setForeground(QColor(Qt.GlobalColor.gray) if not enabled
+                               else QColor("#E74C3C"))
+        else:
+            item.setForeground(QColor(Qt.GlobalColor.gray) if not enabled
+                               else QColor(theme.color("text")))
 
     # ── Structural actions ──────────────────────────────────────────────────
 
@@ -457,7 +479,9 @@ class PipelinePanel(QWidget):
         # future addition nobody re-categorised yet) still appears here
         # rather than silently vanishing from the menu — NODE_REGISTRY stays
         # the single source of truth for "what's addable".
-        leftover = [cls for cls in NODE_REGISTRY if cls.KEY not in categorized]
+        leftover = [cls for cls in NODE_REGISTRY
+                    if cls.KEY not in categorized
+                    and not getattr(cls, "MENU_HIDDEN", False)]
         if leftover:
             if not first:
                 menu.addSeparator()
@@ -525,6 +549,51 @@ class PipelinePanel(QWidget):
 
     def _on_reordered(self, *_) -> None:
         # Drag-drop reorder changes order → pipeline differs → immediate.
+        self.pipeline_changed.emit()
+
+    # ── A/B Anchor insert / remove ────────────────────────────────────────────
+
+    def _find_anchor_row(self) -> int:
+        """Return the list row of the first AB_AnchorNode, or -1 if absent."""
+        for i in range(self.list.count()):
+            if isinstance(self.list.item(i).data(_NODE_ROLE), AB_AnchorNode):
+                return i
+        return -1
+
+    def _update_ab_checkbox(self) -> None:
+        """Sync the A/B checkbox checked state with the current pipeline."""
+        self.chk_ab.blockSignals(True)
+        self.chk_ab.setChecked(self._find_anchor_row() >= 0)
+        self.chk_ab.blockSignals(False)
+
+    def _on_ab_checkbox_changed(self, checked: bool) -> None:
+        """Insert or remove the AB_AnchorNode when the checkbox is toggled."""
+        anchor_present = self._find_anchor_row() >= 0
+        if checked and not anchor_present:
+            insert_at = 0
+            for i in range(self.list.count()):
+                node = self.list.item(i).data(_NODE_ROLE)
+                if node is not None and getattr(node, "PRECROP", False):
+                    insert_at = i + 1
+            self.add_node_at(AB_AnchorNode(), insert_at)
+        elif not checked and anchor_present:
+            row = self._find_anchor_row()
+            self.list.takeItem(row)
+            self._rebuild_editor()
+            self.pipeline_changed.emit()
+
+    def add_node_at(self, node: DSPNode, row: int) -> None:
+        """Insert a node at a specific list row (0 = top). Emits pipeline_changed."""
+        item = QListWidgetItem(tr_node(node.KEY, node.DISPLAY))
+        item.setData(_NODE_ROLE, node)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        self._suppress_item_changed = True
+        item.setCheckState(Qt.CheckState.Checked if node.enabled
+                           else Qt.CheckState.Unchecked)
+        self._suppress_item_changed = False
+        self._apply_muted_style(item, node.enabled)
+        self.list.insertItem(row, item)
+        self.list.setCurrentItem(item)
         self.pipeline_changed.emit()
 
     # ── Save / Load presets ───────────────────────────────────────────────────
@@ -667,6 +736,7 @@ class PipelinePanel(QWidget):
 
         item = self.list.currentItem()
         node = item.data(_NODE_ROLE) if item is not None else None
+        self.node_selection_changed.emit(node)
         if node is None:
             self._editor_hint.setText(self.tr("Select a module to edit its parameters."))
             return
@@ -697,6 +767,8 @@ class PipelinePanel(QWidget):
         self.btn_remove.setText(self.tr("✖ Remove"))
         self.btn_clear.setText(self.tr("✖✖ Clear"))
         self.btn_save_preset.setText(self.tr("Save Preset"))
+        self.chk_ab.setText(self.tr("Comparador A/B"))
+        self._update_ab_checkbox()  # syncs checked state on language change
         # The placeholder row text (index 0) is language-dependent; refresh it.
         if self.preset_combo.count() > 0 and self.preset_combo.itemData(0) is None:
             self.preset_combo.setItemText(0, self.tr("Load preset…"))

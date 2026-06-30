@@ -69,6 +69,24 @@ MAX_PREVIEW_COLS = 4000
 LOD_SCALE = 0.25       # keep ~25% of the normal column cap while dragging
 LOD_MIN_COLS = 250     # floor so a narrow viewport never degenerates further
 
+# Overview LOD (the zoom-out fix). The exact full_depth path processes EVERY
+# native sample of the visible Y-span — correct when zoomed in, but ruinous at
+# zoom-out (15-30k rows through DSP for a ~1.5k-px screen). When visible rows
+# exceed OVERVIEW_TRIGGER_FACTOR × adaptive_target, rows are RMS-pooled down to
+# adaptive_target *before* the pipeline runs (see pipeline._pool_rows_rms).
+#
+# The target is ADAPTIVE: OVERVIEW_OVERSAMPLE × the ViewBox pixel height, so the
+# overview carries ~4 samples per display pixel — much gentler compression than
+# a fixed cap, and the larger stride means the RMS estimate is more accurate
+# (honest energy ≈ σ, vs max-abs's ≈ 2.3σ). Never drops below OVERVIEW_MIN_ROWS
+# (safety floor for tiny/not-yet-laid-out panels).
+#
+# Gated on the VISIBLE span (not the band depth) so a thin Y-zoom keeps the
+# exact Strategy-B window; only genuine oversampling pools.
+OVERVIEW_MIN_ROWS      = 1000  # floor: never pool to fewer than this many rows
+OVERVIEW_OVERSAMPLE    = 4     # target = OVERSAMPLE × ViewBox pixel height
+OVERVIEW_TRIGGER_FACTOR = 2.0  # activate when visible_rows > TRIGGER × target
+
 # Deferred global-levels recompute after a slider release. interactionEnded
 # shows the final full-res raster immediately reusing the LAST locked ceiling
 # (imperceptible: the levels are zoom-independent and barely move per tweak),
@@ -317,7 +335,9 @@ class PreviewController(QObject):
         panel.params_changed.connect(self._on_params_changed)
         panel.interactionStarted.connect(self._on_interaction_started)
         panel.interactionEnded.connect(self._on_interaction_ended)
+        panel.node_selection_changed.connect(self._on_node_selected)
         view.ab_split_changed.connect(self._on_ab_drag)
+        view.mute_horizon_edited.connect(self._on_mute_horizon_edited)
 
     # ── External triggers ───────────────────────────────────────────────────
 
@@ -336,8 +356,16 @@ class PreviewController(QObject):
         self._pc_src = None
         self._pending_base_ctx = None
         self._has_source = obj is not None and getattr(obj, "data", None) is not None
+        # Remove any stale horizon from the previous source; it will be rebuilt
+        # by _on_node_selected once the new data is available.
+        self.view.hide_mute_horizon()
         if self._has_source:
             self._refresh(fit=True, overlays=True)   # initial full-view render
+            # If a WaterMuteNode is currently selected, rebuild its overlay now.
+            from sbp_studio.gui.dsp.nodes import WaterMuteNode
+            node = self.panel.selected_node()
+            if isinstance(node, WaterMuteNode):
+                self._on_node_selected(node)
 
     def display_changed(self) -> None:
         """Presentation (cmap / FIX / boundaries / etc.) changed — recolour.
@@ -381,7 +409,7 @@ class PreviewController(QObject):
         self._global_levels_cache[levels_key] = (vmax_proc, vmax_raw)
         self._global_levels_key = levels_key
 
-        ab_on = bool(disp.get("ab_compare"))
+        ab_on = self._ab_anchor_active()
         vmax = max(vmax_raw, vmax_proc) if ab_on else vmax_proc
         vmin = -vmax if disp.get("amp_range") == "diverging" else 0.0
         self.view.set_levels_only(vmax, vmin)
@@ -448,6 +476,7 @@ class PreviewController(QObject):
 
         Reads ``active_nodes()`` (enabled-only), so a MUTED node is bypassed in
         the live preview exactly as it is in the export."""
+        from .nodes import AB_AnchorNode
         nodes = self.panel.active_nodes()
         precrop = [n for n in nodes if getattr(n, "PRECROP", False)]
         window  = [n for n in nodes if not getattr(n, "PRECROP", False)]
@@ -456,7 +485,13 @@ class PreviewController(QObject):
         # pipeline_global processes all nodes up to and including the last
         # GLOBAL_STATS node on the full active band; pipeline_local processes
         # the remaining (purely local) nodes on the visible+halo window.
-        last_gs = max((i for i, n in enumerate(window)
+        # The anchor must always live in pipeline_local so its _snapshot
+        # shape matches win.crop_visible() — cap the global split point
+        # before the anchor's position to enforce this invariant.
+        anchor_pos = next(
+            (i for i, n in enumerate(window) if isinstance(n, AB_AnchorNode)),
+            len(window))
+        last_gs = max((i for i, n in enumerate(window[:anchor_pos])
                        if getattr(n, "GLOBAL_STATS", False)), default=-1)
         self.pipeline_global.set_nodes(window[:last_gs + 1])
         self.pipeline_local.set_nodes(window[last_gs + 1:])
@@ -481,6 +516,7 @@ class PreviewController(QObject):
             self._data_version += 1       # invalidate per-window cache
         self._pipeline_version += 1      # invalidate halo cache (node set changed)
         self._band_cache = None          # node set changed → stale pan-margin band
+        self._ab_cache = None            # anchor may have moved → stale A/B arrays
         if self._has_source:
             self._refresh(fit=False, overlays=False)
 
@@ -513,6 +549,66 @@ class PreviewController(QObject):
     def _on_view_changed(self) -> None:
         if self._has_source:
             self._refresh(fit=False, overlays=False)
+
+    # ── Mute-horizon overlay lifecycle ──────────────────────────────────────
+
+    def _on_node_selected(self, node: object) -> None:
+        """Show the interactive horizon when a WaterMuteNode is selected."""
+        from sbp_studio.gui.dsp.nodes import WaterMuteNode
+        if not isinstance(node, WaterMuteNode):
+            self.view.hide_mute_horizon()
+            return
+        obj = self._get_source()
+        if obj is None or getattr(obj, "data", None) is None:
+            self.view.hide_mute_horizon()
+            return
+        data = obj.data
+        dt_us = getattr(obj, "dt_us", 1000)
+        n_traces = data.shape[1]
+        dist_km = np.asarray(getattr(obj, "dist_km",
+                                      np.linspace(0.0, 1.0, n_traces)))
+        # t0_ms: absolute display time (ms) of raw sample-0. When delay
+        # alignment is inactive this is 0. Auto-picks are computed on obj.data
+        # (raw, 0-relative) so they must be shifted by t0_ms before they reach
+        # the ViewBox. Manual picks are already stored in absolute display ms
+        # (written by _on_mute_horizon_edited from ViewBox Y coords) — no shift.
+        try:
+            _, t0_ms, _ = self._prepared_base(obj)
+        except Exception:
+            t0_ms = 0.0
+        picks_ms = node.get_manual_picks_ms(n_traces)
+        if picks_ms is None:
+            picks_ms = WaterMuteNode.compute_auto_picks_ms(
+                data, dt_us,
+                node.params.get("threshold_pct", 30.0),
+                node.params.get("smoothing_ms", 0.5))
+            picks_ms = picks_ms + t0_ms  # raw-relative → absolute display ms
+        self.view.show_mute_horizon(picks_ms, dist_km)
+
+    def _on_mute_horizon_edited(self, km_time_pts: list) -> None:
+        """Convert viewport (km, ms) control points → trace fractions, store in node."""
+        from sbp_studio.gui.dsp.nodes import WaterMuteNode
+        node = self.panel.selected_node()
+        if not isinstance(node, WaterMuteNode):
+            return
+        obj = self._get_source()
+        if obj is None:
+            return
+        n_traces = getattr(obj, "n_traces", None) or (
+            obj.data.shape[1] if getattr(obj, "data", None) is not None else 0)
+        if n_traces == 0:
+            return
+        dist_km = np.asarray(getattr(obj, "dist_km",
+                                      np.linspace(0.0, 1.0, n_traces)), dtype=float)
+        ctrl_pts = []
+        for x_km, time_ms in km_time_pts:
+            idx = int(np.clip(np.searchsorted(dist_km, x_km), 0, n_traces - 1))
+            frac = float(idx) / max(1, n_traces - 1)
+            ctrl_pts.append([frac, float(time_ms)])
+        node.set_manual_picks(ctrl_pts)
+        # manual_picks changed → pre-crop sig changes → _on_pipeline_changed
+        # will detect it and rebuild _pc_array.
+        self._on_pipeline_changed()
 
     # ── Prepared base (alignment + PRE-CROP nodes, column-bounded, cached) ───
 
@@ -712,7 +808,7 @@ class PreviewController(QObject):
         return (
             vis_token, pipeline_sig, clip,
             disp.get("cmap"), disp.get("inv_cmap"), disp.get("amp_range"),
-            disp.get("style", "density"), bool(disp.get("ab_compare")),
+            disp.get("style", "density"), self._ab_anchor_active(),
             bool(disp.get("va_fill", True)), bool(disp.get("show_raster", True)),
             bool(disp.get("show_wiggle_line", True)),
             self._ab_frac, self._lod_active)
@@ -906,6 +1002,36 @@ class PreviewController(QObject):
             x_range = (float(dist_km[0]), float(dist_km[-1]))
             y_range = (t0_full, t0_full + data.shape[0] * dt_ms)
 
+        # ── Overview LOD gate (zoom-out fix) ────────────────────────────────
+        # How many NATIVE rows does the visible Y-span cover? (Same floor/ceil
+        # mapping extract_visible_window uses for s_vis0/s_vis1.) When that far
+        # exceeds TRIGGER × adaptive_target, switch to Overview mode: rows are
+        # RMS-pooled down to adaptive_target before DSP runs (quieter noise
+        # floor vs. old max-abs, and gentler compression via viewport-adaptive
+        # sizing). Gated on the VISIBLE span (not the band depth) so a thin
+        # Y-zoom keeps the exact Strategy-B window.
+        ymin_ov, ymax_ov = sorted(y_range)
+        s0_ov = max(0, int(np.floor((ymin_ov - t0_full) / dt_ms)))
+        s1_ov = int(np.ceil((ymax_ov - t0_full) / dt_ms)) + 1
+        visible_rows_ov = max(1, s1_ov - s0_ov)
+        # Adaptive cap: 4× the live ViewBox pixel height so the overview carries
+        # ~4 rows per display pixel — gentler strides mean better RMS estimates.
+        _vb_h = int(self.view.plot.getViewBox().height())
+        _overview_target = (max(OVERVIEW_MIN_ROWS, _vb_h * OVERVIEW_OVERSAMPLE)
+                            if _vb_h > 0 else OVERVIEW_MIN_ROWS)
+        overview_max_rows = None
+        if visible_rows_ov > OVERVIEW_TRIGGER_FACTOR * _overview_target:
+            overview_max_rows = _overview_target
+            # Overview RMS-pools the whole visible band uniformly. The two-pass
+            # split and Strategy-B windowing both assume UN-pooled row indices
+            # (their sh0/sh1/halo math is in native samples), so disable them
+            # and let one pooled array carry every node — GLOBAL_STATS included,
+            # whose statistics on the pooled overview are the accepted zoom-out
+            # approximation. y_halo=None ⇒ extract takes the whole active band
+            # (clamped to visible), then RMS-pools it down to overview_max_rows.
+            has_local_after_gs = False
+            y_halo = None
+
         # ViewBox-limited extraction (preview only). Live horizontal detail:
         # the "Pixels / trace" control raises the column cap so zooming in
         # stays sharp (default 20 → the historical 4000-col cap; higher
@@ -936,7 +1062,7 @@ class PreviewController(QObject):
         # mid-drag (LOD owns that), not a fit/overlay pass, and not zoomed
         # out past the render cap (the un-decimated band can't serve that).
         # On a miss we fall straight through to a worker dispatch.
-        ab_on = bool(disp.get("ab_compare"))
+        ab_on = self._ab_anchor_active()
         visible_cols = cvis1 - cvis0
         band_eligible = (not fit and not ab_on and not self._lod_active
                          and visible_cols <= max_cols_use)
@@ -1036,7 +1162,8 @@ class PreviewController(QObject):
             max_cols=extract_max_cols, full_depth=True,
             active_ns_lookup=active_ns_for_traces,
             active_band_lookup=active_band_for_traces,
-            col_margin=col_margin, y_halo=y_halo)
+            col_margin=col_margin, y_halo=y_halo,
+            overview_max_rows=overview_max_rows)
         # Eligible to populate the pan-margin cache when a real margin band was
         # built un-decimated (col_stride == 1 ⇒ 1:1 re-slice; row_stride is
         # always 1 under full_depth). Stored after the render in _finish_refresh.
@@ -1323,20 +1450,26 @@ class PreviewController(QObject):
         # ── Presentation ────────────────────────────────────────────────────
         from sbp_studio.core.constants import CMAPS
 
-        # ── A/B Compare: splice RAW (left) | PROCESSED (right) ───────────────
-        # The raw window is the SAME prepared base (alignment + pre-crop mute)
-        # WITHOUT the per-window filter pipeline — so both halves share identical
-        # geometry/decimation and composite cleanly into one image. The split
-        # follows the user's draggable wiper (``_ab_frac``, a fraction of the
-        # visible width that persists across pan/zoom). The raw + processed
-        # visible arrays are cached so dragging the wiper recomposes without
-        # re-running the pipeline (see _on_ab_drag).
-        ab_on = bool(disp.get("ab_compare"))
+        # ── A/B Compare: splice ANCHOR (left) | PROCESSED (right) ───────────
+        # State A is the anchor node's snapshot (data at the insertion point in
+        # the pipeline), cropped to the same halo window as the final output so
+        # the two halves have identical geometry and composite cleanly. State B
+        # is the final pipeline output. The split follows the user's draggable
+        # wiper (``_ab_frac``, a fraction of the visible width that persists
+        # across pan/zoom). Arrays are cached so dragging the wiper recomposes
+        # without re-running the pipeline (see _on_ab_drag).
+        ab_on = self._ab_anchor_active()
         ab_split_frac = self._ab_frac
         ab_vmax: Optional[float] = None
         if ab_on:
-            raw_visible = np.ascontiguousarray(win.crop_visible(win.sub),
-                                               dtype=np.float32)
+            anchor = self._get_anchor_node()
+            if anchor is not None and anchor._snapshot is not None:
+                a_visible = np.ascontiguousarray(
+                    win.crop_visible(anchor._snapshot), dtype=np.float32)
+            else:
+                # Anchor not yet run (first frame) — fall back to prepared base
+                a_visible = np.ascontiguousarray(win.crop_visible(win.sub),
+                                                 dtype=np.float32)
             # Explicit COPY (not a view): ``visible`` is a row/col slice of the
             # pipeline's cached prefix output (self.pipeline._cache). Caching a
             # view here would tie the wiper's lifetime to that cache entry —
@@ -1353,7 +1486,7 @@ class PreviewController(QObject):
             # once in _refresh from the full prepared base (see
             # _compute_global_levels), never from this call's visible crop.
             ab_vmax = max(self._global_vmax_raw, self._global_vmax)
-            visible = self._compose_ab(raw_visible, proc_visible, split)
+            visible = self._compose_ab(a_visible, proc_visible, split)
 
         # Locked to the GLOBAL (whole-profile) levels — see _refresh's
         # levels_key check / _compute_global_levels. This is the core color-
@@ -1406,7 +1539,7 @@ class PreviewController(QObject):
         # re-running the pipeline.
         if ab_on:
             self._ab_cache = dict(
-                raw=raw_visible, proc=proc_visible,
+                raw=a_visible, proc=proc_visible,
                 dist0=dist0, dist1=dist1, t_top=t_top, t_bot=t_bot,
                 vmax=vmax, vmin=vmin, cmap=cmap_name,
                 c0=win.c_vis0 + col_offset, c1=c1_idx + 1 + col_offset)
@@ -1501,8 +1634,21 @@ class PreviewController(QObject):
         split = max(0, min(int(split), n))
         combined = np.array(proc, dtype=np.float32, copy=True)
         if split > 0:
-            combined[:, :split] = raw[:, :min(split, raw.shape[1])]
+            s = min(split, raw.shape[1])
+            combined[:, :s] = raw[:, :s]
         return combined
+
+    def _ab_anchor_active(self) -> bool:
+        """True when the pipeline contains at least one enabled AB_AnchorNode."""
+        from .nodes import AB_AnchorNode
+        return any(isinstance(n, AB_AnchorNode) for n in self.panel.active_nodes())
+
+    def _get_anchor_node(self):
+        """Return the first enabled AB_AnchorNode in the pipeline, or None."""
+        from .nodes import AB_AnchorNode
+        return next(
+            (n for n in self.panel.active_nodes() if isinstance(n, AB_AnchorNode)),
+            None)
 
     def _on_ab_drag(self, split_km: float) -> None:
         """User dragged the A/B wiper → recompose the split at the new position
