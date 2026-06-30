@@ -219,6 +219,8 @@ class SegyProfile:
         self.coord_unit:  int   = 0
         self.detected_crs: Optional[str]  = None
         self.crs_notes:    List[str]       = []
+        self.crs_is_unknown: bool  = False   # #21: True when detected_crs is None
+        self.meters_per_unit: float = 1.0    # #13: 0.3048 when BinField.MeasurementSystem==2
 
     def summary(self) -> str:
         if self.error:

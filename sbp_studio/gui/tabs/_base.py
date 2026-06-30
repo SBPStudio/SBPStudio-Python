@@ -454,7 +454,8 @@ class SubTabbedTab(QWidget):
         from sbp_studio.core import safe_map_coords
         mx, my = safe_map_coords(lons, lats, getattr(obj, "coord_unit", 0),
                                  getattr(obj, "detected_crs", None))
-        self._map.set_track(mx, my, is_geographic=True)
+        self._map.set_track(mx, my, is_geographic=True,
+                            crs_is_unknown=getattr(obj, "crs_is_unknown", False))
 
     def _on_crs_updated(self, obj) -> None:
         """state.crs_updated reaction: only redraw if the object whose CRS

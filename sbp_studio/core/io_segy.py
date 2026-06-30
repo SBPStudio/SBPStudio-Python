@@ -104,6 +104,9 @@ ACTIVE_DEPTH_REL_THRESH = 0.01
 # EACH side — guards against a slightly conservative detection and gives
 # windowed filters with a small halo room past the cutoff.
 ACTIVE_DEPTH_MARGIN_SAMPLES = 50
+# Minimum position displacement (decimal degrees) treated as "real movement"
+# in the dual-gate dedup (#20). ~9e-6° ≈ 1 m at the equator.
+_DEDUP_POS_TOL_DEG = 9e-6
 
 
 def _detect_active_band(data: np.ndarray, clip_p99: float) -> Tuple[int, int]:
@@ -171,33 +174,45 @@ def smooth_track(lons: np.ndarray, lats: np.ndarray,
             median_filter(lats, size=k, mode="nearest"))
 
 
-def _timestamp_dedup_mask(doy, hod, moh, som, sx, sy) -> Optional[np.ndarray]:
+def _timestamp_dedup_mask(doy, hod, moh, som, sx, sy,
+                          scalar: int = 0) -> Optional[np.ndarray]:
     """Return a boolean keep-mask (length n_traces) that drops consecutive traces
     sharing an identical acquisition timestamp AND position, or ``None`` when no
     cleaning is warranted.
 
-    The SBP acquisition system occasionally stamps several CONSECUTIVE traces
-    with the same DayOfYear/Hour/Minute/Second — duplicate shots that smear the
-    section horizontally and misalign the navigation. We build the (n_traces, 6)
-    matrix [DOY, Hour, Minute, Second, SourceX, SourceY], diff consecutive rows,
-    and keep a trace ONLY when its vector differs from its predecessor in at least
-    one field (the first trace is always kept).
+    Dual-gate (#20): a trace is kept when EITHER gate fires —
+      • Time gate:     any of the 4 SEG-Y time fields changed (Δt ≠ 0)
+      • Position gate: raw SourceX/Y moved by more than ``_DEDUP_POS_TOL_DEG``
+                       (converted to raw integer units via the coordinate scalar).
 
-    Requiring coordinate identity (raw SourceX/SourceY integers) prevents
-    high-ping-rate files (>1 Hz) from being mass-purged: real pings at the same
-    whole-second timestamp will have different positions and are correctly kept.
+    Separating the two gates prevents over-aggressive purging of high-ping-rate
+    files where a GPS with < 1 Hz update rate echoes the same integer coordinate
+    for two consecutive 0.5 s pings: the time gate fires (different second or
+    minute) and saves the trace even when the position gate cannot.
 
-    Safety bypass: if the parsed time headers are all zeros (a file that simply
-    does not populate the time words) we return ``None`` so nothing is purged —
-    every trace would otherwise collapse to one. ``None`` is likewise returned
-    when there is nothing to clean (no consecutive duplicates), so the common
-    case stays an exact pass-through (Zero-regression contract)."""
+    Safety bypass: if ALL time fields across ALL traces are zero (a file that
+    does not populate the time words) ``None`` is returned so nothing is purged.
+    ``None`` is also returned when no consecutive duplicates are found (the common
+    case), so the hot path stays a pass-through with zero extra cost."""
     tvec = np.stack([np.asarray(doy), np.asarray(hod),
                      np.asarray(moh), np.asarray(som),
                      np.asarray(sx),  np.asarray(sy)], axis=1).astype(np.int64)
     if tvec.shape[0] < 2 or not np.any(tvec[:, :4]):
         return None                      # <2 traces, or all-zero time headers → bypass
-    changed = np.any(np.diff(tvec, axis=0) != 0, axis=1)     # (n-1,) differs-from-prev
+
+    # Time gate: any second/minute/hour/DOY field changed from the previous trace
+    t_diff    = np.diff(tvec[:, :4], axis=0)
+    t_changed = np.any(t_diff != 0, axis=1)
+
+    # Position gate: raw coordinate integer moved by more than the 1-metre
+    # tolerance (converted from degrees using the coordinate scalar, floor at 0
+    # so any integer change counts when the scale is too coarse to represent 1 m).
+    fac     = _scalar_fac(scalar) if scalar else 1.0
+    tol_raw = max(0, int(_DEDUP_POS_TOL_DEG / fac))
+    pos_diff  = np.diff(tvec[:, 4:], axis=0)
+    p_changed = np.any(np.abs(pos_diff) > tol_raw, axis=1)
+
+    changed = t_changed | p_changed
     keep = np.concatenate(([True], changed))                 # always keep trace[0]
     if keep.all():
         return None                      # no consecutive duplicates → pass-through
@@ -343,13 +358,14 @@ def _extract_trace_headers(f: "segyio.SegyFile") -> dict:
     return out
 
 
-def _dist_km(lons: np.ndarray, lats: np.ndarray, coord_unit: int) -> np.ndarray:
+def _dist_km(lons: np.ndarray, lats: np.ndarray, coord_unit: int,
+             meters_per_unit: float = 1.0) -> np.ndarray:
     """
     Compute cumulative along-track distance in km.
 
     Uses geographic (haversine-approximation) formula when coord_unit in (2,3)
-    or when coordinates appear to be degrees. Falls back to Euclidean/1000
-    otherwise (assumes metres — known limitation; OQ-2).
+    or when coordinates appear to be degrees. Falls back to Euclidean otherwise,
+    scaling by *meters_per_unit* (1.0 for metres, 0.3048 for feet — #13).
     """
     dlat = np.diff(lats)
     dlon = np.diff(lons)
@@ -361,7 +377,7 @@ def _dist_km(lons: np.ndarray, lats: np.ndarray, coord_unit: int) -> np.ndarray:
         d = np.sqrt((dlat * 111.32)**2 +
                     (dlon * 111.32 * np.cos(np.radians(lat_m)))**2)
     else:
-        d = np.sqrt(dlat**2 + dlon**2) / 1000.0
+        d = np.sqrt(dlat**2 + dlon**2) * meters_per_unit / 1000.0
     return np.concatenate([[0.0], np.cumsum(d)])
 
 
@@ -504,6 +520,9 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
     prof.scalar_coord = int(_to_signed(h0[segyio.TraceField.SourceGroupScalar] or 0, 16))
     prof.scalar_elev  = int(_to_signed(h0[segyio.TraceField.ElevationScalar]   or 0, 16))
     prof.coord_unit   = int(h0[segyio.TraceField.CoordinateUnits]   or 0)
+    # #13: BinField.MeasurementSystem: 1=metres, 2=feet, 0=unknown (default metres)
+    _meas = int(f.bin[segyio.BinField.MeasurementSystem] or 0)
+    prof.meters_per_unit = 0.3048 if _meas == 2 else 1.0
 
     _fields = [
         segyio.TraceField.DelayRecordingTime,
@@ -532,6 +551,7 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
         _hdr[segyio.TraceField.SecondOfMinute],
         _hdr[segyio.TraceField.SourceX],
         _hdr[segyio.TraceField.SourceY],
+        scalar=prof.scalar_coord,
     )
     if _keep is not None:
         for fld in list(_hdr):
@@ -612,7 +632,8 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
     prof.t_ms    = prof.delay_ms + np.arange(prof.ns) * prof.dt_us / 1000.0
     # Distance axis from the CLEANED track so it is smooth and well-behaved for
     # the seismic X-axis and the map↔profile sync (raw coords stay export-only).
-    prof.dist_km = _dist_km(prof.track_lons, prof.track_lats, prof.coord_unit)
+    prof.dist_km = _dist_km(prof.track_lons, prof.track_lats, prof.coord_unit,
+                             prof.meters_per_unit)
     prof.total_km = float(prof.dist_km[-1])
 
     # Header Inspector data — textual header is always decoded (single 3200-byte
@@ -631,6 +652,7 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
             prof.trace_headers = {k: v[_keep] for k, v in prof.trace_headers.items()}
     prof.detected_crs, prof.crs_notes = _detect_crs(
         prof.coord_unit, prof.lons, crs_override=crs_override, raw_text=_raw_text)
+    prof.crs_is_unknown = (prof.detected_crs is None)  # #21
 
     # OQ-2: warn if projected CRS axis unit is not metres
     unit_warnings = _check_crs_units(prof.detected_crs, prof.coord_unit)
@@ -1009,6 +1031,22 @@ def _opt_reproject_coords_bulk(src_f: "segyio.SegyFile",
 
     # Single bulk transform — the payoff
     nxs, nys = tf.transform(sxs, sys_)
+
+    # #8: Guard against pyproj returning inf/nan (e.g. out-of-zone UTM coords).
+    bad = ~(np.isfinite(nxs) & np.isfinite(nys))
+    n_bad = int(bad.sum())
+    if n_bad:
+        _LOG.warning(
+            "_opt_reproject_coords_bulk: %d/%d non-finite output coord(s); "
+            "forward-filling from nearest valid neighbour.", n_bad, n)
+        good = np.where(~bad)[0]
+        if good.size == 0:
+            raise ValueError(
+                "All reprojected coordinates are non-finite — check the "
+                "source/target CRS combination.")
+        nxs[bad] = np.interp(np.where(bad)[0], good, nxs[good])
+        nys[bad] = np.interp(np.where(bad)[0], good, nys[good])
+
     return nxs, nys
 
 

@@ -810,6 +810,15 @@ class MapView(QWidget):
         plot_lay = QVBoxLayout(plot_col)
         plot_lay.setContentsMargins(0, 0, 0, 0)
         plot_lay.setSpacing(2)
+        # #21: CRS-unknown warning banner — shown above the plot when the
+        # active profile has no detectable CRS (coord_unit=1 without override).
+        self._crs_warn_lbl = QLabel(
+            "⚠  CRS desconocido — la pista no se puede proyectar al mapa")
+        self._crs_warn_lbl.setStyleSheet(
+            "background-color: #cc6600; color: white; "
+            "padding: 4px 8px; font-weight: bold;")
+        self._crs_warn_lbl.setVisible(False)
+        plot_lay.addWidget(self._crs_warn_lbl)
         plot_lay.addWidget(self.plot, 1)
         self.lbl_cursor_coords = QLabel("")
         self.lbl_cursor_coords.setStyleSheet(f"font-family: {MONO};")
@@ -937,7 +946,8 @@ class MapView(QWidget):
 
     # ── Public API ──────────────────────────────────────────────────────────
 
-    def set_track(self, x, y, is_geographic: Optional[bool] = None) -> None:
+    def set_track(self, x, y, is_geographic: Optional[bool] = None,
+                  crs_is_unknown: bool = False) -> None:
         """Set the full trackline from per-trace X/Y coordinates and pin the
         STATIC SOL/EOL anchors: green at the absolute start ``_x[0]``/``_y[0]``,
         red at the absolute end ``_x[-1]``/``_y[-1]``. These dots never move;
@@ -947,8 +957,13 @@ class MapView(QWidget):
         the caller derives from the source CRS (via
         ``core.crs_produces_geographic``): True = lon/lat, False = projected
         metres, None = unknown → fall back to the magnitude heuristic. Drives
-        the basemap, scale-bar calibration, and cursor readout units."""
+        the basemap, scale-bar calibration, and cursor readout units.
+
+        ``crs_is_unknown`` (#21) shows an orange warning banner above the plot
+        when the active profile has coord_unit=1 (projected) but no CRS has
+        been specified — the track is NOT drawn in that case."""
         self._geographic_hint = is_geographic
+        self._crs_warn_lbl.setVisible(crs_is_unknown)
         self._x = np.asarray(x, dtype=float)
         self._y = np.asarray(y, dtype=float)
         self._x_disp = _unwrap_lons(self._x)
@@ -986,6 +1001,7 @@ class MapView(QWidget):
     def clear(self) -> None:
         self._x = self._y = self._x_disp = None
         self._geographic_hint = None     # next track re-establishes it (Bug #10)
+        self._crs_warn_lbl.setVisible(False)
         self.curve_full.setData([], [])
         self.curve_seg.setData([], [])
         self.marker_start.setData([], [])
