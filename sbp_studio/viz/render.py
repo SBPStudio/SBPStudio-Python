@@ -783,6 +783,11 @@ WIGGLE_MAX_TRACES = 1200
 # legible while guaranteeing a gap between adjacent traces' max excursions.
 WIGGLE_GAIN_DEFAULT = 0.9
 
+# CV threshold for switching from imshow (uniform) to pcolormesh (non-uniform)
+# in render_profile_figure.  CV = std(Δkm) / mean(Δkm); 5% captures real
+# irregular-ping surveys while ignoring sub-percent GPS jitter (#14).
+_DIST_CV_THRESH = 0.05
+
 
 def _draw_wiggle_overlay(ax, d: np.ndarray, x_lo: float, x_hi: float,
                          t0: float, t1: float, *, vmax: float,
@@ -999,19 +1004,46 @@ def render_profile_figure(
     fig.tight_layout(pad=1.2)
 
     if draw_raster:
-        # Measure the final axes pixel box from the settled layout.
-        ax_pos  = ax.get_position()
-        axes_w  = max(1, int(round(ax_pos.width  * figsize[0] * dpi)))
-        axes_h  = max(1, int(round(ax_pos.height * figsize[1] * dpi)))
-        resized = _colorize_for_target(d, cmap_name, vmin, vmax,
-                                       (axes_w, axes_h),
-                                       max_abs_pool=max_abs_pool,
-                                       interp=params.get("interp"))
-        ax.imshow(resized, aspect="auto",
-                  interpolation=params.get("interp") or "nearest",
-                  extent=[x_lo, x_hi, t1, t0], rasterized=True)
-        # Re-settle: adding the image rarely shifts axes geometry but the call
-        # is cheap and keeps the figure in a consistent state for the caller.
+        # #14: choose rendering path based on trace-spacing uniformity.
+        # Coefficient of variation of inter-trace distances: > _DIST_CV_THRESH
+        # AND x_axis=="distance" → pcolormesh with real km X-coordinates so
+        # the horizontal axis is geophysically accurate (WYSIWYG).  All other
+        # cases use the optimised two-pass imshow path (colorize-to-pixel-size
+        # then raster, no double-resample).
+        _spacing = np.diff(sd.dist_km)
+        _mean_sp = float(_spacing.mean()) if _spacing.size else 0.0
+        _cv      = (float(_spacing.std()) / _mean_sp
+                    if _mean_sp > 0 else 0.0)
+        _use_mesh = x_axis == "distance" and _cv > _DIST_CV_THRESH
+
+        if _use_mesh:
+            # Non-uniform spacing: pcolormesh with actual km X-coordinates.
+            # shading='nearest' → Z[i,j] centred on (X[j], Y[i]); no extra
+            # edge array needed.  y-axis explicitly inverted (t0 at top).
+            t_axis = np.linspace(t0, t1, d.shape[0])
+            ax.pcolormesh(sd.dist_km[:d.shape[1]], t_axis, d,
+                          cmap=cmap_name,
+                          norm=mcolors.Normalize(vmin, vmax),
+                          shading="nearest",
+                          rasterized=True)
+            ax.set_xlim(x_lo, x_hi)
+            ax.set_ylim(t1, t0)     # inverted: shallow time at top
+        else:
+            # Uniform (or near-uniform) spacing: optimised two-pass path —
+            # colorize to the exact axes pixel box then imshow 1:1 (no
+            # Matplotlib resampling, no double-resample bias).
+            ax_pos  = ax.get_position()
+            axes_w  = max(1, int(round(ax_pos.width  * figsize[0] * dpi)))
+            axes_h  = max(1, int(round(ax_pos.height * figsize[1] * dpi)))
+            resized = _colorize_for_target(d, cmap_name, vmin, vmax,
+                                           (axes_w, axes_h),
+                                           max_abs_pool=max_abs_pool,
+                                           interp=params.get("interp"))
+            ax.imshow(resized, aspect="auto",
+                      interpolation=params.get("interp") or "nearest",
+                      extent=[x_lo, x_hi, t1, t0], rasterized=True)
+
+        # Re-settle: cheap call that keeps the figure in a consistent state.
         fig.tight_layout(pad=1.2)
 
     return fig

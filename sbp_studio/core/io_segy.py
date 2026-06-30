@@ -66,7 +66,7 @@ from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import segyio
-from pyproj import CRS, Transformer
+from pyproj import CRS, Geod, Transformer
 
 from .coordinates import resolve_crs
 from .logger import get_logger
@@ -80,7 +80,8 @@ from .tasks import (
 
 _LOG = get_logger("io_segy")
 
-_INT32_MAX = 2_147_483_647
+_INT32_MAX  = 2_147_483_647
+_WGS84      = Geod(ellps="WGS84")   # #12: re-used for every geodesic dist_km call
 
 # Trace-order median-filter kernel for cleaning per-trace navigation. Large
 # enough to reject multi-sample GPS spikes (frozen/jumping fixes common in
@@ -107,6 +108,9 @@ ACTIVE_DEPTH_MARGIN_SAMPLES = 50
 # Minimum position displacement (decimal degrees) treated as "real movement"
 # in the dual-gate dedup (#20). ~9e-6° ≈ 1 m at the equator.
 _DEDUP_POS_TOL_DEG = 9e-6
+# CV of inter-trace spacing above which a reprojection/join op warns that
+# true spatial regularization is recommended (#19).
+_SPACING_CV_THRESH = 0.10
 
 
 def _detect_active_band(data: np.ndarray, clip_p99: float) -> Tuple[int, int]:
@@ -363,20 +367,23 @@ def _dist_km(lons: np.ndarray, lats: np.ndarray, coord_unit: int,
     """
     Compute cumulative along-track distance in km.
 
-    Uses geographic (haversine-approximation) formula when coord_unit in (2,3)
-    or when coordinates appear to be degrees. Falls back to Euclidean otherwise,
-    scaling by *meters_per_unit* (1.0 for metres, 0.3048 for feet — #13).
+    Geographic path (coord_unit 2 or 3, or values within degree range): uses
+    pyproj.Geod.inv for true WGS-84 geodesic distances — replaces the former
+    flat-Earth cosine approximation (#12). Projected path: Euclidean, scaled by
+    *meters_per_unit* (1.0 for metres, 0.3048 for feet — #13).
     """
-    dlat = np.diff(lats)
-    dlon = np.diff(lons)
     _is_geo = coord_unit in (2, 3) or (
         -180 <= float(np.nanmedian(lons)) <= 180 and
         -90  <= float(np.nanmedian(lats)) <= 90)
     if _is_geo:
-        lat_m = np.nanmean(lats)
-        d = np.sqrt((dlat * 111.32)**2 +
-                    (dlon * 111.32 * np.cos(np.radians(lat_m)))**2)
+        if lons.size < 2:
+            return np.zeros(lons.size)
+        # _WGS84.inv returns (fwd_az, back_az, dist_m); vectorised over all gaps.
+        _, _, dist_m = _WGS84.inv(lons[:-1], lats[:-1], lons[1:], lats[1:])
+        d = np.abs(dist_m) / 1000.0
     else:
+        dlat = np.diff(lats)
+        dlon = np.diff(lons)
         d = np.sqrt(dlat**2 + dlon**2) * meters_per_unit / 1000.0
     return np.concatenate([[0.0], np.cumsum(d)])
 
@@ -1050,6 +1057,34 @@ def _opt_reproject_coords_bulk(src_f: "segyio.SegyFile",
     return nxs, nys
 
 
+def _warn_irregular_spacing(dist_km: np.ndarray, label: str,
+                             log_fn: LogCallback) -> None:
+    """Emit a structured warning when inter-trace spacing CV exceeds 10% (#19).
+
+    A high CV indicates that the SEG-Y file was recorded with variable ping
+    rate or uneven vessel speed.  Writing it with uniform trace indices (as
+    every SEG-Y writer does) is a silent form of spatial regularization: a
+    25-m ping followed by a 250-m gap is rendered as two equally spaced
+    columns, compressing the gap tenfold.  Callers should flag this so the
+    geophysicist can decide whether true regularization is needed."""
+    if dist_km is None or dist_km.size < 3:
+        return
+    spacing = np.diff(dist_km)
+    mean_sp = float(spacing.mean())
+    if mean_sp <= 0:
+        return
+    cv = float(spacing.std()) / mean_sp
+    if cv > _SPACING_CV_THRESH:
+        msg = (f"Espaciado irregular en '{label}': CV={cv * 100:.1f}% "
+               f"(umbral {_SPACING_CV_THRESH * 100:.0f}%) — "
+               "se recomienda regularización espacial real antes de interpretar.")
+        _LOG.warning(
+            "Irregular trace spacing in '%s': CV=%.1f%% (threshold %.0f%%). "
+            "True spatial regularization is recommended before interpretation.",
+            label, cv * 100, _SPACING_CV_THRESH * 100)
+        log_fn(f"⚠  {msg}")
+
+
 # ── Public reprojection: dispatches to optimised path ──────────────────────────
 
 def reproject_one(
@@ -1112,6 +1147,9 @@ def reproject_one(
             # Optimised: compute ALL transformed coords in one bulk call
             progress(0.05, "computing coordinates…")
             nxs, nys = _opt_reproject_coords_bulk(src, tf, unit_hint)
+
+            # #19: warn if source trace spacing is highly irregular
+            _warn_irregular_spacing(sd.dist_km, sd.name, log)
 
             # File-copy is byte-faithful to the SOURCE: iterate the file's true
             # trace count, NOT sd.n_traces (which may be the in-memory cleaned
@@ -1233,6 +1271,9 @@ def reproject_chain(
     log(f"Salida     : {Path(outpath).name}")
 
     try:
+        # #19: warn once for the whole chain before the write loop
+        _warn_irregular_spacing(ch.dist_km, ch.label, log)
+
         # Byte-faithful copy: size the output by the SOURCE files' real trace
         # counts (original_n_traces), not ch.n_traces — which may be the cleaned
         # in-memory total after duplicate-timestamp purging.
