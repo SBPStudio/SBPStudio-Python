@@ -1172,6 +1172,371 @@ class TestViewBoxExtraction:
         assert win.c0 == max(0, win.c_vis0 - 5)    # cols: halo applied
         assert win.col_stride >= 1
 
+    def test_col_margin_widens_processed_band_beyond_halo(self):
+        """col_margin extends the processed columns past trace_halo so the
+        pan-margin cache has spare data to re-slice into."""
+        data, dist_km = self._full()
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(4.0, 6.0), y_range=(100.0, 150.0),
+            trace_halo=3, col_margin=40, full_depth=True, max_cols=100000)
+        # Band reaches col_margin (40 > halo 3) traces either side of visible.
+        assert win.c0 == max(0, win.c_vis0 - 40)
+        assert win.c1 == min(data.shape[1], win.c_vis1 + 40)
+
+    def test_active_ns_lookup_caps_rows_below_full_ns(self):
+        """True-depth cap: when active_ns_lookup reports a real signal depth
+        well short of ns, AND the visible Y-range sits entirely within it,
+        the processed window must shrink — the whole point of skipping a
+        file's dead/padded tail rather than always running DSP on ns rows."""
+        data, dist_km = self._full()
+        ns = data.shape[0]
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(3.0, 4.0), y_range=(10.0, 20.0),   # shallow Y-zoom
+            full_depth=True, active_ns_lookup=lambda c0, c1: 100)
+        assert win.sub.shape[0] < ns
+        assert win.sub.shape[0] == 100   # capped exactly at the reported depth
+
+    def test_active_ns_lookup_never_undercuts_the_visible_y_range(self):
+        """Safety guard: if the user is actually looking DEEPER than the
+        reported active depth (e.g. detection was wrong, or they zoomed into
+        what looks like a dead zone), the cap must defer to the real Y-range
+        — never truncate data the user is currently viewing."""
+        data, dist_km = self._full()
+        ns = data.shape[0]
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(3.0, 4.0), y_range=(150.0, 200.0),   # rows ~600-800
+            full_depth=True, active_ns_lookup=lambda c0, c1: 100)
+        assert win.s1 <= ns
+        assert win.sub.shape[0] >= win.s1   # window covers everything visible
+        cropped = win.crop_visible(win.sub)
+        assert cropped.shape[0] == win.s1 - win.s0   # nothing truncated
+
+    def test_active_ns_lookup_returning_none_is_unchanged_from_baseline(self):
+        """A lookup that can't resolve a value (e.g. an unloaded constituent)
+        must behave EXACTLY like omitting active_ns_lookup entirely — the
+        pre-existing full_depth=True contract (every row, ns)."""
+        data, dist_km = self._full()
+        ns = data.shape[0]
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(3.0, 4.0), y_range=(120.0, 125.0),
+            full_depth=True, active_ns_lookup=lambda c0, c1: None)
+        assert win.sub.shape[0] == ns
+
+    def test_active_ns_lookup_clamped_to_ns_when_oversized(self):
+        """A reported depth larger than the array's own ns (margin overflow,
+        or a generously-padded lookup) must clamp to ns — never index past
+        the array."""
+        data, dist_km = self._full()
+        ns = data.shape[0]
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(3.0, 4.0), y_range=(10.0, 20.0),
+            full_depth=True, active_ns_lookup=lambda c0, c1: ns + 5000)
+        assert win.sub.shape[0] == ns
+
+
+class TestActiveBandAndYHalo:
+    """extract_visible_window's Strategy A (active_band_lookup — top+bottom
+    real-signal trim) and Strategy B (y_halo — visible-Y+halo windowing,
+    only safe for nodes WITHOUT GLOBAL_STATS — see preview.py's wiring).
+    These two parameters are independent: A trims the band's outer edges,
+    B (when active) further narrows to what's actually visible within it."""
+
+    DT_US = 250
+
+    def _full(self):
+        ns, nt = 1000, 200
+        data = as_matrix(synthetic_trace(ns=ns), n_traces=nt)
+        dist_km = np.linspace(0.0, 10.0, nt)
+        return data, dist_km
+
+    def test_active_band_lookup_trims_both_top_and_bottom(self):
+        """Strategy A alone (no y_halo): the band [lo, hi] replaces [0, ns]
+        as the full-depth extraction range, extended if needed for the
+        visible range — exactly active_ns_lookup's old contract, now
+        symmetric at the top too."""
+        data, dist_km = self._full()
+        ns = data.shape[0]
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(3.0, 4.0), y_range=(60.0, 70.0),   # rows ~240-281, inside [200,800)
+            full_depth=True, active_band_lookup=lambda c0, c1: (200, 800))
+        assert win.sub.shape[0] == 600   # 800-200, NOT ns
+        assert win.s0 >= 200 and win.s1 <= 800
+
+    def test_active_band_lookup_never_undercuts_visible_range_either_side(self):
+        """A deliberate zoom OUTSIDE the reported band (top OR bottom) must
+        still be served in full — the band is a HINT for skipping dead rows,
+        never a hard crop of real data the user is looking at."""
+        data, dist_km = self._full()
+        win_above = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(3.0, 4.0), y_range=(10.0, 20.0),    # rows ~40-81, ABOVE band lo=200
+            full_depth=True, active_band_lookup=lambda c0, c1: (200, 800))
+        assert win_above.s0 <= 40 and win_above.sub.shape[0] >= win_above.s1 - 0
+        cropped_above = win_above.crop_visible(win_above.sub)
+        assert cropped_above.shape[0] == win_above.s1 - win_above.s0
+
+        win_below = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(3.0, 4.0), y_range=(220.0, 230.0),  # rows ~880-921, BELOW band hi=800
+            full_depth=True, active_band_lookup=lambda c0, c1: (200, 800))
+        cropped_below = win_below.crop_visible(win_below.sub)
+        assert cropped_below.shape[0] == win_below.s1 - win_below.s0
+
+    def test_active_band_lookup_none_falls_back_to_active_ns_lookup(self):
+        """When active_band_lookup returns None (e.g. an unloaded chain
+        segment), the legacy bottom-only active_ns_lookup still applies —
+        identical to the pre-Strategy-A contract."""
+        data, dist_km = self._full()
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(3.0, 4.0), y_range=(10.0, 20.0),
+            full_depth=True, active_band_lookup=lambda c0, c1: None,
+            active_ns_lookup=lambda c0, c1: 100)
+        assert win.sub.shape[0] == 100
+
+    def test_y_halo_narrows_to_visible_plus_halo_within_the_band(self):
+        """Strategy B: with y_halo given, the extraction shrinks to visible
+        +/- halo, clamped to the active band — far smaller than the whole
+        band when zoomed into a small Y slice of a deep band."""
+        data, dist_km = self._full()
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(3.0, 4.0), y_range=(100.0, 110.0),  # rows ~400-441
+            full_depth=True, active_band_lookup=lambda c0, c1: (0, 1000),
+            y_halo=50)
+        assert win.sub.shape[0] < 1000          # NOT the whole band
+        assert win.sub.shape[0] <= (441 - 400) + 2 * 50 + 2   # visible span + halo (+ rounding slack)
+
+    def test_y_halo_clamped_to_the_active_band_not_full_ns(self):
+        """The halo must not reach OUTSIDE the active band even though it
+        legally could reach outside [0, ns] — Strategy A's trim still wins
+        at the band edges."""
+        data, dist_km = self._full()
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(3.0, 4.0), y_range=(60.0, 65.0),    # near the top of the band
+            full_depth=True, active_band_lookup=lambda c0, c1: (200, 800),
+            y_halo=5000)                                  # huge halo
+        assert win.s0 >= 0
+        # sh0 must not go below the band's lo (200) even though the visible
+        # range minus the halo would ask for a negative row.
+        cropped = win.crop_visible(win.sub)
+        assert cropped.shape[0] == win.s1 - win.s0   # still nothing truncated
+
+    def test_y_halo_none_processes_the_whole_band_unchanged(self):
+        """Omitting y_halo (or GLOBAL_STATS forcing it to None) must behave
+        exactly like before Strategy B existed — the whole active band."""
+        data, dist_km = self._full()
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=(3.0, 4.0), y_range=(60.0, 70.0),
+            full_depth=True, active_band_lookup=lambda c0, c1: (200, 800))
+        assert win.sub.shape[0] == 600   # the whole [200,800) band, no halo narrowing
+
+
+class TestResliceBand:
+    """reslice_band (pipeline.py): the pan-margin cache fast path. The decisive
+    correctness property is EQUIVALENCE — a viewport served by re-slicing a
+    cached processed band must be byte-identical to the same viewport extracted
+    directly from the source — plus the conservative miss conditions that make
+    it safe to fall back to a fresh worker dispatch."""
+
+    DT_US = 250
+
+    def _full(self):
+        ns, nt = 1000, 400
+        data = as_matrix(synthetic_trace(ns=ns), n_traces=nt)
+        dist_km = np.linspace(0.0, 20.0, nt)
+        return data, dist_km
+
+    def _band(self, data, dist_km, x_range, y_range, *, halo=4, margin=60,
+              active_ns=None):
+        """Build an identity-processed band (processed == extracted sub) for a
+        viewport, exactly as PreviewController would after a worker run."""
+        from sbp_studio.gui.dsp.pipeline import ProcessedBand
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=x_range, y_range=y_range,
+            trace_halo=halo, col_margin=margin, full_depth=True, max_cols=100000,
+            active_ns_lookup=(None if active_ns is None
+                              else (lambda c0, c1: active_ns)))
+        assert win.col_stride == 1 and win.row_stride == 1
+        band = ProcessedBand(
+            processed=np.ascontiguousarray(win.sub), c0=win.c0, c1=win.c1,
+            n_traces=data.shape[1], trace_halo=halo, t0_ms=0.0, dt_us=self.DT_US,
+            data_ns=data.shape[0], data_version=7, pipeline_sig=("agc",))
+        return band
+
+    def _windowed_band(self, data, dist_km, x_range, y_range, *, halo=4,
+                       margin=60, active_band, y_halo):
+        """Build a Strategy-B band (visible+halo, row0 possibly nonzero) —
+        mirrors PreviewController._refresh's band_meta(row0=win.s0-win.r0)."""
+        from sbp_studio.gui.dsp.pipeline import ProcessedBand
+        win = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=x_range, y_range=y_range,
+            trace_halo=halo, col_margin=margin, full_depth=True, max_cols=100000,
+            active_band_lookup=lambda c0, c1: active_band, y_halo=y_halo)
+        assert win.col_stride == 1 and win.row_stride == 1
+        row0 = win.s0 - win.r0
+        band = ProcessedBand(
+            processed=np.ascontiguousarray(win.sub), c0=win.c0, c1=win.c1,
+            n_traces=data.shape[1], trace_halo=halo, t0_ms=0.0, dt_us=self.DT_US,
+            data_ns=data.shape[0], data_version=7, pipeline_sig=("agc",),
+            row0=row0)
+        return band, win
+
+    def test_row0_defaults_to_zero_for_full_band(self):
+        """A band built with the historical (no Strategy B) full-band
+        contract must have row0==0 — confirms the default never disturbs
+        any existing call site."""
+        data, dist_km = self._full()
+        band = self._band(data, dist_km, (8.0, 12.0), (50.0, 200.0))
+        assert band.row0 == 0
+
+    def test_windowed_band_reslice_matches_direct_extraction(self):
+        """The decisive equivalence test for Strategy B + the pan-margin
+        cache TOGETHER: re-slicing a row0!=0 band for a pan within its
+        row coverage must be byte-identical to a direct extraction of the
+        same viewport."""
+        from sbp_studio.gui.dsp.pipeline import reslice_band
+        data, dist_km = self._full()
+        active_band = (300, 700)   # the file's real signal band
+        band, _ = self._windowed_band(
+            data, dist_km, (8.0, 12.0), (100.0, 120.0),   # rows ~400-481+halo
+            active_band=active_band, y_halo=30)
+        assert band.row0 > 0   # confirms this band genuinely starts mid-trace
+
+        xr, yr = (9.0, 11.0), (105.0, 115.0)   # pan + narrower Y, still inside coverage
+        win_d = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=xr, y_range=yr, trace_halo=4, full_depth=True, max_cols=100000,
+            active_band_lookup=lambda c0, c1: active_band, y_halo=30)
+        visible_d = win_d.crop_visible(win_d.sub)
+
+        win_r = reslice_band(band, dist_km, xr, yr,
+                             max_cols=100000, data_version=7, pipeline_sig=("agc",))
+        assert win_r is not None
+        visible_r = win_r.crop_visible(band.processed)
+        np.testing.assert_array_equal(visible_r, visible_d)
+        assert (win_r.s0, win_r.s1) == (win_d.s0, win_d.s1)
+
+    def test_windowed_band_misses_when_panned_above_its_row_coverage(self):
+        """A row0!=0 band must miss (not silently serve wrong rows) when the
+        new Y-range reaches ABOVE what it covers — the row0-aware extension
+        of the historical 'deeper than the band' miss, now symmetric."""
+        from sbp_studio.gui.dsp.pipeline import reslice_band
+        data, dist_km = self._full()
+        active_band = (300, 700)
+        band, _ = self._windowed_band(
+            data, dist_km, (8.0, 12.0), (100.0, 110.0),
+            active_band=active_band, y_halo=10)
+        assert band.row0 > 0
+
+        # A Y-range near the very top of the array — well above the band's
+        # own row coverage (row0..row0+rows).
+        shallow_ms = 5 * self.DT_US / 1000.0
+        assert reslice_band(band, dist_km, (9.0, 11.0), (0.0, shallow_ms),
+                            max_cols=100000, data_version=7,
+                            pipeline_sig=("agc",)) is None
+
+    def test_reslice_matches_direct_extraction(self):
+        from sbp_studio.gui.dsp.pipeline import reslice_band
+        data, dist_km = self._full()
+        # Band built around 8-12 km; pan to 9-11 km (well inside the margin).
+        band = self._band(data, dist_km, (8.0, 12.0), (50.0, 200.0))
+        xr, yr = (9.0, 11.0), (60.0, 180.0)
+
+        # Direct extraction of the SAME viewport from source (identity DSP).
+        win_d = extract_visible_window(
+            data, dist_km, t0_ms=0.0, dt_us=self.DT_US,
+            x_range=xr, y_range=yr, trace_halo=4, full_depth=True, max_cols=100000)
+        visible_d = win_d.crop_visible(win_d.sub)
+
+        win_r = reslice_band(band, dist_km, xr, yr,
+                             max_cols=100000, data_version=7, pipeline_sig=("agc",))
+        assert win_r is not None
+        visible_r = win_r.crop_visible(band.processed)
+        np.testing.assert_array_equal(visible_r, visible_d)
+        # Render extent must match too (so the image lands at the same km/ms).
+        assert (win_r.c_vis0, win_r.c_vis1) == (win_d.c_vis0, win_d.c_vis1)
+        assert (win_r.s0, win_r.s1) == (win_d.s0, win_d.s1)
+
+    def test_miss_on_stale_data_version(self):
+        from sbp_studio.gui.dsp.pipeline import reslice_band
+        data, dist_km = self._full()
+        band = self._band(data, dist_km, (8.0, 12.0), (50.0, 200.0))
+        assert reslice_band(band, dist_km, (9.0, 11.0), (60.0, 180.0),
+                            max_cols=100000, data_version=99,
+                            pipeline_sig=("agc",)) is None
+
+    def test_miss_on_pipeline_change(self):
+        from sbp_studio.gui.dsp.pipeline import reslice_band
+        data, dist_km = self._full()
+        band = self._band(data, dist_km, (8.0, 12.0), (50.0, 200.0))
+        assert reslice_band(band, dist_km, (9.0, 11.0), (60.0, 180.0),
+                            max_cols=100000, data_version=7,
+                            pipeline_sig=("agc", "fk")) is None
+
+    def test_miss_when_panned_into_halo_edge(self):
+        """A viewport reaching the band's outer halo (degraded F-K context)
+        must miss so a fresh, re-centred band is dispatched."""
+        from sbp_studio.gui.dsp.pipeline import reslice_band
+        data, dist_km = self._full()
+        band = self._band(data, dist_km, (8.0, 12.0), (50.0, 200.0), halo=4, margin=60)
+        # Pan hard left so the visible start is within the halo of band.c0.
+        dkm = dist_km[1] - dist_km[0]
+        x_left = float(dist_km[band.c0 + 1])           # 1 trace into the band
+        assert reslice_band(band, dist_km, (x_left, x_left + 2 * dkm),
+                            (60.0, 180.0), max_cols=100000, data_version=7,
+                            pipeline_sig=("agc",)) is None
+
+    def test_miss_when_zoomed_out_past_cap(self):
+        from sbp_studio.gui.dsp.pipeline import reslice_band
+        data, dist_km = self._full()
+        band = self._band(data, dist_km, (5.0, 15.0), (50.0, 200.0), margin=80)
+        # A wide viewport whose visible column count exceeds a tiny cap.
+        assert reslice_band(band, dist_km, (6.0, 14.0), (60.0, 180.0),
+                            max_cols=10, data_version=7,
+                            pipeline_sig=("agc",)) is None
+
+    def test_miss_when_zoomed_deeper_than_band(self):
+        """A band trimmed by active_ns (shallower than the data) must MISS when
+        the viewport reaches below that processed depth — so a deeper band is
+        dispatched. (A FULL-depth band, by contrast, can serve any depth: the
+        data_ns clamp turns the +1 Y overshoot into a hit, not a miss.)"""
+        from sbp_studio.gui.dsp.pipeline import reslice_band
+        data, dist_km = self._full()
+        ns = data.shape[0]                                  # 1000
+        band = self._band(data, dist_km, (8.0, 12.0), (10.0, 30.0), active_ns=200)
+        assert band.processed.shape[0] == 200               # band trimmed shallow
+        # View a time band well below row 200 but still within the data (ns=1000).
+        deep_ms = 600 * self.DT_US / 1000.0                 # ~row 600
+        assert reslice_band(band, dist_km, (9.0, 11.0), (deep_ms - 5, deep_ms),
+                            max_cols=100000, data_version=7,
+                            pipeline_sig=("agc",)) is None
+
+    def test_full_depth_band_serves_the_y_overshoot(self):
+        """The common case: a full-depth band must HIT a full-depth-Y view even
+        though s_vis1 computes to ns+1 — the data_ns clamp handles the overshoot
+        (without it, every full-depth lateral pan would needlessly re-dispatch)."""
+        from sbp_studio.gui.dsp.pipeline import reslice_band
+        data, dist_km = self._full()
+        ns = data.shape[0]
+        full_y = (0.0, ns * self.DT_US / 1000.0)            # whole depth
+        band = self._band(data, dist_km, (8.0, 12.0), full_y)
+        assert band.processed.shape[0] == ns
+        win_r = reslice_band(band, dist_km, (9.0, 11.0), full_y,
+                             max_cols=100000, data_version=7, pipeline_sig=("agc",))
+        assert win_r is not None
+        assert win_r.crop_visible(band.processed).shape[0] == ns
+
 
 # ── 4. PIPELINE: row decimation + effective-dt (preview perf fix) ────────────────
 
@@ -1333,6 +1698,64 @@ class TestExportFilter:
         assert len(calls) > 1   # actually went through multiple blocks
 
 
+class TestApplyPipelineToSource:
+    """Phase 7: apply_pipeline_to_source — the generalised engine behind
+    apply_pipeline_to_matrix, reading column blocks via MatrixSource.
+    read_columns instead of slicing a pre-built ndarray. The decisive proof
+    is that it runs DIRECTLY against a real (segmented) ProfileChain and
+    reproduces apply_pipeline_to_matrix's result exactly, byte for byte —
+    without ever calling load_chain_traces / building the monolithic array."""
+
+    DT_US = 200
+
+    def _chain(self, chain_pair):
+        from sbp_studio.core import load_profile
+        from sbp_studio.core.model import ProfileChain
+        path1, path2 = chain_pair
+        return ProfileChain([load_profile(path1), load_profile(path2)])
+
+    def test_matches_apply_pipeline_to_matrix_full_memory_path(self, chain_pair):
+        from sbp_studio.gui.dsp.export_filter import (
+            apply_pipeline_to_matrix, apply_pipeline_to_source,
+        )
+        ch = self._chain(chain_pair)
+        node_cfg = [("agc", {"win_ms": 20.0})]
+
+        out_source = apply_pipeline_to_source(
+            ch, ch.ns, ch.n_traces, node_cfg, ch.dt_us, mem_budget_gb=10.0)
+        assert ch.data is None   # never materialised the whole chain
+
+        ch.load_chain_traces()   # the legacy reference path, for comparison only
+        out_matrix = apply_pipeline_to_matrix(
+            ch.data, node_cfg, ch.dt_us, mem_budget_gb=10.0)
+        np.testing.assert_array_equal(out_source, out_matrix)
+
+    def test_matches_apply_pipeline_to_matrix_block_based_path(self, chain_pair):
+        """Same equivalence, forced through the chunked fallback — proves
+        read_columns-driven blocks reproduce the monolithic-array blocks."""
+        from sbp_studio.gui.dsp.export_filter import (
+            apply_pipeline_to_matrix, apply_pipeline_to_source,
+        )
+        ch = self._chain(chain_pair)
+        node_cfg = [("agc", {"win_ms": 20.0})]
+
+        out_source = apply_pipeline_to_source(
+            ch, ch.ns, ch.n_traces, node_cfg, ch.dt_us, mem_budget_gb=1e-9)
+        assert ch.data is None
+
+        ch.load_chain_traces()
+        out_matrix = apply_pipeline_to_matrix(
+            ch.data, node_cfg, ch.dt_us, mem_budget_gb=1e-9)
+        np.testing.assert_array_equal(out_source, out_matrix)
+
+    def test_empty_node_cfg_reads_but_does_not_process(self, chain_pair):
+        from sbp_studio.gui.dsp.export_filter import apply_pipeline_to_source
+        ch = self._chain(chain_pair)
+        out = apply_pipeline_to_source(ch, ch.ns, ch.n_traces, [], ch.dt_us)
+        ch.load_chain_traces()
+        np.testing.assert_array_equal(out, ch.data)
+
+
 # ── 5. PHASE 3: migrated nodes wrap the core math exactly ───────────────────────
 
 class TestNodeMigration:
@@ -1375,6 +1798,27 @@ class TestNodeMigration:
         out = PresetNode({"preset": "envelope"}).apply(d, self._ctx())
         np.testing.assert_array_equal(out, apply_filter_preset(d, "envelope", self.DT_US))
 
+    def test_preset_node_threads_ctx_preview_into_fast_flag(self):
+        """PresetNode._apply must pass ctx.preview straight through as
+        apply_filter_preset's fast= argument — the wiring the live preview
+        relies on to get the Phase-2 precision-tax saving (see
+        DSPContext.preview's docstring); export/CLI's ctx.preview defaults
+        False so they are never affected."""
+        from sbp_studio.gui.dsp import DSPContext, PresetNode
+        d = self._data()
+        node = PresetNode({"preset": "sobel_v"})
+
+        ctx_export = DSPContext(dt_us=self.DT_US, ns=400, n_traces=80)
+        assert ctx_export.preview is False
+        out_export = node.apply(d, ctx_export)
+
+        ctx_preview = DSPContext(dt_us=self.DT_US, ns=400, n_traces=80, preview=True)
+        out_preview = node.apply(d, ctx_preview)
+
+        from sbp_studio.core import apply_filter_preset
+        np.testing.assert_array_equal(out_export, apply_filter_preset(d, "sobel_v", self.DT_US, fast=False))
+        np.testing.assert_array_equal(out_preview, apply_filter_preset(d, "sobel_v", self.DT_US, fast=True))
+
     def test_delay_alignment_is_static_not_a_node(self):
         """Delay alignment is a STATIC geometry correction — it must NOT be a
         movable pipeline node (the controller/export apply core directly)."""
@@ -1411,6 +1855,89 @@ class TestNodeMigration:
                         "median_filter", "bilateral_filter", "svd_filter", "tvg", "agc",
                         "spherical_divergence", "log_compress", "clahe", "despike"}
         assert "align" not in keys
+
+
+class TestGlobalStatsFlag:
+    """DSPNode.GLOBAL_STATS — the safety net for Strategy B's vertical
+    windowing (preview.py): True ONLY for nodes whose output depends on the
+    ENTIRE window given (PredictiveDeconNode's autocorrelation-derived
+    coefficients; LogCompressionNode/CLAHENode's max(abs(data)) normalisation),
+    False for everything else (genuinely LOCAL, halo-bounded nodes)."""
+
+    def test_default_is_false(self):
+        from sbp_studio.gui.dsp.nodes import DSPNode
+
+        class _Probe(DSPNode):
+            KEY = "probe"
+
+            def _apply(self, data, ctx):
+                return data
+        assert _Probe().GLOBAL_STATS is False
+
+    def test_true_only_on_decon_logcompress_and_clahe(self):
+        from sbp_studio.gui.dsp import NODE_REGISTRY
+        global_stats_keys = {c.KEY for c in NODE_REGISTRY if c.GLOBAL_STATS}
+        assert global_stats_keys == {"decon", "log_compress", "clahe"}
+
+    def test_local_filters_are_not_global_stats(self):
+        """A representative spot-check of genuinely LOCAL nodes — each is
+        either a sliding/local-window op (AGC, bandpass, F-K vertically) or
+        a pointwise/per-trace op, never global across the whole window."""
+        from sbp_studio.gui.dsp import (
+            AGCNode, BandpassNode, TVGNode, FKFilterNode, MedianFilterNode,
+            DespikeNode, NotchNode,
+        )
+        for cls in (AGCNode, BandpassNode, TVGNode, FKFilterNode,
+                    MedianFilterNode, DespikeNode, NotchNode):
+            assert cls.GLOBAL_STATS is False, cls.KEY
+
+
+class TestNodeFiniteGuard:
+    """DSPNode.apply's NaN/Inf sanitisation, now allocation-free (it tests the
+    float64 grand sum's finiteness instead of materialising a full bool array
+    per node — see DSPNode.apply). The guard's CONTRACT must be unchanged:
+    non-finite input is scrubbed before the node's DSP, clean input passes
+    through untouched (no false-positive nan_to_num)."""
+
+    def _ctx(self):
+        from sbp_studio.gui.dsp import DSPContext
+        return DSPContext(dt_us=250, ns=64, n_traces=8)
+
+    def _probe(self):
+        from sbp_studio.gui.dsp.nodes import DSPNode
+
+        class _Probe(DSPNode):
+            KEY = "probe"
+            seen = None
+
+            def _apply(self, data, ctx):
+                type(self).seen = data
+                return data
+        return _Probe()
+
+    def test_nan_is_scrubbed_before_dsp(self):
+        node = self._probe()
+        d = np.ones((64, 8), dtype=np.float32)
+        d[10, 3] = np.nan
+        node.apply(d, self._ctx())
+        assert np.all(np.isfinite(node.seen))      # the node never saw the NaN
+        assert node.seen[10, 3] == 0.0
+
+    def test_posinf_and_neginf_are_scrubbed(self):
+        node = self._probe()
+        d = np.ones((64, 8), dtype=np.float32)
+        d[0, 0] = np.inf
+        d[1, 1] = -np.inf
+        node.apply(d, self._ctx())
+        assert np.all(np.isfinite(node.seen))
+
+    def test_clean_input_passes_through_without_copy(self):
+        """A finite array must NOT be needlessly nan_to_num-copied (the grand
+        sum stays finite) — the node receives the SAME array object."""
+        node = self._probe()
+        d = np.full((64, 8), 3.0, dtype=np.float32)
+        node.apply(d, self._ctx())
+        assert node.seen is d                       # no defensive copy
 
 
 class TestSelfDocumentingTooltips:
@@ -1838,7 +2365,10 @@ class TestNavigationMap:
         sv.visible_traces_changed.connect(lambda a, b: mv_traces.append((a, b)))
         sv.set_distance_axis(dist)
         # Scroll to the far edge: ViewBox right edge == the profile's max distance.
+        # visible_traces_changed is now throttled (see _queue_visible_traces), so
+        # drain the pending emit explicitly to read the resolved window here.
         sv._emit_visible_traces(((dist[0], dist[-1]), (0.0, 100.0)))
+        sv._flush_visible_traces()
         t0, t1 = mv_traces[-1]
         assert t0 == 0 and t1 == n          # reaches the TRUE end despite plateaus
         # A window covering the right 25% by DISTANCE: the last in-view trace is
@@ -1846,6 +2376,7 @@ class TestNavigationMap:
         # captures the whole plateau where searchsorted would stop at its start.
         d0, d1 = float(dist[0]), float(dist[-1])
         sv._emit_visible_traces(((d0 + 0.75 * (d1 - d0), d1), (0.0, 100.0)))
+        sv._flush_visible_traces()
         t0, t1 = mv_traces[-1]
         # Right-quarter distance window: start at the first trace ≥ 0.75·extent,
         # end exactly at the last trace (the frozen-end plateau is fully included).
@@ -2190,10 +2721,13 @@ class TestTrackCleaning:
         sv = SeismicView()
         sv.visible_traces_changed.connect(lambda a, b: got.append((a, b)))
         sv.set_distance_axis(dist)
+        # visible_traces_changed is throttled now — flush to read each resolution.
         sv._emit_visible_traces(((dist[0], dist[-1]), (0.0, 1.0)))
+        sv._flush_visible_traces()
         assert got[-1] == (0, n)                    # far edge reaches the true end
         # A window up to a mid distance maps to searchsorted-right of that value.
         sv._emit_visible_traces(((0.0, 6.0), (0.0, 1.0)))
+        sv._flush_visible_traces()
         t0, t1 = got[-1]
         assert t0 == 0 and t1 == int(np.searchsorted(dist, 6.0, side="right"))
 
@@ -2495,6 +3029,7 @@ class TestColorPumpingFix:
                 super().__init__()
                 self._range = ((0.0, 10.0), (-1000.0, 1000.0))
                 self.shown: list = []
+                self.levels_only: list = []   # set_levels_only() call log
 
             def enable_preview(self, *_a, **_k): pass
             def current_view_range(self): return self._range
@@ -2510,8 +3045,14 @@ class TestColorPumpingFix:
                              vmin=0.0, fit=False, c0=None, c1=None):
                 self.shown.append(dict(vmax=float(vmax), vmin=float(vmin)))
 
+            def set_levels_only(self, vmax, vmin=0.0):
+                self.levels_only.append(dict(vmax=float(vmax), vmin=float(vmin)))
+
         class _FakePanel(QObject):
             pipeline_changed = pyqtSignal()
+            params_changed = pyqtSignal()
+            interactionStarted = pyqtSignal()
+            interactionEnded = pyqtSignal()
 
             def __init__(self):
                 super().__init__()
@@ -2578,6 +3119,59 @@ class TestColorPumpingFix:
         # A lower percentile cutoff must shrink the ceiling — proves the
         # slider's effect is real and derives from the (now global) sample.
         assert vmax_loose < vmax_tight
+
+    def test_clip_changed_never_dispatches_a_worker_or_refresh(self):
+        """Phase 3: the Clip slider's dedicated path (PreviewController.
+        clip_changed) must update levels WITHOUT a PipelineWorker round
+        trip and WITHOUT re-rendering the raster — only
+        SeismicView.set_levels_only, instantly."""
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj, clip=99.6)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        shown_before = len(view.shown)
+
+        disp["clip"] = 80.0
+        pc.clip_changed()
+
+        assert pc._worker is None                # no worker ever dispatched
+        assert len(view.shown) == shown_before    # raster never re-rendered
+        assert len(view.levels_only) == 1         # exactly one instant level update
+
+    def test_clip_changed_matches_a_full_recompute_for_the_same_clip(self):
+        """Correctness: the fast path's result must be numerically IDENTICAL
+        to what a full _compute_global_levels recompute would give for the
+        same clip — it's reusing the exact same cached sample arrays, just
+        skipping the (already-known) DSP pass."""
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj, clip=99.6)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+
+        disp["clip"] = 85.0
+        pc.clip_changed()
+        fast_vmax = pc._global_vmax
+
+        disp["clip"] = 85.0
+        pc.display_changed()                     # forces a full worker recompute
+        self._run_to_completion(app, pc)
+        full_vmax = pc._global_vmax
+
+        assert fast_vmax == pytest.approx(full_vmax)
+
+    def test_clip_changed_is_a_safe_noop_before_any_render(self):
+        """No samples cached yet (e.g. clip touched before the first frame
+        ever rendered) — must not crash, just no-op until the real refresh
+        catches up."""
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj, clip=99.6)
+        pc._has_source = True   # simulate "has a source" without ever refreshing
+        disp["clip"] = 50.0
+        pc.clip_changed()       # must not raise
+        assert view.levels_only == []
 
     def test_clip_unchanged_pan_does_not_recompute_global_levels(self):
         """A pure pan/zoom must be a no-op for the global-levels cache (the
@@ -2764,9 +3358,10 @@ class TestColorPumpingFix:
         app = self._qt()
         obj = self._profile(ns=50, n_traces=2000)
         pc, view, panel, disp = self._controller(obj)
-        vmax_proc, vmax_raw = pc._compute_global_levels(
+        vmax_proc, vmax_raw, raw_sample, processed_sample = pc._compute_global_levels(
             obj.data, obj.dt_us, 99.6)
         assert vmax_proc == vmax_raw == pytest.approx(vmax_raw)  # no nodes → equal
+        assert processed_sample is None        # no nodes → no separate processed sample
         # Internal sanity: starts span close to the full trace range, not a
         # single block stuck at column 0.
         from sbp_studio.gui.dsp.preview import (
@@ -2836,6 +3431,654 @@ class TestColorPumpingFix:
         vmax_zoomed = view.shown[-1]["vmax"]
 
         assert vmax_zoomed == pytest.approx(vmax_full, rel=1e-9)
+
+
+class TestPanMarginCache:
+    """End-to-end pan-margin cache (preview.py): a lateral pan whose viewport
+    stays inside the processed band's margin is served by re-slicing on the
+    GUI thread — NO worker dispatch, NO pipeline re-run — the decisive fix for
+    zoomed-in lateral panning on deep cadenas. Reuses TestColorPumpingFix's
+    _FakeView harness; a probe node counts how often the DSP chain actually
+    runs."""
+
+    _qt = TestColorPumpingFix._qt
+    _controller = TestColorPumpingFix._controller
+    _run_to_completion = TestColorPumpingFix._run_to_completion
+
+    def _wide_profile(self, ns=300, n_traces=2000, dt_us=200):
+        from types import SimpleNamespace
+        rng = np.random.default_rng(2)
+        data = rng.normal(0.0, 10.0, size=(ns, n_traces)).astype(np.float32)
+        dist_km = np.linspace(0.0, 40.0, n_traces)
+        return SimpleNamespace(
+            data=data, dist_km=dist_km, dt_us=dt_us, ns=ns, n_traces=n_traces,
+            delay_ms=0.0, delays=None, min_delay=0.0, boundaries_km=(), error=None)
+
+    def _probe_pipeline(self, panel, calls):
+        from sbp_studio.gui.dsp.nodes import DSPNode
+
+        class _ProbeNode(DSPNode):
+            KEY = "probe"
+
+            def _apply(self, data, ctx):
+                calls.append(data.shape)
+                return data
+        panel.nodes.append(_ProbeNode())
+
+    def test_lateral_pan_within_margin_is_served_from_cache(self):
+        calls = []
+        app = self._qt()
+        obj = self._wide_profile()
+        pc, view, panel, disp = self._controller(obj)
+        self._probe_pipeline(panel, calls)
+        # Realistic full-depth Y-range (ns=300, dt=0.2ms → 60 ms).
+        full_y = (0.0, obj.ns * obj.dt_us / 1000.0)
+
+        pc.set_source(obj)                          # fit render (not eligible)
+        self._run_to_completion(app, pc)
+
+        # Zoom in to a sub-range → an eligible dispatch builds the margin band.
+        view._range = ((10.0, 12.0), full_y)
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        assert pc._band_cache is not None
+        n_after_build = len(calls)
+
+        # Pan right a little, staying inside the margin → re-slice, no worker.
+        view._range = ((10.3, 12.3), full_y)
+        pc._on_view_changed()
+        assert pc._worker is None                   # nothing dispatched
+        assert len(calls) == n_after_build          # pipeline NOT re-run
+
+    def test_pan_past_margin_redispatches_worker(self):
+        calls = []
+        app = self._qt()
+        obj = self._wide_profile()
+        pc, view, panel, disp = self._controller(obj)
+        self._probe_pipeline(panel, calls)
+        full_y = (0.0, obj.ns * obj.dt_us / 1000.0)
+
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        view._range = ((10.0, 12.0), full_y)
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        n_after_build = len(calls)
+
+        # Jump far away (outside the band entirely) → must dispatch a worker.
+        view._range = ((30.0, 32.0), full_y)
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        assert len(calls) > n_after_build           # pipeline re-ran on a fresh band
+
+    def test_pipeline_edit_invalidates_band_cache(self):
+        from sbp_studio.gui.dsp import AGCNode
+        calls = []
+        app = self._qt()
+        obj = self._wide_profile()
+        pc, view, panel, disp = self._controller(obj)
+        self._probe_pipeline(panel, calls)
+        full_y = (0.0, obj.ns * obj.dt_us / 1000.0)
+
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        view._range = ((10.0, 12.0), full_y)
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        assert pc._band_cache is not None
+
+        panel.nodes.append(AGCNode())               # chain content changed
+        pc._on_pipeline_changed()
+        assert pc._band_cache is None               # stale band dropped
+        self._run_to_completion(app, pc)            # drain the worker it spawned
+
+
+class TestVerticalWindowingEndToEnd:
+    """Phase-6 end-to-end (preview.py): Strategy A (active_band_for_traces —
+    top+bottom trim) and Strategy B (visible+halo windowing, gated by
+    GLOBAL_STATS) wired into _refresh, plus the margin-budget fix (use the
+    LOCAL window's depth, not the chain-wide worst case)."""
+
+    _qt = TestColorPumpingFix._qt
+    _controller = TestColorPumpingFix._controller
+
+    def _run_to_completion(self, app, pc) -> None:
+        """Override of TestColorPumpingFix's busy-spin polling: this
+        environment's scheduler can starve a background QThread under a
+        TIGHT processEvents() loop with no yield (confirmed directly —
+        QThread.wait() finishes the SAME worker in <10ms when given a
+        chance to actually run, vs. never within 2000 bare processEvents()
+        iterations). QThread.wait() is the correct, blocking way to wait for
+        a thread to finish; one extra processEvents() afterwards lets its
+        already-finished QUEUED succeeded/failed signal actually get
+        delivered to the GUI-thread slot."""
+        for _ in range(50):
+            if pc._worker is None:
+                return
+            pc._worker.wait(2000)
+            app.processEvents()
+        raise AssertionError("preview worker never completed")
+
+    def _profile_with_local_vs_chain_depth(self, ns=300, n_traces=400,
+                                           dt_us=200, shallow_hi=200,
+                                           fake_chain_hi=130_000):
+        """A synthetic source whose REAL array is modest (ns=300, n_traces=400
+        — this sandbox's QThread scheduling needs a SMALL array to reliably
+        finish within the polling budget; other passing tests in this file
+        use a similar scale) but whose REPORTED active band differs by
+        RANGE — the left half reports a shallow local band (0, shallow_hi);
+        ``active_ns_for_traces(0, n_traces)`` (the chain-wide value the
+        global-levels job legitimately wants) reports an artificially deep
+        ``fake_chain_hi`` — simulating "some OTHER segment of this cadena is
+        very deep", decoupled from this array's own real depth so the test
+        can isolate whether the margin-budget calc uses the LOCAL band
+        (correct) or the chain-wide one (the bug)."""
+        from types import SimpleNamespace
+        rng = np.random.default_rng(4)
+        data = rng.normal(0.0, 10.0, size=(ns, n_traces)).astype(np.float32)
+        dist_km = np.linspace(0.0, 80.0, n_traces)
+        half = n_traces // 2
+
+        def active_band_for_traces(c0, c1):
+            if c1 <= half:
+                return (0, shallow_hi)
+            return (0, min(ns, fake_chain_hi))
+
+        def active_ns_for_traces(c0, c1):
+            return fake_chain_hi   # the chain-wide worst case, by design
+
+        return SimpleNamespace(
+            data=data, dist_km=dist_km, dt_us=dt_us, ns=ns, n_traces=n_traces,
+            delay_ms=0.0, delays=None, min_delay=0.0, boundaries_km=(), error=None,
+            active_band_for_traces=active_band_for_traces,
+            active_ns_for_traces=active_ns_for_traces)
+
+    def test_margin_budget_uses_local_band_not_chain_wide_worst_case(self):
+        """With a GLOBAL_STATS node active (forces y_halo=None, isolating
+        the margin-budget calc from Strategy B's own row-shrinking), panning
+        within the SHALLOW half of the chain must get a GENEROUS margin —
+        one the chain-wide fake_chain_hi=130_000 value could never produce
+        (512MB / (130_000·4) ≈ 986 budget_cols, far below the visible width
+        used here, which would force col_margin to 0 under the old bug)."""
+        from sbp_studio.gui.dsp import LogCompressionNode
+        app = self._qt()
+        obj = self._profile_with_local_vs_chain_depth()
+        pc, view, panel, disp = self._controller(obj)
+        panel.nodes.append(LogCompressionNode())   # GLOBAL_STATS=True
+        full_y = (0.0, obj.ns * obj.dt_us / 1000.0)
+
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        # Zoom into the SHALLOW (first) half of the chain, wide enough that
+        # the chain-wide budget (≈986 cols) could not have granted ANY margin.
+        view._range = ((5.0, 25.0), full_y)
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+
+        assert pc._band_cache is not None
+        band_width = pc._band_cache.c1 - pc._band_cache.c0
+        # The band must be substantially WIDER than the bare visible range —
+        # i.e. col_margin > 0 — something the chain-wide budget could not
+        # have produced for this visible width (it would clamp to 0).
+        dist_km = obj.dist_km
+        cvis0 = int(np.searchsorted(dist_km, 5.0))
+        cvis1 = int(np.searchsorted(dist_km, 25.0, side="right"))
+        visible_cols = cvis1 - cvis0
+        assert band_width > visible_cols + 10   # real margin granted
+
+    def test_global_stats_node_disables_strategy_b_for_its_own_phase(self):
+        """Two-pass split (Phase 9): GLOBAL_STATS nodes (Decon) run on the full
+        active band in pipeline_global; local nodes placed AFTER the last
+        GLOBAL_STATS node run on visible+halo in pipeline_local.  A node
+        immediately after Decon therefore sees FAR fewer rows than the full
+        active band — Strategy B is restored for local nodes."""
+        from sbp_studio.gui.dsp import PredictiveDeconNode
+        from sbp_studio.gui.dsp.nodes import DSPNode
+        seen_rows_global = []   # probe in pipeline_global (before/at GLOBAL_STATS)
+        seen_rows_local = []    # probe in pipeline_local (after last GLOBAL_STATS)
+
+        class _PreProbe(DSPNode):
+            KEY = "pre_probe"
+
+            def _apply(self, data, ctx):
+                seen_rows_global.append(data.shape[0])
+                return data
+
+        class _PostProbe(DSPNode):
+            KEY = "post_probe"
+
+            def _apply(self, data, ctx):
+                seen_rows_local.append(data.shape[0])
+                return data
+
+        app = self._qt()
+        obj = self._profile_with_local_vs_chain_depth(
+            ns=2000, shallow_hi=1500, fake_chain_hi=1800)
+        pc, view, panel, disp = self._controller(obj)
+        # pipeline_global = [_PreProbe, PredictiveDeconNode]
+        # pipeline_local  = [_PostProbe]
+        panel.nodes.append(_PreProbe())
+        panel.nodes.append(PredictiveDeconNode())   # GLOBAL_STATS=True
+        panel.nodes.append(_PostProbe())
+
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        # Zoom into a NARROW Y-slice within the shallow half's column range.
+        view._range = ((5.0, 6.0), (50.0, 60.0))
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        # Global phase: _PreProbe and Decon see the full active band.
+        assert seen_rows_global[-1] >= 1500
+        # Local phase: _PostProbe sees only visible+halo — stacking multiplier broken.
+        assert seen_rows_local[-1] < 1500
+
+    def test_no_global_stats_node_enables_strategy_b_windowing(self):
+        """Without a GLOBAL_STATS node, the SAME narrow Y-slice on the SAME
+        source must process far fewer rows than the active band — Strategy
+        B actually engaging, not just being available."""
+        from sbp_studio.gui.dsp.nodes import DSPNode
+        seen_rows = []
+
+        class _ProbeNode(DSPNode):
+            KEY = "probe"
+
+            def _apply(self, data, ctx):
+                seen_rows.append(data.shape[0])
+                return data
+
+        app = self._qt()
+        obj = self._profile_with_local_vs_chain_depth(
+            ns=2000, shallow_hi=1500, fake_chain_hi=1800)
+        pc, view, panel, disp = self._controller(obj)
+        panel.nodes.append(_ProbeNode())            # no GLOBAL_STATS node
+        full_y = (0.0, obj.ns * obj.dt_us / 1000.0)
+
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        view._range = ((5.0, 6.0), (50.0, 60.0))
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        assert seen_rows[-1] < 1500   # Strategy B narrowed it well below the band
+
+
+class TestInteractiveLODAndCancellation:
+    """Dynamic column capping (Interactive LOD) and cooperative worker
+    cancellation — both mask the raw compute cost of full_depth=True DSP
+    nodes during an active param-slider drag without ever touching row
+    extraction (which must stay byte-faithful for AGC/Decon correctness;
+    see TestColorPumpingFix above, whose helpers are duplicated here
+    rather than subclassed — subclassing would re-collect every one of
+    its tests under this class too)."""
+
+    _qt = TestColorPumpingFix._qt
+    _profile = TestColorPumpingFix._profile
+    _controller = TestColorPumpingFix._controller
+    _run_to_completion = TestColorPumpingFix._run_to_completion
+
+    def test_lod_active_shrinks_extracted_column_count(self):
+        """While a param slider is being dragged (_lod_active=True), the
+        worker must see far fewer traces than a normal refresh — proving
+        the slashed extraction width (LOD_SCALE) actually reaches
+        extract_visible_window, not just a no-op flag."""
+        from sbp_studio.gui.dsp.nodes import DSPNode
+
+        seen_cols = []
+
+        class _ProbeNode(DSPNode):
+            KEY = "probe"
+
+            def _apply(self, data, ctx):
+                seen_cols.append(data.shape[1])
+                return data
+
+        app = self._qt()
+        # n_traces well above MAX_PREVIEW_COLS (4000) so the cap actually bites.
+        obj = self._profile(ns=50, n_traces=6000)
+        pc, view, panel, disp = self._controller(obj)
+        panel.nodes.append(_ProbeNode())
+        view._range = ((0.0, 10.0), (-1000.0, 1000.0))   # whole-section viewport
+
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        # seen_cols[0] is the WINDOW pass; _compute_global_levels (bundled
+        # into the same worker run on a cache miss) appends its own,
+        # much-smaller block-sized calls to this same node right after.
+        full_cols = seen_cols[0]
+
+        seen_cols.clear()
+        pc._on_interaction_started()
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        lod_cols = seen_cols[0]
+
+        assert lod_cols < full_cols
+        assert pc._lod_active is True
+
+    def test_interaction_ended_restores_full_resolution_and_refreshes(self):
+        """Release must both clear _lod_active AND fire one final refresh
+        immediately (not wait for the param's own debounce) — back to the
+        same column count as a normal, non-dragging refresh."""
+        from sbp_studio.gui.dsp.nodes import DSPNode
+
+        seen_cols = []
+
+        class _ProbeNode(DSPNode):
+            KEY = "probe"
+
+            def _apply(self, data, ctx):
+                seen_cols.append(data.shape[1])
+                return data
+
+        app = self._qt()
+        obj = self._profile(ns=50, n_traces=6000)
+        pc, view, panel, disp = self._controller(obj)
+        panel.nodes.append(_ProbeNode())
+        view._range = ((0.0, 10.0), (-1000.0, 1000.0))
+
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        full_cols = seen_cols[0]   # window pass — see the sibling test's note
+
+        seen_cols.clear()
+        pc._on_interaction_started()
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        assert seen_cols[0] < full_cols
+
+        seen_cols.clear()
+        pc._on_interaction_ended()
+        self._run_to_completion(app, pc)
+        assert pc._lod_active is False
+        assert seen_cols[0] == full_cols
+
+    def test_panel_interaction_signals_drive_lod_state(self):
+        """The wiring from PipelinePanel's forwarded signals into the
+        controller's _lod_active flag (connected in __init__) — exercised
+        via the signals themselves, not by calling the slots directly."""
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+
+        assert pc._lod_active is False
+        panel.interactionStarted.emit()
+        assert pc._lod_active is True
+        panel.interactionEnded.emit()
+        assert pc._lod_active is False
+        # interactionEnded triggers a final _refresh -> a real QThread starts;
+        # drain it before the test/interpreter exits (an undrained QThread
+        # crashes Qt at teardown — see core/processing.py's _parallel_apply
+        # note on ThreadPoolExecutor threads being a DIFFERENT, unrelated
+        # mechanism from this GUI-thread worker).
+        self._run_to_completion(app, pc)
+
+    def test_superseding_refresh_cancels_the_busy_worker_token(self):
+        """A second trigger arriving while a worker is still running must
+        cancel that SAME (old) token before being coalesced into
+        ``_pending`` — proving the busy-worker branch in _refresh actually
+        reaches the in-flight token rather than just dropping the request."""
+        app = self._qt()
+        obj = self._profile(ns=50, n_traces=2000)
+        pc, view, panel, disp = self._controller(obj)
+
+        pc.set_source(obj)
+        # Don't pump the event loop: the worker is still "running" per
+        # pc._worker.isRunning() for at least a moment after start().
+        old_token = pc._cancel_token
+        assert old_token is not None
+
+        pc._on_view_changed()   # supersedes the still-in-flight worker
+
+        assert old_token.cancelled() is True
+        self._run_to_completion(app, pc)
+
+    def test_cancelled_worker_run_does_not_log_as_an_error(self):
+        """PreviewController._on_pipeline_failed must recognise the
+        CANCELLED_MESSAGE sentinel and skip the error log for an
+        intentional abort — only a genuine DSP exception should alarm."""
+        from sbp_studio.gui.dsp.preview_worker import CANCELLED_MESSAGE
+
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+
+        logged = []
+        pc._on_pipeline_failed("some-token", CANCELLED_MESSAGE)
+        assert pc._worker is None   # handled cleanly, no crash
+
+
+class TestTrueDepthCapEndToEnd:
+    """Phase 4 (preview.py + pipeline.py): when the source exposes
+    active_ns_for_traces (SegyProfile/ProfileChain), the live preview's
+    full_depth=True window must skip rows below the file's real listening-
+    window depth instead of always processing the nominal ns — see
+    extract_visible_window's active_ns_lookup. Reuses TestColorPumpingFix's
+    harness; the SimpleNamespace _profile() fixture has NO active_ns_for_traces
+    attribute by default, so the duck-typed fallback (full ns, unchanged
+    behaviour) is exercised by every OTHER test in this file."""
+
+    _qt = TestColorPumpingFix._qt
+    _controller = TestColorPumpingFix._controller
+    _run_to_completion = TestColorPumpingFix._run_to_completion
+
+    def _profile_with_shallow_signal(self, ns=1000, n_traces=300, dt_us=200,
+                                     real_depth=100, active_ns=150):
+        """A synthetic source whose real signal lives only in the first
+        ``real_depth`` rows (zeros below) and which reports ``active_ns`` —
+        mirrors a marine survey file recorded with a campaign-wide fixed
+        listening window far deeper than this particular segment's seabed."""
+        from types import SimpleNamespace
+        rng = np.random.default_rng(1)
+        data = np.zeros((ns, n_traces), dtype=np.float32)
+        data[:real_depth, :] = rng.normal(0.0, 10.0, size=(real_depth, n_traces))
+        dist_km = np.linspace(0.0, 10.0, n_traces)
+        return SimpleNamespace(
+            data=data, dist_km=dist_km, dt_us=dt_us, ns=ns, n_traces=n_traces,
+            delay_ms=0.0, delays=None, min_delay=0.0, boundaries_km=(), error=None,
+            active_ns_for_traces=lambda c0, c1: active_ns)
+
+    def test_cap_shrinks_rows_seen_by_the_pipeline(self):
+        """set_source's initial render is fit=True (the WHOLE section, every
+        row, by definition — the cap correctly does NOT shrink that). The
+        cap's effect shows on a SUBSEQUENT pan/zoom into a Y window that
+        sits within the real-signal zone, well above active_ns."""
+        from sbp_studio.gui.dsp.nodes import DSPNode
+        seen_rows = []
+
+        class _ProbeNode(DSPNode):
+            KEY = "probe"
+
+            def _apply(self, data, ctx):
+                seen_rows.append(data.shape[0])
+                return data
+
+        app = self._qt()
+        obj = self._profile_with_shallow_signal()
+        pc, view, panel, disp = self._controller(obj)
+        panel.nodes.append(_ProbeNode())
+
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+
+        dt_ms = obj.dt_us / 1000.0
+        view._range = ((0.0, 10.0), (0.0, 50 * dt_ms))   # rows ~0-50, inside active_ns
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        assert seen_rows[-1] == 150
+        assert seen_rows[-1] < obj.ns
+
+    def test_cap_never_truncates_a_deliberate_deep_y_zoom(self):
+        """If the user zooms into rows beyond the reported active depth, the
+        pipeline must still see (at least) down to that Y-range — the
+        max(active_ns, s_vis1) guard in extract_visible_window."""
+        from sbp_studio.gui.dsp.nodes import DSPNode
+        seen_rows = []
+
+        class _ProbeNode(DSPNode):
+            KEY = "probe"
+
+            def _apply(self, data, ctx):
+                seen_rows.append(data.shape[0])
+                return data
+
+        app = self._qt()
+        obj = self._profile_with_shallow_signal()
+        pc, view, panel, disp = self._controller(obj)
+        panel.nodes.append(_ProbeNode())
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+
+        # Pan/zoom the Y-range to deep rows (~700-900 of 1000), well past the
+        # reported active_ns=150 — a real DSP pass must still COVER them.
+        # Phase-6 update: with Strategy B's vertical windowing, the extracted
+        # sub-array no longer necessarily starts at absolute row 0 (sh0 can
+        # be > 0 now), so its row COUNT alone is no longer comparable to the
+        # absolute Y-range — the correct invariant is that it's AT LEAST tall
+        # enough to span what's visible (s_vis1 - s_vis0), never truncated
+        # below that no matter how the windowing strategy shrinks sh0/sh1.
+        dt_ms = obj.dt_us / 1000.0
+        view._range = ((0.0, 10.0), (700 * dt_ms, 900 * dt_ms))
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        s_vis0 = 700
+        s_vis1 = 901   # ceil((900*dt_ms - 0) / dt_ms) + 1, matching extract_visible_window's math
+        assert seen_rows[-1] >= (s_vis1 - s_vis0)
+
+
+class TestSettleGatingAndLevelFreeze:
+    """Phase-1 perf wins (preview.py): _refresh skips the whole worker round-
+    trip when a pan/zoom resolved to the SAME column window (settle gating),
+    and LOD freezes the locked global levels mid-drag. Reuses
+    TestColorPumpingFix's _FakeView/_FakePanel harness (its _FakeView logs
+    every show_preview into ``shown``, so a render is observable as a count
+    increment)."""
+
+    _qt = TestColorPumpingFix._qt
+    _profile = TestColorPumpingFix._profile
+    _controller = TestColorPumpingFix._controller
+    _run_to_completion = TestColorPumpingFix._run_to_completion
+
+    def test_identical_window_pan_is_gated(self):
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        n_shown = len(view.shown)
+        # Same view range → same win.token → render_key matches → gated:
+        # no worker dispatched, no new image pushed.
+        pc._on_view_changed()
+        assert pc._worker is None
+        assert len(view.shown) == n_shown
+
+    def test_distinct_window_pan_is_not_gated(self):
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        n_shown = len(view.shown)
+        view._range = ((0.0, 2.5), (-1000.0, 1000.0))   # pan to a narrower span
+        pc._on_view_changed()
+        self._run_to_completion(app, pc)
+        assert len(view.shown) == n_shown + 1
+
+    def test_filter_edit_same_window_is_not_gated(self):
+        """A param/node edit changes pipeline_sig, so render_key differs even
+        though the viewport (win.token) is unchanged — must NOT be gated."""
+        from sbp_studio.gui.dsp import AGCNode
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        n_shown = len(view.shown)
+        panel.nodes.append(AGCNode())
+        pc._on_pipeline_changed()
+        self._run_to_completion(app, pc)
+        assert len(view.shown) == n_shown + 1
+
+    def test_overlays_refresh_bypasses_gate(self):
+        """display_changed (cmap/FIX/boundary toggles) refreshes with
+        overlays=True, which must always re-render even when the window and
+        pipeline are unchanged — the gate only applies to pure pan/zoom."""
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        n_shown = len(view.shown)
+        pc.display_changed()
+        self._run_to_completion(app, pc)
+        assert len(view.shown) == n_shown + 1
+
+    def test_lod_active_freezes_global_levels(self):
+        """Mid-drag (_lod_active) a fresh pipeline signature must NOT trigger
+        the 5-block global-levels recompute. interactionEnded renders the
+        committed frame but KEEPS the ceiling frozen (deferred) — the real
+        recompute only happens on the LEVELS_SETTLE_MS timer (_on_levels_settle),
+        so a rapid edit→release→edit cycle never pays it per release."""
+        from sbp_studio.gui.dsp import AGCNode
+        app = self._qt()
+        obj = self._profile()
+        pc, view, panel, disp = self._controller(obj)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        key0 = pc._global_levels_key
+        vmax0 = pc._global_vmax
+
+        pc._on_interaction_started()
+        panel.nodes.append(AGCNode())
+        pc._on_pipeline_changed()            # new pipeline sig, but LOD frozen
+        self._run_to_completion(app, pc)
+        assert pc._global_levels_key == key0   # levels untouched mid-drag
+        assert pc._global_vmax == vmax0
+        assert pc._pending_levels_key is None
+
+        pc._on_interaction_ended()           # renders, but levels stay FROZEN
+        self._run_to_completion(app, pc)
+        assert pc._levels_frozen is True
+        assert pc._global_levels_key == key0   # STILL deferred, not yet recomputed
+
+        pc._on_levels_settle()               # the settle timer fires
+        self._run_to_completion(app, pc)
+        assert pc._levels_frozen is False
+        assert pc._global_levels_key != key0   # recomputed for committed config
+
+
+class TestCooperativeCancellationCore:
+    """Core-level: apply_predictive_decon must raise Cancelled promptly when
+    handed a pre-cancelled CancelToken, in BOTH the single-threaded inline
+    fallback (small array) and the ThreadPoolExecutor parallel path (large
+    array) — see core/processing.py's _parallel_apply size thresholds."""
+
+    def test_small_array_inline_path_raises_cancelled(self):
+        from sbp_studio.core import apply_predictive_decon
+        from sbp_studio.core.tasks import CancelToken, Cancelled
+
+        data = np.random.default_rng(0).normal(
+            size=(200, 8)).astype(np.float32)   # < 64 traces, < 4MB -> inline
+        token = CancelToken()
+        token.cancel()
+        with pytest.raises(Cancelled):
+            apply_predictive_decon(data, dt_us=200, op_len_ms=20.0,
+                                   gap_ms=2.0, white_noise_pct=1.0, cancel=token)
+
+    def test_large_array_parallel_path_raises_cancelled(self):
+        from sbp_studio.core import apply_predictive_decon
+        from sbp_studio.core.tasks import CancelToken, Cancelled
+
+        data = np.random.default_rng(0).normal(
+            size=(8200, 128)).astype(np.float32)  # >= 64 traces, >= 4MB -> ThreadPoolExecutor
+        assert data.nbytes >= 4 * 1024 * 1024
+        token = CancelToken()
+        token.cancel()
+        with pytest.raises(Cancelled):
+            apply_predictive_decon(data, dt_us=200, op_len_ms=20.0,
+                                   gap_ms=2.0, white_noise_pct=1.0, cancel=token)
 
 
 class TestGisReaders:
@@ -3053,6 +4296,247 @@ class TestAttributeLabelingGui:
         mv.layer_list.setCurrentItem(li)
         mv._remove_selected_layer()
         assert mv.layer_list.count() == 0   # row removed; no crash on cleanup
+
+
+class TestBasePrepWorker:
+    """PreviewController Phase 10 — off-GUI-thread disk I/O for evicted chain
+    segments.
+
+    The test doubles below simulate a ProfileChain where a LRU eviction has
+    made one segment unavailable in memory.  We verify:
+
+    * On cache MISS + columns_in_cache=False → BasePrepWorker is dispatched;
+      a render eventually completes after the worker finishes.
+    * On cache HIT (or single SegyProfile without columns_in_cache) → no
+      BasePrepWorker is ever dispatched.
+    * A structural pipeline change while BasePrepWorker is running is safely
+      deferred and replayed on worker completion.
+    """
+
+    def _qt(self):
+        from PyQt6.QtWidgets import QApplication
+        return QApplication.instance() or QApplication([])
+
+    def _chain_obj(self, ns=100, n_traces=60, slow=False):
+        """A chain-like SimpleNamespace with columns_in_cache / read_columns.
+
+        When ``slow=True``, read_columns sleeps for a moment so we can verify
+        the worker is in-flight before completion."""
+        from types import SimpleNamespace
+        import time
+        rng = np.random.default_rng(42)
+        data = rng.standard_normal((ns, n_traces)).astype(np.float32)
+        dist_km = np.linspace(0.0, 5.0, n_traces)
+
+        obj = SimpleNamespace(
+            data=data,
+            dist_km=dist_km,
+            dt_us=500,
+            ns=ns,
+            n_traces=n_traces,
+            delay_ms=0.0,
+            delays=None,
+            min_delay=0.0,
+            boundaries_km=(),
+            error=None,
+            _cache_ok=True,   # toggled to simulate eviction
+            _slow=slow,
+        )
+
+        def columns_in_cache(c0, c1, _obj=obj):
+            return _obj._cache_ok
+
+        def read_columns(c0, c1, _obj=obj):
+            if _obj._slow:
+                import time
+                time.sleep(0.05)
+            c0 = max(0, c0)
+            c1 = min(n_traces, c1)
+            return _obj.data[:, c0:c1].copy()
+
+        obj.columns_in_cache = columns_in_cache
+        obj.read_columns = read_columns
+        return obj
+
+    def _controller(self, obj):
+        from PyQt6.QtCore import QObject, pyqtSignal
+        from sbp_studio.gui.dsp.preview import PreviewController
+
+        class _FakeView(QObject):
+            view_range_changed = pyqtSignal()
+            ab_split_changed = pyqtSignal(float)
+
+            def __init__(self):
+                super().__init__()
+                self._range = ((0.0, 5.0), (-50.0, 50.0))
+                self.render_count = 0
+
+            def enable_preview(self, *_a, **_k): pass
+            def current_view_range(self): return self._range
+            def set_colormap(self, *_a, **_k): pass
+            def set_distance_axis(self, *_a, **_k): pass
+            def update_ab(self, *_a, **_k): pass
+            def disable_wiggle(self): pass
+            def set_raster_visible(self, *_a, **_k): pass
+            def set_wiggle_line_visible(self, *_a, **_k): pass
+            def set_overlays(self, **_k): pass
+            def set_levels_only(self, *_a, **_k): pass
+
+            def show_preview(self, *_a, **_k):
+                self.render_count += 1
+
+        class _FakePanel(QObject):
+            pipeline_changed = pyqtSignal()
+            params_changed = pyqtSignal()
+            interactionStarted = pyqtSignal()
+            interactionEnded = pyqtSignal()
+
+            def __init__(self):
+                super().__init__()
+                self.nodes: list = []
+
+            def active_nodes(self): return self.nodes
+
+        view = _FakeView()
+        panel = _FakePanel()
+        disp = dict(clip=99.6, cmap="Viridis", px_per_trace=20.0,
+                    align=False, ab_compare=False, amp_range="sequential")
+        pc = PreviewController(view, panel, get_source=lambda: obj,
+                               get_display=lambda: dict(disp))
+        return pc, view, panel
+
+    def _run_to_completion(self, app, pc, timeout=2000):
+        """Pump the Qt event loop until both workers are done."""
+        for _ in range(timeout):
+            if (pc._base_worker is None and pc._worker is None):
+                return
+            app.processEvents()
+        raise AssertionError("workers never completed")
+
+    def test_cache_hit_path_never_dispatches_base_worker(self):
+        """When _pc_array is warm and columns_in_cache=True, _refresh never
+        starts a BasePrepWorker — the fast direct path is taken."""
+        app = self._qt()
+        obj = self._chain_obj()
+        pc, view, _ = self._controller(obj)
+
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        assert view.render_count == 1
+        assert pc._base_worker is None
+
+        # Pan — cache is warm (_pc_array covers the whole chain),
+        # columns_in_cache=True → no base worker.
+        obj._cache_ok = True
+        view._range = ((1.0, 3.0), (-50.0, 50.0))
+        pc._on_view_changed()
+        assert pc._base_worker is None   # dispatched inline, no side-step
+        self._run_to_completion(app, pc)
+        assert view.render_count == 2
+
+    def test_no_columns_in_cache_method_never_dispatches_base_worker(self):
+        """A plain SegyProfile (no columns_in_cache) must never trigger the
+        base-prep path — the guard is duck-typed and falls through to the
+        direct _prepared_base call."""
+        app = self._qt()
+        from types import SimpleNamespace
+        rng = np.random.default_rng(7)
+        n, ns = 40, 80
+        data = rng.standard_normal((ns, n)).astype(np.float32)
+        obj = SimpleNamespace(
+            data=data, dist_km=np.linspace(0, 2, n), dt_us=500,
+            ns=ns, n_traces=n, delay_ms=0.0, delays=None, min_delay=0.0,
+            boundaries_km=(), error=None)
+        pc, view, _ = self._controller(obj)
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        assert view.render_count == 1
+        assert pc._base_worker is None
+
+    def test_evicted_segment_dispatches_base_worker_then_renders(self):
+        """After LRU eviction (simulate by clearing _pc_array AND returning
+        False from columns_in_cache), _refresh must dispatch BasePrepWorker
+        and eventually produce a render on completion."""
+        app = self._qt()
+        obj = self._chain_obj()
+        pc, view, _ = self._controller(obj)
+
+        # Initial render fills _pc_array for the whole-chain fit.
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+        renders_before = view.render_count
+
+        # Simulate LRU eviction: clear the prepared-base cache and tell the
+        # chain that the segment is no longer in RAM.
+        pc._pc_array = None
+        obj._cache_ok = False
+
+        # Pan to a sub-range.
+        view._range = ((1.0, 3.0), (-50.0, 50.0))
+        pc._on_view_changed()
+
+        # BasePrepWorker must have been dispatched.
+        assert pc._base_worker is not None
+
+        # Run until both workers finish.
+        self._run_to_completion(app, pc)
+
+        # A new render must have occurred after the worker chain completed.
+        assert view.render_count > renders_before
+        assert pc._base_worker is None
+
+    def test_pending_base_ctx_coalesces_multiple_pans_during_warm(self):
+        """While BasePrepWorker is in flight, repeated pans update
+        _pending_base_ctx to the LATEST viewport — only one render fires on
+        completion (the stale intermediate positions are discarded)."""
+        app = self._qt()
+        obj = self._chain_obj(slow=True)
+        pc, view, _ = self._controller(obj)
+
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+
+        pc._pc_array = None
+        obj._cache_ok = False
+        view._range = ((0.5, 2.0), (-50.0, 50.0))
+        pc._on_view_changed()
+
+        # Worker is in-flight.  Queue two more pans — they should not spawn
+        # additional workers or raise.
+        if pc._base_worker is not None and pc._base_worker.isRunning():
+            view._range = ((1.0, 2.5), (-50.0, 50.0))
+            pc._on_view_changed()
+            view._range = ((1.5, 3.0), (-50.0, 50.0))
+            pc._on_view_changed()
+
+        renders_before = view.render_count
+        self._run_to_completion(app, pc)
+        # Exactly one new render from the coalesced replay.
+        assert view.render_count == renders_before + 1
+
+    def test_structural_change_while_base_worker_running_is_deferred(self):
+        """A pipeline_changed while BasePrepWorker is in-flight must be
+        deferred (_pending_sync=True) and replayed when the worker finishes —
+        never race against it."""
+        app = self._qt()
+        obj = self._chain_obj(slow=True)
+        pc, view, panel = self._controller(obj)
+
+        pc.set_source(obj)
+        self._run_to_completion(app, pc)
+
+        pc._pc_array = None
+        obj._cache_ok = False
+        view._range = ((0.5, 2.5), (-50.0, 50.0))
+        pc._on_view_changed()
+
+        if pc._base_worker is not None and pc._base_worker.isRunning():
+            panel.pipeline_changed.emit()
+            assert pc._pending_sync is True, \
+                "pipeline_changed while _base_worker running must set _pending_sync"
+
+        self._run_to_completion(app, pc)
+        assert pc._pending_sync is False   # dispatched + cleared
 
 
 if __name__ == "__main__":

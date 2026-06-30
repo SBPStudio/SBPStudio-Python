@@ -108,3 +108,241 @@ class TestProfileChainConcat:
         sd1, sd2 = load_profile(path1), load_profile(path2)
         ch = ProfileChain([sd1, sd2])
         assert len(ch.boundaries_km) == 1   # one boundary for 2 profiles
+
+    def test_load_chain_traces_clip_p99_is_max_of_per_file_values(self, chain_pair):
+        """Phase 7: clip_p99 is now the MAX of the already-computed per-file
+        values (never an underestimate, same 'safe union' philosophy as
+        active_band_for_traces) instead of a true whole-array percentile —
+        clip_p99 is metadata only (no DSP/display-stability path reads it),
+        so this approximation is a deliberate, documented trade for skipping
+        the O(ns*total_traces) full-array np.abs+percentile pass."""
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch = ProfileChain([sd1, sd2])
+        ch.load_chain_traces()
+        assert ch.clip_p99 == max(sd1.clip_p99, sd2.clip_p99)
+
+
+class TestReadColumns:
+    """ProfileChain.read_columns — the segmented alternative to
+    load_chain_traces. NEVER builds/touches the whole-chain self.data; reads
+    only the (typically 1, rarely a handful at a seam) segment(s) the
+    requested column range actually overlaps."""
+
+    def test_never_touches_chain_data(self, chain_pair):
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch = ProfileChain([sd1, sd2])
+        ch.read_columns(0, sd1.n_traces)
+        assert ch.data is None   # the monolithic array was never built
+
+    def test_range_within_a_single_segment_matches_that_profiles_data(self, chain_pair):
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch = ProfileChain([sd1, sd2])
+        out = ch.read_columns(0, sd1.n_traces)
+        np.testing.assert_array_equal(out, sd1.data)
+
+        out2 = ch.read_columns(sd1.n_traces, sd1.n_traces + sd2.n_traces)
+        np.testing.assert_array_equal(out2, sd2.data)
+
+    def test_range_spanning_the_seam_matches_the_stitched_array(self, chain_pair):
+        """The decisive equivalence check: a read across the boundary must
+        match exactly what load_chain_traces' full concat would give for the
+        same absolute column range — proving the bounded multi-segment join
+        is correct, not just the single-segment fast path."""
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch_segmented = ProfileChain([sd1, sd2])
+        c0, c1 = sd1.n_traces - 3, sd1.n_traces + 3
+        spanning = ch_segmented.read_columns(c0, c1)
+
+        ch_full = ProfileChain([load_profile(path1), load_profile(path2)])
+        ch_full.load_chain_traces()
+        expected = ch_full.data[:, c0:c1]
+        np.testing.assert_array_equal(spanning, expected)
+        assert ch_segmented.data is None   # still never materialised
+
+    def test_reloads_an_evicted_segment_from_disk(self, chain_pair):
+        """Mirrors load_chain_traces_from_evicted_stubs — an evicted
+        constituent must be transparently re-read from disk, and the reload
+        lands in THAT PROFILE's own .data slot (the same object AppState's
+        per-profile LRU manages), not a separate chain-level allocation."""
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        original = sd1.data.copy()
+        ch = ProfileChain([sd1, sd2])
+        sd1.data = None                          # simulate LRU eviction
+        out = ch.read_columns(0, sd1.n_traces)
+        np.testing.assert_array_equal(out, original)
+        assert sd1.data is not None              # reload landed on the profile itself
+        np.testing.assert_array_equal(sd1.data, original)
+
+    def test_out_of_range_clamps_rather_than_errors(self, chain_pair):
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch = ProfileChain([sd1, sd2])
+        total = sd1.n_traces + sd2.n_traces
+        out = ch.read_columns(-50, total + 999)
+        assert out.shape[1] == total
+
+    def test_empty_range_returns_zero_width_array(self, chain_pair):
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch = ProfileChain([sd1, sd2])
+        out = ch.read_columns(5, 5)
+        assert out.shape == (sd1.ns, 0)
+
+
+class TestSegyProfileReadColumns:
+    """SegyProfile.read_columns — the trivial single-file case, duck-typed
+    alongside ProfileChain.read_columns so GUI code can call either
+    uniformly."""
+
+    def test_matches_a_direct_slice(self, simple_segy):
+        sd = load_profile(simple_segy)
+        out = sd.read_columns(2, 5)
+        np.testing.assert_array_equal(out, sd.data[:, 2:5])
+
+    def test_reloads_when_evicted(self, simple_segy):
+        sd = load_profile(simple_segy)
+        original = sd.data.copy()
+        sd.data = None
+        out = sd.read_columns(0, sd.n_traces)
+        np.testing.assert_array_equal(out, original)
+        assert sd.data is not None
+
+    def test_clamps_out_of_range(self, simple_segy):
+        sd = load_profile(simple_segy)
+        out = sd.read_columns(-10, sd.n_traces + 500)
+        assert out.shape[1] == sd.n_traces
+
+
+class TestActiveNsForTraces:
+    """ProfileChain.active_ns_for_traces: resolves the real listening-window
+    depth (SegyProfile.active_ns) for whichever constituent file(s) overlap
+    a column range — the per-FILE granularity the live preview's true-depth
+    cap needs for a stitched cadena where one segment's real signal ends far
+    short of another's (see extract_visible_window's active_ns_lookup)."""
+
+    def _chain_with_active_ns(self, chain_pair, ns1, ns2):
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        sd1.active_ns, sd2.active_ns = ns1, ns2
+        ch = ProfileChain([sd1, sd2])
+        return ch, sd1, sd2
+
+    def test_resolves_to_the_single_overlapping_profile(self, chain_pair):
+        ch, sd1, sd2 = self._chain_with_active_ns(chain_pair, 100, 800)
+        # A range entirely within the first profile's columns.
+        assert ch.active_ns_for_traces(0, sd1.n_traces) == 100
+        # A range entirely within the second profile's columns.
+        assert ch.active_ns_for_traces(sd1.n_traces, ch.n_traces) == 800
+
+    def test_resolves_to_the_max_when_range_spans_both_profiles(self, chain_pair):
+        """The deeper of the overlapping files governs — the preview must
+        never under-cut whichever constituent needs more depth."""
+        ch, sd1, sd2 = self._chain_with_active_ns(chain_pair, 100, 800)
+        spanning = ch.active_ns_for_traces(sd1.n_traces - 1, sd1.n_traces + 1)
+        assert spanning == 800
+
+    def test_returns_none_when_an_overlapping_profile_is_unloaded(self, chain_pair):
+        """A stub (active_ns=None) in the overlapping range means 'don't
+        know' — the caller must fall back to the full ns, never guess."""
+        ch, sd1, sd2 = self._chain_with_active_ns(chain_pair, 100, None)
+        assert ch.active_ns_for_traces(0, sd1.n_traces) == 100
+        assert ch.active_ns_for_traces(sd1.n_traces, ch.n_traces) is None
+        # A range spanning both: still None, since one overlapping file is unknown.
+        assert ch.active_ns_for_traces(sd1.n_traces - 1, sd1.n_traces + 1) is None
+
+
+class TestActiveBandForTraces:
+    """ProfileChain.active_band_for_traces: the symmetric (lo, hi) extension
+    of active_ns_for_traces — Strategy A's top+bottom real-signal band,
+    resolved per overlapping constituent file the same way."""
+
+    def _chain_with_active_band(self, chain_pair, band1, band2):
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        if band1 is None:
+            sd1.active_lo = sd1.active_ns = None
+        else:
+            sd1.active_lo, sd1.active_ns = band1
+        if band2 is None:
+            sd2.active_lo = sd2.active_ns = None
+        else:
+            sd2.active_lo, sd2.active_ns = band2
+        ch = ProfileChain([sd1, sd2])
+        return ch, sd1, sd2
+
+    def test_resolves_to_the_single_overlapping_profile(self, chain_pair):
+        ch, sd1, sd2 = self._chain_with_active_band(chain_pair, (50, 100), (200, 800))
+        assert ch.active_band_for_traces(0, sd1.n_traces) == (50, 100)
+        assert ch.active_band_for_traces(sd1.n_traces, ch.n_traces) == (200, 800)
+
+    def test_spanning_range_takes_the_safe_union(self, chain_pair):
+        """The combined range must never under-cut EITHER overlapping file:
+        the SHALLOWEST top (min of the los) and the DEEPEST bottom (max of
+        the his) — the safe union of both bands."""
+        ch, sd1, sd2 = self._chain_with_active_band(chain_pair, (50, 100), (200, 800))
+        spanning = ch.active_band_for_traces(sd1.n_traces - 1, sd1.n_traces + 1)
+        assert spanning == (50, 800)
+
+    def test_returns_none_when_an_overlapping_profile_is_unloaded(self, chain_pair):
+        ch, sd1, sd2 = self._chain_with_active_band(chain_pair, (50, 100), None)
+        assert ch.active_band_for_traces(0, sd1.n_traces) == (50, 100)
+        assert ch.active_band_for_traces(sd1.n_traces, ch.n_traces) is None
+        assert ch.active_band_for_traces(sd1.n_traces - 1, sd1.n_traces + 1) is None
+
+
+class TestColumnsInCache:
+    """ProfileChain.columns_in_cache — the disk-I/O gate used by Phase 10's
+    BasePrepWorker to decide whether to dispatch off-thread before calling
+    _prepared_base."""
+
+    def test_true_when_all_segments_are_in_memory(self, chain_pair):
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch = ProfileChain([sd1, sd2])
+        assert ch.columns_in_cache(0, ch.n_traces) is True
+
+    def test_false_when_first_segment_evicted(self, chain_pair):
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch = ProfileChain([sd1, sd2])
+        sd1.data = None
+        assert ch.columns_in_cache(0, sd1.n_traces) is False
+
+    def test_false_when_second_segment_evicted(self, chain_pair):
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch = ProfileChain([sd1, sd2])
+        sd2.data = None
+        assert ch.columns_in_cache(sd1.n_traces, ch.n_traces) is False
+
+    def test_true_for_range_that_only_touches_resident_segment(self, chain_pair):
+        """sd2 evicted but the query only overlaps sd1 → True."""
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch = ProfileChain([sd1, sd2])
+        sd2.data = None
+        assert ch.columns_in_cache(0, sd1.n_traces) is True
+
+    def test_false_when_spanning_range_includes_evicted_segment(self, chain_pair):
+        """A seam-crossing query hitting the evicted sd2 → False."""
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch = ProfileChain([sd1, sd2])
+        sd2.data = None
+        assert ch.columns_in_cache(sd1.n_traces - 2, sd1.n_traces + 2) is False
+
+    def test_out_of_range_clamps_and_returns_true(self, chain_pair):
+        """Requesting a range that clamps to nothing or just the resident
+        portion must not raise and must return True."""
+        path1, path2 = chain_pair
+        sd1, sd2 = load_profile(path1), load_profile(path2)
+        ch = ProfileChain([sd1, sd2])
+        # Completely out of range — clamps to empty → no segments → True.
+        assert ch.columns_in_cache(ch.n_traces + 100, ch.n_traces + 200) is True
+        # Identical endpoints → empty range → True.
+        assert ch.columns_in_cache(5, 5) is True

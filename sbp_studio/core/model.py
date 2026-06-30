@@ -193,6 +193,21 @@ class SegyProfile:
         self.original_n_traces: int = 0
         self.n_purged:    int   = 0
         self.ns:          int   = 0
+        # Real signal band: [active_lo, active_ns) — the first/last+1 row
+        # (sample) index across all traces with amplitude above a small
+        # fraction of clip_p99, each padded by a safety margin (set by
+        # io_segy._populate_profile_from_file once ``data`` is loaded; both
+        # None for header-only stubs). Marine surveys commonly record every
+        # shot with a FIXED window sized for the deepest expected water
+        # depth, so a shallow segment's traces are mostly DEAD samples —
+        # trailing zeros below the real signal (active_ns) — and, just as
+        # often, LEADING zeros above it (active_lo): a high-res SBP system
+        # starts recording at the ping, but sub-bottom reflectors of
+        # interest don't arrive until after the water-column travel time,
+        # which can be thousands of samples in deep water. See
+        # active_band_for_traces.
+        self.active_lo:   Optional[int] = None
+        self.active_ns:   Optional[int] = None
         self.dt_us:       int   = 0
         self.dur_ms:      float = 0.0
         self.delay_ms:    int   = 0
@@ -211,6 +226,41 @@ class SegyProfile:
         wd = float(np.nanmean(self.water_depth)) if self.water_depth is not None else float("nan")
         return (f"{self.n_traces} trazas · {self.dur_ms:.0f} ms · "
                 f"{self.total_km:.1f} km · WD {wd:.0f} m")
+
+    def active_ns_for_traces(self, c0: int, c1: int) -> Optional[int]:
+        """Real listening-window depth for the trace range [c0, c1) — see
+        ``active_ns``. A single profile has only one file, so the range is
+        irrelevant; kept for a uniform duck-typed call from the live preview
+        (``ProfileChain`` below resolves a per-file value for the range)."""
+        return self.active_ns
+
+    def active_band_for_traces(self, c0: int, c1: int) -> Optional[Tuple[int, int]]:
+        """``(active_lo, active_ns)`` for the trace range [c0, c1) — the real
+        signal band, top and bottom; see ``active_lo``. ``None`` if either
+        bound hasn't been detected (header-only stub). A single profile has
+        only one file, so the range is irrelevant; kept for a uniform duck-
+        typed call from the live preview (``ProfileChain`` below resolves
+        the per-file band for the range)."""
+        if self.active_lo is None or self.active_ns is None:
+            return None
+        return self.active_lo, self.active_ns
+
+    def read_columns(self, c0: int, c1: int) -> np.ndarray:
+        """Column-bounded read — trivial for a single profile (one in-memory
+        array already, no concatenation involved). Reloads from disk if
+        evicted, mirroring ``ProfileChain.read_columns``'s fallback, so GUI
+        code can call this uniformly on either a lone profile or a chain."""
+        if self.data is None:
+            from .io_segy import load_profile
+            loaded = load_profile(self.path, load_traces=True)
+            if loaded.error:
+                raise ValueError(f"Cannot load {self.name}: {loaded.error}")
+            self.data = loaded.data
+            if not self.trace_headers:
+                self.trace_headers = loaded.trace_headers
+        c0 = max(0, min(int(c0), self.n_traces))
+        c1 = max(c0, min(int(c1), self.n_traces))
+        return self.data[:, c0:c1]
 
     def to_metadata(self) -> SegyMetadata:
         """Return a SegyMetadata snapshot of this profile's header fields."""
@@ -348,44 +398,137 @@ class ProfileChain:
             float(self.dist_km[trace_offsets[i]])
             for i in range(len(self.profiles) - 1)
         ]
+        # Per-profile absolute column [start, end) — reused by
+        # active_ns_for_traces to resolve which constituent file(s) a column
+        # range overlaps without re-deriving it from boundaries_km.
+        self._trace_ends   = trace_offsets
+        self._trace_starts = np.concatenate(([0], trace_offsets[:-1]))
 
     # ── Lazy trace assembly (on demand, from disk if evicted) ──────────────
+
+    @staticmethod
+    def _ensure_profile_loaded(p: "SegyProfile") -> np.ndarray:
+        """Return ``p.data``, reloading from disk via ``load_profile`` if it's
+        an evicted/never-loaded stub — the SAME per-segment fallback used by
+        both ``load_chain_traces`` (legacy, whole-chain) and ``read_columns``
+        (segmented). Mutates ``p.data``/``p.trace_headers`` in place: a
+        reload lands in the constituent ``SegyProfile``'s OWN ``data`` slot
+        (the same object ``AppState``'s per-profile LRU already manages —
+        see ``read_columns``'s docstring), never a separate chain-level copy."""
+        data = getattr(p, "data", None)
+        if data is None:
+            from .io_segy import load_profile
+            loaded = load_profile(p.path, load_traces=True)
+            if loaded.error:
+                raise ValueError(f"Cannot load chain segment "
+                                 f"{p.name}: {loaded.error}")
+            data = loaded.data
+            p.data = data
+            if not p.trace_headers:                # upgrade stub with full headers
+                p.trace_headers = loaded.trace_headers
+        return data
+
+    def read_columns(self, c0: int, c1: int) -> np.ndarray:
+        """Full-depth, column-bounded read across whichever constituent
+        file(s) overlap absolute trace range [c0, c1) — the SEGMENTED
+        alternative to ``load_chain_traces``. NEVER builds/touches the
+        whole-chain ``self.data`` array: only the (typically one, rarely a
+        handful at a chain seam) segment(s) the requested range actually
+        spans are read, reloading any evicted one from disk via
+        ``_ensure_profile_loaded``.
+
+        Because a reload lands in the constituent ``SegyProfile.data`` slot
+        (NOT a separate chain-level allocation), it is the SAME kind of
+        object ``AppState``'s existing per-profile LRU (``MAX_HOT_PROFILES``)
+        already governs — eliminating the leak where ``ProfileChain.data``
+        escaped that eviction entirely by living outside it. The residual
+        gap (a segment ONLY ever touched via chain reads, never standalone,
+        won't be in the GUI's LRU ordering until something calls its
+        ``_touch``) is a follow-up for the GUI layer, not this core method.
+
+        This is the canonical access path for the live preview's per-window
+        extraction and for chunked export (see ``export_filter.py``);
+        ``load_chain_traces``/``self.data`` remain for legacy consumers that
+        still need the whole chain as one materialised ndarray.
+        """
+        c0 = max(0, min(int(c0), self.n_traces))
+        c1 = max(c0, min(int(c1), self.n_traces))
+        mats = []
+        for p, start, end in zip(self.profiles, self._trace_starts, self._trace_ends):
+            if end <= c0 or start >= c1:
+                continue                      # no overlap with the requested range
+            data = self._ensure_profile_loaded(p)
+            lo = max(c0, start) - start
+            hi = min(c1, end) - start
+            mats.append(data[:, lo:hi])
+        if not mats:
+            return np.zeros((self.ns, 0), dtype=np.float32)
+        if len(mats) == 1:
+            return mats[0]
+        out = np.empty((self.ns, sum(m.shape[1] for m in mats)), dtype=np.float32)
+        np.concatenate(mats, axis=1, out=out)
+        return out
+
+    def columns_in_cache(self, c0: int, c1: int) -> bool:
+        """True if every segment overlapping [c0, c1) has its data in memory.
+
+        Returns False as soon as any overlapping segment has been LRU-evicted
+        (its ``data`` attribute is None).  Used by the preview layer to decide
+        whether to dispatch a ``BasePrepWorker`` before calling
+        ``_prepared_base`` — avoiding a blocking disk read on the GUI thread."""
+        c0 = max(0, min(int(c0), self.n_traces))
+        c1 = max(c0, min(int(c1), self.n_traces))
+        for p, start, end in zip(self.profiles, self._trace_starts, self._trace_ends):
+            if end <= c0 or start >= c1:
+                continue
+            if getattr(p, "data", None) is None:
+                return False
+        return True
 
     def load_chain_traces(self, cancel=None) -> "ProfileChain":
         """Assemble the stitched ``(ns, total_traces)`` trace matrix on demand.
 
         Idempotent: a no-op once ``self.data`` is populated. Each constituent
         profile's traces are sourced from RAM when still resident, otherwise
-        re-read from disk via ``load_profile`` — so this works correctly even
-        after LRU eviction reverted them to header-only stubs. The per-profile
-        matrices are transient (only the single stitched chain matrix is kept),
-        keeping the memory footprint flat.
+        re-read from disk via ``_ensure_profile_loaded`` — so this works
+        correctly even after LRU eviction reverted them to header-only stubs.
+
+        Kept for LEGACY consumers that genuinely need the whole chain as one
+        materialised ndarray (e.g. an un-migrated export path, or analysis
+        code that runs a 2-D filter needing the full extent). The live
+        preview and chunked export use ``read_columns`` instead and never
+        trigger this — see that method's docstring for why ``self.data``
+        living outside the per-profile LRU was the actual RAM leak.
 
         ``cancel`` (optional) is a CancelToken whose ``check()`` is polled per
         profile so a long assembly can be aborted cooperatively.
         """
         if self.data is not None:
             return self
-        from .io_segy import load_profile
         mats = []
         for p in self.profiles:
             if cancel is not None:
                 cancel.check()
-            data = getattr(p, "data", None)
-            if data is None:                       # evicted / never loaded → disk
-                loaded = load_profile(p.path, load_traces=True)
-                if loaded.error:
-                    raise ValueError(f"Cannot load chain segment "
-                                     f"{p.name}: {loaded.error}")
-                data = loaded.data
-                if not p.trace_headers:            # upgrade stub with full headers
-                    p.trace_headers = loaded.trace_headers
-            mats.append(data)
-        # Force C-contiguity so downstream ViewBox slicing (the GUI preview
-        # extracts column/row ranges of this stitched array) is a fast memory
-        # view rather than a fragmented strided read.
-        self.data = np.ascontiguousarray(np.concatenate(mats, axis=1))
-        self.clip_p99 = float(np.percentile(np.abs(self.data), 99))
+            mats.append(self._ensure_profile_loaded(p))
+        # Write directly into one pre-allocated contiguous destination —
+        # np.concatenate's own buffer is not guaranteed C-contiguous for this
+        # axis, so the historical code paid a SECOND full-size copy via a
+        # separate np.ascontiguousarray pass; out= does the gather once.
+        out = np.empty((self.profiles[0].ns if self.profiles else 0,
+                       sum(m.shape[1] for m in mats)), dtype=np.float32)
+        np.concatenate(mats, axis=1, out=out)
+        self.data = out
+        # Chain-wide clip_p99 used to be a true 99th percentile over every
+        # sample of the stitched array — an O(ns × total_traces) full-array
+        # `np.abs` + percentile pass on every load. It is metadata only (no
+        # DSP/display-stability path reads it; the live preview's color
+        # lock comes from PreviewController._compute_global_levels, not
+        # this), so the MAX of the already-computed per-file clip_p99
+        # values — never an underestimate, same "safe union" philosophy as
+        # active_band_for_traces — is a deliberate, documented approximation
+        # traded for skipping that full-array pass entirely.
+        per_file = [p.clip_p99 for p in self.profiles if p.clip_p99]
+        self.clip_p99 = max(per_file) if per_file else 0.0
         self.n_traces = self.data.shape[1]
         # Rebuild the chain-level header map now every constituent is fully loaded.
         # This populates the Header Inspector when the chain view re-emits
@@ -397,6 +540,46 @@ class ProfileChain:
                 for lab in labels
             }
         return self
+
+    def active_ns_for_traces(self, c0: int, c1: int) -> Optional[int]:
+        """Real listening-window depth across the constituent file(s)
+        overlapping absolute trace range [c0, c1) — the MAX of their
+        per-file ``SegyProfile.active_ns`` (the deepest of the overlapping
+        files governs, since the live preview must not under-cut any of
+        them). Returns None — caller falls back to the full ``ns`` — if any
+        overlapping profile hasn't been trace-loaded yet (a header-only
+        stub has no ``active_ns``), which only happens for a column range
+        outside what ``load_chain_traces`` has actually populated."""
+        vals: List[int] = []
+        for p, start, end in zip(self.profiles, self._trace_starts, self._trace_ends):
+            if end <= c0 or start >= c1:
+                continue                      # no overlap with the requested range
+            if p.active_ns is None:
+                return None
+            vals.append(p.active_ns)
+        return max(vals) if vals else None
+
+    def active_band_for_traces(self, c0: int, c1: int) -> Optional[Tuple[int, int]]:
+        """``(lo, hi)`` real signal band across the constituent file(s)
+        overlapping absolute trace range [c0, c1) — the SAFE UNION of their
+        per-file bands: ``lo`` is the SHALLOWEST top-of-signal (min) and
+        ``hi`` is the DEEPEST bottom-of-signal (max) among the overlapping
+        files, so the combined extraction range never under-cuts any one of
+        them. Returns None — caller falls back to the full ``(0, ns)`` band
+        — if any overlapping profile hasn't been trace-loaded yet (mirrors
+        ``active_ns_for_traces``)."""
+        los: List[int] = []
+        his: List[int] = []
+        for p, start, end in zip(self.profiles, self._trace_starts, self._trace_ends):
+            if end <= c0 or start >= c1:
+                continue
+            if p.active_lo is None or p.active_ns is None:
+                return None
+            los.append(p.active_lo)
+            his.append(p.active_ns)
+        if not los:
+            return None
+        return min(los), max(his)
 
     # ── Haversine distance helper ──────────────────────────────────────────
 

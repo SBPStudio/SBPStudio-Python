@@ -21,16 +21,27 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 import numpy as np
-from PyQt6.QtCore import QObject
+from PyQt6.QtCore import QObject, QTimer
+
+import os
+from time import perf_counter
 
 from sbp_studio.core.constants import DEFAULT_CLIP_PCT
 from sbp_studio.core.logger import get_logger
+from sbp_studio.core.tasks import CancelToken
 
 from .nodes import DSPContext
-from .pipeline import Pipeline, extract_visible_window
-from .preview_worker import PipelineWorker
+from .pipeline import Pipeline, ProcessedBand, extract_visible_window, reslice_band
+from .preview_worker import CANCELLED_MESSAGE, BasePrepWorker, PipelineWorker
 
 _LOG = get_logger("dsp.preview")
+
+# Lightweight perf telemetry, off by default (zero overhead — a single bool
+# check per hot call). Run with the env var ``TOPAS_PERF=1`` to emit per-stage
+# timing for _prepared_base, the _refresh→result round-trip (here) and
+# MapView.set_visible_range (seismic side) at INFO so they show on the console
+# while dragging a real cadena. See the Phase-2 telemetry note.
+_PERF = os.environ.get("TOPAS_PERF") == "1"
 
 # Preview raster column cap. Rows are NEVER decimated/cropped for the live
 # preview — see _refresh's full_depth note: a time-series filter (AGC,
@@ -41,6 +52,62 @@ _LOG = get_logger("dsp.preview")
 # 3840 px wide, so processing more traces than that is pure overdraw the
 # screen can't even show.
 MAX_PREVIEW_COLS = 4000
+
+# Interactive LOD (level-of-detail): while the user is actively DRAGGING a
+# DSP node's parameter slider (see PipelinePanel.interactionStarted/Ended),
+# the column extent handed to the worker is slashed by this fraction —
+# masking a heavy node's (Deconvolution, F-K) per-call compute cost during
+# the drag, when many intermediate frames are inherently throwaway anyway.
+# Deliberately HORIZONTAL-only: rows stay full_depth=True always (the very
+# physics fix this must never regress — see the column-cap note above), so
+# this never trades away the math correctness, only on-screen trace density
+# for the duration of the drag. The slider's OWN debounce (PipelinePanel.
+# DEBOUNCE_MS) already limits how often a frame is even requested; LOD
+# additionally shrinks the COST of each of those frames specifically while
+# the mouse button is still down. interactionEnded triggers one final,
+# full-resolution _refresh() once the drag stops.
+LOD_SCALE = 0.25       # keep ~25% of the normal column cap while dragging
+LOD_MIN_COLS = 250     # floor so a narrow viewport never degenerates further
+
+# Deferred global-levels recompute after a slider release. interactionEnded
+# shows the final full-res raster immediately reusing the LAST locked ceiling
+# (imperceptible: the levels are zoom-independent and barely move per tweak),
+# then this long settle delay elapses before the one real 5-block levels pass
+# runs — so rapid edit→release→edit→release cycles never pay it per release,
+# only once the user truly stops. Longer than the param debounce so a quick
+# follow-up edit pre-empts it.
+LEVELS_SETTLE_MS = 400
+
+# ── Vertical windowing (Strategy A + B) ──────────────────────────────────────────
+# Strategy B: when no active node needs the WHOLE active band (see DSPNode.
+# GLOBAL_STATS), the full_depth extraction becomes visible-Y + a halo instead
+# of the whole band — collapsing the row count from "the file's entire real
+# signal depth" (tens of thousands of samples on a deep cadena) down to a few
+# thousand at most, which is what actually starves the pan-margin cache's
+# column budget (see PAN_BAND_BUDGET_BYTES below). The halo is the LARGER of
+# this floor and whatever the active nodes themselves declare via
+# time_halo_samples (e.g. AGC's is exactly half its sliding-RMS window) — see
+# _refresh's any_global_stats/y_halo. 500 samples is generous slack for any
+# node whose declared halo is small or zero, while staying tiny next to a
+# typical real-signal band.
+Y_HALO_MIN_SAMPLES = 500
+
+# ── Pan-margin cache (the decisive lateral-pan fix) ──────────────────────────────
+# When zoomed in, the visible window is a thin COLUMN band of the full-depth
+# matrix. Lateral panning shifts that band, and because the pipeline cache keys
+# on the exact window, every pan re-runs the whole DSP chain (F-K's 2-D FFT over
+# the full real depth — seconds on a deep cadena). Instead, on an eligible
+# refresh we process a band WIDER than the viewport (``PAN_MARGIN_FRAC`` extra on
+# each side) and keep the processed result (see pipeline.ProcessedBand). A
+# subsequent pan whose viewport still falls inside that band's trusted interior
+# is served by re-slicing the cache on the GUI thread — NO worker, the same way
+# PyQtGraph already pans the raster itself. A fresh band is dispatched only when
+# the user pans out toward the margin edge, zooms, or edits the chain.
+PAN_MARGIN_FRAC = 0.6
+# Hard ceiling on the cached band's bytes so a genuinely deep file (active_ns in
+# the tens of thousands) can't blow RAM: the margin auto-shrinks to fit, down to
+# zero (then this gracefully degrades to the per-pan worker path). float32.
+PAN_BAND_BUDGET_BYTES = 512 * 1024 * 1024
 
 # Global amplitude-level estimation — FULL-RESOLUTION representative blocks,
 # NOT a globally decimated grid. Row/column striding would corrupt the very
@@ -116,32 +183,39 @@ class PreviewController(QObject):
         self._get_source = get_source
         self._get_display = get_display
 
-        self.pipeline = Pipeline()       # the dynamic per-WINDOW filter nodes
+        self.pipeline = Pipeline()         # all per-WINDOW filter nodes (full node list)
+        self.pipeline_global = Pipeline()  # GLOBAL_STATS nodes + their predecessors
+        self.pipeline_local = Pipeline()   # nodes after the last GLOBAL_STATS node
         self._precrop_nodes: list = []   # PRECROP nodes (e.g. Water Mute) — full-array
         self._precrop_sig: tuple = ()
         self._data_version = 0           # bumped when source / align / pre-crop changes
         self._has_source = False
 
-        # Cached PREPARED base = full array with (1) static delay alignment and
-        # (2) PRE-CROP nodes (water mute) applied. Rebuilt only when the source,
-        # the align flag, or the pre-crop node params change — NOT on pan/zoom
-        # and NOT on per-window filter edits.
+        # Cached PREPARED base: static delay alignment + PRE-CROP nodes (water
+        # mute) applied. Phase 7: this is now COLUMN-BOUNDED, not the whole
+        # chain — see _prepared_base's docstring. ``_pc_c0``/``_pc_c1`` are the
+        # ABSOLUTE column range ``_pc_array`` actually covers (0/n_traces for
+        # the alignment-active or fit case, which still need the whole chain).
+        # Rebuilt when the source/align/pre-crop signature changes, OR when a
+        # pan reaches outside the cached range — NOT on every pan/zoom frame.
         self._pc_array = None
         self._pc_t0 = 0.0
         self._pc_src = None
         self._pc_key = None              # (align_flag, precrop_signature)
+        self._pc_c0 = 0
+        self._pc_c1 = 0
 
         # Display-param snapshot: re-read from Qt widgets only when a display
         # setting actually changed (not on every pan/zoom frame).
         self._disp_cache: Optional[dict] = None
         self._disp_dirty: bool = True
 
-        # Halo cache: max_trace_halo (spatial filters' lateral padding) only
-        # changes when the source object or the pipeline node set changes —
-        # not on pan/zoom. No time halo any more — see _refresh's full_depth
-        # note: every row of every selected trace is always kept, so there
-        # is no Y-edge to protect against pre-DSP.
-        self._halo_cache: Optional[tuple] = None  # (data_ver, pipeline_ver), trh
+        # Halo cache: max_trace_halo (spatial filters' lateral padding) and
+        # max_time_halo (per-node local-context requirement — used by
+        # Strategy B's vertical windowing, see _refresh) only change when
+        # the source object or the pipeline node set changes — not on
+        # pan/zoom.
+        self._halo_cache: Optional[tuple] = None  # (halo_key, trace_halo, time_halo)
         self._pipeline_version: int = 0
 
         # Cached wiggle geometry key. When window bounds, vmax, and va_fill are
@@ -171,6 +245,16 @@ class PreviewController(QObject):
         # see _pending_levels_key/PipelineWorker's global_levels_job.
         self._global_levels_cache: dict = {}
         self._pending_levels_key: Optional[tuple] = None
+        # Cache of the RAW SAMPLE ARRAYS (raw_sample, processed_sample) the
+        # 5-block computation produced, keyed by (data_version, pipeline_sig)
+        # — deliberately WITHOUT clip, since the samples themselves don't
+        # depend on it (only the percentile derived FROM them does). This is
+        # what makes the Clip slider instant (see clip_changed): moving it
+        # alone never needs a new PipelineWorker round-trip — it just
+        # re-percentiles the SAME already-computed samples on the GUI
+        # thread, which is cheap, then pushes [vmin, vmax] straight to the
+        # ImageItem via SeismicView.set_levels_only (no array resubmission).
+        self._global_samples_cache: dict = {}
 
         # A/B Compare wiper state. ``_ab_frac`` is the user's chosen split as a
         # fraction of the visible width (persists across pan/zoom — a screen-
@@ -187,10 +271,52 @@ class PreviewController(QObject):
         self._refresh_ctx: Optional[dict] = None
         self._pending: Optional[tuple] = None   # (fit, overlays) to re-run
         self._pending_sync: bool = False         # a pipeline_changed was deferred
+        self._pending_params: bool = False       # a params_changed was deferred
+        # Off-GUI-thread disk I/O for evicted chain segments (Phase 10).
+        # Runs BEFORE PipelineWorker; the two are never in flight simultaneously.
+        # _pending_base_ctx stores the (fit, overlays) to replay once warm.
+        self._base_worker: Optional[BasePrepWorker] = None
+        self._pending_base_ctx: Optional[tuple] = None
+        # Cooperative cancellation: the token handed to the CURRENTLY in-
+        # flight worker (None when idle). A fresher request arriving while
+        # busy cancels this SAME token (see _refresh) so the stale worker
+        # aborts at its next checkpoint instead of finishing uselessly.
+        self._cancel_token: Optional[CancelToken] = None
+        # Interactive LOD: True for the whole span between a param slider's
+        # press and release — see _on_interaction_started/_ended.
+        self._lod_active: bool = False
+        # Deferred global levels: True from a slider release until the
+        # LEVELS_SETTLE_MS timer fires, during which the locked ceiling is held
+        # and no 5-block recompute is armed (see _refresh's levels block).
+        self._levels_frozen: bool = False
+        self._levels_timer = QTimer(self)
+        self._levels_timer.setSingleShot(True)
+        self._levels_timer.setInterval(LEVELS_SETTLE_MS)
+        self._levels_timer.timeout.connect(self._on_levels_settle)
+        # Settle gating: the render key (window token + pipeline + display
+        # signature) of the image CURRENTLY on screen. A pure pan/zoom that
+        # resolves to the SAME column window produces a byte-identical image,
+        # so _refresh skips the whole worker round-trip when this is unchanged.
+        # Set only after a render actually completes (see _refresh's dispatch /
+        # _on_pipeline_failed reset) so a cancelled run never leaves a stale
+        # key that would wrongly gate out the next request.
+        self._last_render_key: Optional[tuple] = None
+        # Telemetry: perf_counter at worker dispatch, read once in
+        # _on_pipeline_result for the round-trip timing (only when _PERF).
+        self._refresh_dispatch_t: Optional[float] = None
+        # Pan-margin cache: the last processed-WIDER-than-viewport band (see
+        # PAN_MARGIN_FRAC / pipeline.ProcessedBand). A lateral pan that stays
+        # inside its trusted interior is re-sliced from here on the GUI thread
+        # instead of dispatching the DSP worker. Invalidated whenever the data
+        # or pipeline changes (set_source / _on_pipeline_changed / alignment).
+        self._band_cache: Optional[ProcessedBand] = None
 
         view.enable_preview(True)
         view.view_range_changed.connect(self._on_view_changed)
         panel.pipeline_changed.connect(self._on_pipeline_changed)
+        panel.params_changed.connect(self._on_params_changed)
+        panel.interactionStarted.connect(self._on_interaction_started)
+        panel.interactionEnded.connect(self._on_interaction_ended)
         view.ab_split_changed.connect(self._on_ab_drag)
 
     # ── External triggers ───────────────────────────────────────────────────
@@ -200,19 +326,65 @@ class PreviewController(QObject):
         self._ensure_idle()
         self._data_version += 1
         self._disp_dirty = True
+        self._last_render_key = None     # new data → no prior frame to gate against
+        self._band_cache = None          # new data → stale pan-margin band
         self.pipeline.clear_cache()
+        self.pipeline_global.clear_cache()
+        self.pipeline_local.clear_cache()
         self._sync_nodes()
         self._pc_array = None
         self._pc_src = None
+        self._pending_base_ctx = None
         self._has_source = obj is not None and getattr(obj, "data", None) is not None
         if self._has_source:
             self._refresh(fit=True, overlays=True)   # initial full-view render
 
     def display_changed(self) -> None:
-        """Presentation (cmap / clip / FIX / boundaries) changed — recolour."""
+        """Presentation (cmap / FIX / boundaries / etc.) changed — recolour.
+
+        NOT used by the Clip slider any more — see clip_changed, which
+        updates [vmin, vmax] instantly without a PipelineWorker round trip."""
         self._disp_dirty = True
         if self._has_source:
             self._refresh(fit=False, overlays=True)
+
+    def clip_changed(self) -> None:
+        """Clip slider moved — recompute ``[vmin, vmax]`` INSTANTLY from the
+        cached global-levels SAMPLE arrays (see _global_samples_cache) and
+        push the result straight to the view via
+        ``SeismicView.set_levels_only`` — NO ``_refresh()``, NO
+        ``PipelineWorker`` dispatch, no array resubmission. Must track a
+        slider drag at 60 fps, which a worker round-trip per tick cannot
+        guarantee.
+
+        ``_disp_dirty`` is still set so the NEXT real refresh (a pan/zoom,
+        a different control) re-reads the display dict and picks up this
+        new clip value rather than a stale cached one. If no samples are
+        cached yet for the current (data_version, pipeline_sig) — e.g. the
+        very first frame hasn't finished rendering — this is a no-op; the
+        upcoming real refresh will compute everything correctly anyway."""
+        self._disp_dirty = True
+        if not self._has_source:
+            return
+        disp = self._get_display()
+        clip = float(disp.get("clip", DEFAULT_CLIP_PCT))
+        pipeline_sig = tuple(n.signature() for n in self.pipeline.nodes)
+        samples = self._global_samples_cache.get((self._data_version, pipeline_sig))
+        if samples is None:
+            return
+        raw_sample, processed_sample = samples
+        vmax_raw = self._estimate_vmax(raw_sample, clip)
+        vmax_proc = (self._estimate_vmax(processed_sample, clip)
+                    if processed_sample is not None else vmax_raw)
+        self._global_vmax, self._global_vmax_raw = vmax_proc, vmax_raw
+        levels_key = (self._data_version, pipeline_sig, clip)
+        self._global_levels_cache[levels_key] = (vmax_proc, vmax_raw)
+        self._global_levels_key = levels_key
+
+        ab_on = bool(disp.get("ab_compare"))
+        vmax = max(vmax_raw, vmax_proc) if ab_on else vmax_proc
+        vmin = -vmax if disp.get("amp_range") == "diverging" else 0.0
+        self.view.set_levels_only(vmax, vmin)
 
     def alignment_changed(self) -> None:
         """Static delay-alignment toggled — rebuild the prepared base, invalidate
@@ -221,6 +393,7 @@ class PreviewController(QObject):
         self._pc_array = None
         self._data_version += 1          # window cache keys include data_version
         self._disp_dirty = True
+        self._band_cache = None          # geometry changed → stale pan-margin band
         if self._has_source:
             self._refresh(fit=True, overlays=True)
 
@@ -228,6 +401,44 @@ class PreviewController(QObject):
         """Re-fit the whole section to the panel (the 'Fit view' action)."""
         if self._has_source:
             self._refresh(fit=True, overlays=True)
+
+    # ── Interactive LOD (param slider press/release) ────────────────────────
+
+    def _on_interaction_started(self) -> None:
+        """A DSP node param slider was just pressed — every refresh until
+        release uses a slashed column extent (see LOD_SCALE/_refresh). Also
+        cancels any pending deferred-levels timer from a PREVIOUS release: a
+        new drag has started, so that stale recompute must not fire mid-drag."""
+        self._lod_active = True
+        self._levels_timer.stop()
+
+    def _on_interaction_ended(self) -> None:
+        """Slider released — restore full COLUMN resolution and render one final
+        high-quality raster immediately, but keep the locked color ceiling
+        FROZEN (``_levels_frozen``) and defer the real 5-block levels recompute
+        to LEVELS_SETTLE_MS later (see _on_levels_settle). So the released
+        frame appears instantly reusing the last ceiling instead of blocking on
+        a full global-levels pass, and a rapid next edit pre-empts that pass
+        entirely."""
+        self._lod_active = False
+        self._levels_frozen = True
+        if self._has_source:
+            self._refresh(fit=False, overlays=False)
+        self._levels_timer.start()           # restarts if already pending
+
+    def _on_levels_settle(self) -> None:
+        """The post-release settle elapsed with no new drag — unfreeze and do
+        the one real global-levels recompute now (a normal _refresh; the
+        levels block re-arms because the freeze is cleared). Skipped while a
+        worker is mid-flight or another drag is active — _dispatch_pending /
+        the next release will re-trigger it."""
+        self._levels_frozen = False
+        if self._lod_active or not self._has_source:
+            return
+        # overlays=True so settle gating (which would otherwise skip this as a
+        # no-op — same window + pipeline as the already-rendered release frame)
+        # is bypassed and the now-unfrozen levels block actually re-arms.
+        self._refresh(fit=False, overlays=True)
 
     # ── Internal trigger slots ──────────────────────────────────────────────
 
@@ -241,6 +452,14 @@ class PreviewController(QObject):
         precrop = [n for n in nodes if getattr(n, "PRECROP", False)]
         window  = [n for n in nodes if not getattr(n, "PRECROP", False)]
         self.pipeline.set_nodes(window)
+        # Split at the last GLOBAL_STATS node boundary for two-pass execution.
+        # pipeline_global processes all nodes up to and including the last
+        # GLOBAL_STATS node on the full active band; pipeline_local processes
+        # the remaining (purely local) nodes on the visible+halo window.
+        last_gs = max((i for i, n in enumerate(window)
+                       if getattr(n, "GLOBAL_STATS", False)), default=-1)
+        self.pipeline_global.set_nodes(window[:last_gs + 1])
+        self.pipeline_local.set_nodes(window[last_gs + 1:])
         sig = tuple(n.signature() for n in precrop)
         self._precrop_nodes = precrop
         if sig != self._precrop_sig:
@@ -251,14 +470,43 @@ class PreviewController(QObject):
     def _on_pipeline_changed(self) -> None:
         # _sync_nodes() mutates self.pipeline.nodes, which the worker thread may
         # be iterating right now — defer the whole handler (not just _refresh)
-        # until it's done, rather than racing it.
-        if self._worker is not None and self._worker.isRunning():
+        # until it's done, rather than racing it.  Also defer while a
+        # BasePrepWorker is warming the cache (_pc_array is being written).
+        if ((self._worker is not None and self._worker.isRunning())
+                or (self._base_worker is not None and self._base_worker.isRunning())):
             self._pending_sync = True
             return
         if self._sync_nodes():           # pre-crop (e.g. Water Mute) changed
             self._pc_array = None         # rebuild the prepared base
             self._data_version += 1       # invalidate per-window cache
         self._pipeline_version += 1      # invalidate halo cache (node set changed)
+        self._band_cache = None          # node set changed → stale pan-margin band
+        if self._has_source:
+            self._refresh(fit=False, overlays=False)
+
+    def _on_params_changed(self) -> None:
+        """A node PARAMETER value changed (slider / spinbox) — the node set is
+        unchanged, only amplitude/filter values differ.
+
+        Unlike ``_on_pipeline_changed`` (structural), this does NOT clear
+        ``_band_cache``: the cached band's spatial footprint (column range,
+        row range, strides) is identical to what the fresh run will produce,
+        so the ``pipeline_sig`` guard in ``reslice_band`` is sufficient to
+        prevent serving stale data — the old band can't be matched once
+        pipeline_sig changes, and the new worker run overwrites the cache.
+
+        ``_sync_nodes`` is also skipped: node objects update their own
+        ``params`` dict in-place, so ``self.pipeline.nodes`` already reflects
+        the current values without a re-set.
+
+        ``_pipeline_version`` IS bumped so the halo cache (``_halo_cache``)
+        is rebuilt on the next refresh — a param change (e.g. AGC window
+        size) can legitimately alter a node's ``time_halo_samples``."""
+        if ((self._worker is not None and self._worker.isRunning())
+                or (self._base_worker is not None and self._base_worker.isRunning())):
+            self._pending_params = True
+            return
+        self._pipeline_version += 1
         if self._has_source:
             self._refresh(fit=False, overlays=False)
 
@@ -266,43 +514,122 @@ class PreviewController(QObject):
         if self._has_source:
             self._refresh(fit=False, overlays=False)
 
-    # ── Prepared base (alignment + PRE-CROP nodes on the FULL array, cached) ──
+    # ── Prepared base (alignment + PRE-CROP nodes, column-bounded, cached) ───
 
-    def _prepared_base(self, obj: object):
-        """Return (base_array, t0_ms): the FULL array with static delay alignment
-        AND any PRE-CROP nodes (water mute) applied — cached so pan/zoom and
-        per-window filter edits never recompute it.
+    def _prepared_base(self, obj: object, c0_req: Optional[int] = None,
+                       c1_req: Optional[int] = None, *,
+                       _align: Optional[bool] = None):
+        """Return ``(base_array, t0_ms, base_c0)``: static delay alignment +
+        any PRE-CROP nodes (water mute) applied to a column-bounded slice of
+        ``obj`` covering AT LEAST ``[c0_req, c1_req)`` — ``base_c0`` is the
+        ABSOLUTE column ``base_array[:, 0]`` corresponds to (0 for the
+        whole-chain cases below). Cached so a pan WITHIN the cached range
+        never re-reads/re-precrops anything.
 
-        Water-column mute MUST run here (not per ViewBox window): its seabed pick
-        needs the whole trace, and the window's row 0 is not true t=0. Running it
-        full-array first guarantees a flawlessly muted preview."""
-        align = bool(self._get_display().get("align", False))
+        Water-column mute MUST see the whole TIME extent (full depth) of each
+        trace it touches — its seabed pick needs the whole trace, and the
+        window's row 0 is not true t=0 — but it does NOT need every trace in
+        the chain simultaneously: it's per-trace (at most a small
+        ``trace_halo`` for spatial PRECROP nodes), so a column-bounded read
+        (via ``read_columns`` — see model.py) is exactly as correct as the
+        historical whole-chain pass, while never materialising the rest of a
+        deep cadena just to view one segment.
+
+        Falls back to the WHOLE chain (``c0_req``/``c1_req`` ignored) when:
+          * no bounds are given (e.g. ``analysis_inputs``'s "full" scope,
+            which legitimately wants everything), or
+          * static delay alignment is ON — ``apply_delay_alignment``'s
+            row-growth (``offsets.max()``) depends on the delay SPREAD of
+            whichever traces it's given; computing it from a column-bounded
+            slice would make the array's row count (and thus ``t0``/every
+            row index downstream) drift depending on which columns happen to
+            be in view — a real correctness hazard, not just a missed
+            optimisation. Fixing that needs an explicit global-offset
+            parameter on ``apply_delay_alignment`` (core/processing.py) —
+            future work, out of this pass's scope. Alignment is an opt-in
+            toggle, so the common (alignment-off) case still gets the win.
+        """
+        align = (_align if _align is not None
+                 else bool(self._get_display().get("align", False)))
         key = (align, self._precrop_sig)
-        if (self._pc_array is not None and self._pc_src is obj
-                and self._pc_key == key):
-            return self._pc_array, self._pc_t0
+        whole_chain = align or c0_req is None or c1_req is None
+        n_traces_total = int(getattr(obj, "n_traces", 0))
+        if whole_chain:
+            c0_req, c1_req = 0, n_traces_total
 
-        base = obj.data
+        if (self._pc_array is not None and self._pc_src is obj
+                and self._pc_key == key
+                and self._pc_c0 <= c0_req and c1_req <= self._pc_c1):
+            return self._pc_array, self._pc_t0, self._pc_c0
+
+        # Cache MISS. Whole-chain case: read everything (the historical
+        # behaviour, unavoidable here — see the docstring). Bounded case:
+        # widen the request by a margin (same RAM-budget philosophy as the
+        # pan-margin cache — PAN_BAND_BUDGET_BYTES — sized against the
+        # FULL row depth, since this read is always full_depth) so a
+        # following pan within that margin hits the cache too.
+        t_start = perf_counter() if _PERF else 0.0
+        if whole_chain:
+            base_c0, base_c1 = 0, n_traces_total
+        else:
+            ns_full = int(getattr(obj, "ns", 1)) or 1
+            budget_cols = max(1, PAN_BAND_BUDGET_BYTES // (ns_full * 4))
+            req_width = max(1, c1_req - c0_req)
+            margin = max(0, min(int(PAN_MARGIN_FRAC * req_width),
+                                (budget_cols - req_width) // 2))
+            base_c0 = max(0, c0_req - margin)
+            base_c1 = min(n_traces_total, c1_req + margin)
+
+        read_columns = getattr(obj, "read_columns", None)
+        base = (read_columns(base_c0, base_c1) if read_columns is not None
+                else obj.data[:, base_c0:base_c1])
         t0 = float(getattr(obj, "delay_ms", 0.0))
         full_ctx = DSPContext.from_source(obj)
         # 1) Static geometry: delay alignment (taller array, t0 = min_delay).
+        #    Only reachable when whole_chain is True — see the docstring.
         if align and getattr(obj, "delays", None) is not None:
             from sbp_studio.core import apply_delay_alignment
             base = apply_delay_alignment(
                 base, obj.delays, obj.min_delay, obj.dt_us, fill_value=0.0)
             t0 = float(getattr(obj, "min_delay", 0.0))
-        # 2) PRE-CROP nodes (water mute) on the full aligned array.
+        # 2) PRE-CROP nodes (water mute) on the (bounded or whole) aligned array.
         for node in self._precrop_nodes:
             base = node.apply(base, full_ctx)
 
         self._pc_array, self._pc_t0, self._pc_src, self._pc_key = base, t0, obj, key
-        return base, t0
+        self._pc_c0, self._pc_c1 = base_c0, base_c1
+        if _PERF:
+            _LOG.info("perf _prepared_base REBUILD: %.1f ms "
+                      "(precrop_nodes=%d, align=%s, cols=[%d,%d) of %d, shape=%s)",
+                      (perf_counter() - t_start) * 1e3, len(self._precrop_nodes),
+                      align, base_c0, base_c1, n_traces_total,
+                      getattr(base, "shape", None))
+        return base, t0, base_c0
 
     def _compute_global_levels(self, data: np.ndarray, dt_us: int,
-                               clip: float) -> tuple:
-        """Zoom-independent ``(vmax_processed, vmax_raw)`` for the WHOLE
-        profile — the fix for "color pumping": these never depend on the
-        current ViewBox, only on the data itself.
+                               clip: float,
+                               cancel: Optional[CancelToken] = None,
+                               active_ns: Optional[int] = None) -> tuple:
+        """Zoom-independent ``(vmax_processed, vmax_raw, raw_sample,
+        processed_sample)`` for the WHOLE profile — the fix for "color
+        pumping": the levels never depend on the current ViewBox, only on
+        the data itself.
+
+        ``active_ns`` — when given (the profile/chain's real listening-window
+        depth, see SegyProfile.active_ns), the sampled blocks are capped to
+        that many rows BEFORE the per-window DSP runs. This is the same
+        true-depth saving the viewport already takes (Phase 4): the heavy
+        node (F-K's 2-D FFT over ~32 k rows, Decon) no longer chews through a
+        file's dead/padded tail just to estimate a ceiling. NOTE it also makes
+        the ceiling MORE representative — a gain stage (AGC) amplifies the
+        near-silent dead zone to full scale, and including those rows in the
+        percentile biased ``vmax_proc`` toward that amplified noise; capping
+        them out ties the ceiling to the real-signal zone instead.
+
+        ``cancel`` — same cooperative-cancellation token as the viewport's
+        own pipeline run (see _refresh); checked once per block below so a
+        superseded request aborts here too instead of finishing all 5
+        blocks uselessly.
 
         ``data`` is the prepared base (alignment + pre-crop already applied,
         see _prepared_base). Sampled as a few FULL-RESOLUTION, CONTIGUOUS
@@ -316,6 +643,12 @@ class PreviewController(QObject):
         (no per-window filters) is kept separately for A/B Compare, which
         needs a fair ceiling for BOTH its raw and processed halves.
 
+        The returned ``raw_sample``/``processed_sample`` arrays (the SAME
+        ones the percentile was estimated from) are cached by the caller
+        (see _on_pipeline_result → _global_samples_cache) so a LATER
+        clip-only change can re-percentile them directly on the GUI thread
+        — see clip_changed — instead of recomputing this whole block pass.
+
         Called from the WORKER thread (see PipelineWorker's
         global_levels_job) on a cache miss, never inline on the GUI thread
         — even though the sampled trace count stays small, a heavy node
@@ -325,49 +658,106 @@ class PreviewController(QObject):
         changes (see _refresh's levels_key/_global_levels_cache check),
         never on every pan/zoom frame."""
         ns, n_traces = data.shape
+        ns_eff = min(ns, int(active_ns)) if active_ns else ns   # true-depth cap
         block_w = min(GLOBAL_LEVELS_BLOCK_TRACES, n_traces)
         n_blocks = min(GLOBAL_LEVELS_BLOCKS, max(1, n_traces // block_w))
         if n_blocks <= 1:
             starts = [0]
         else:
             starts = np.linspace(0, n_traces - block_w, n_blocks).astype(int)
-        raw_blocks = [data[:, s:s + block_w] for s in starts]
+        raw_blocks = [data[:ns_eff, s:s + block_w] for s in starts]
 
         raw_sample = np.concatenate(raw_blocks, axis=1)
         vmax_raw = self._estimate_vmax(raw_sample, clip)
         if not self.pipeline.nodes:
-            return vmax_raw, vmax_raw
+            return vmax_raw, vmax_raw, raw_sample, None
 
-        ctx = DSPContext(dt_us=int(dt_us), ns=ns, n_traces=block_w)
-        processed_blocks = [
-            self.pipeline.process(
+        ctx = DSPContext(dt_us=int(dt_us), ns=ns_eff, n_traces=block_w,
+                         cancel=cancel, preview=True)
+        processed_blocks = []
+        for i, block in enumerate(raw_blocks):
+            if cancel is not None:
+                cancel.check()
+            processed_blocks.append(self.pipeline.process(
                 np.ascontiguousarray(block, dtype=np.float32), ctx,
-                input_token=("__global_levels__", self._data_version, i))
-            for i, block in enumerate(raw_blocks)]
+                input_token=("__global_levels__", self._data_version, i),
+                cancel=cancel))
         processed_sample = np.concatenate(processed_blocks, axis=1)
         vmax_proc = self._estimate_vmax(processed_sample, clip)
-        return vmax_proc, vmax_raw
+        return vmax_proc, vmax_raw, raw_sample, processed_sample
 
     # ── The live loop ───────────────────────────────────────────────────────
+
+    def _render_key(self, win, pipeline_sig: tuple, clip: float, disp: dict,
+                    col_offset: int = 0) -> tuple:
+        """Stable identity of the IMAGE a refresh would put on screen — drives
+        settle gating (skip a redundant re-render) for BOTH the worker-dispatch
+        and the pan-margin re-slice paths, so they agree on what "already
+        shown" means. Keyed on the VISIBLE trace/sample bounds (not the
+        processed band's full extent) so it discriminates a Y-zoom — which
+        leaves full_depth's processed rows unchanged but does change what the
+        viewer sees — and so a dispatch render and a later re-slice of the same
+        viewport produce the SAME key.
+
+        ``col_offset`` — the ABSOLUTE column ``win``'s indices are relative
+        to (0 for the pan-margin reslice path, which already resolves against
+        the full chain's dist_km; the prepared-base's own ``base_c0`` for the
+        worker-dispatch path, whose ``win`` is local to a column-bounded
+        ``_prepared_base`` read — see ``_refresh``). Without this, two
+        DIFFERENT bounded reads that happen to produce the same LOCAL indices
+        would alias to the same key despite being different viewports."""
+        vis_token = (self._data_version, win.c_vis0 + col_offset,
+                     win.c_vis1 + col_offset, win.s0, win.s1,
+                     win.col_stride, win.row_stride)
+        return (
+            vis_token, pipeline_sig, clip,
+            disp.get("cmap"), disp.get("inv_cmap"), disp.get("amp_range"),
+            disp.get("style", "density"), bool(disp.get("ab_compare")),
+            bool(disp.get("va_fill", True)), bool(disp.get("show_raster", True)),
+            bool(disp.get("show_wiggle_line", True)),
+            self._ab_frac, self._lod_active)
 
     def _refresh(self, *, fit: bool, overlays: bool = False) -> None:
         # Only one pipeline worker runs at a time (see preview_worker). A
         # trigger that arrives while one is in flight is coalesced into
         # ``_pending`` and replayed once it finishes — never overlapped.
+        # This NEW request supersedes whatever the busy worker is doing, so
+        # cancel its token: the worker aborts at its next checkpoint
+        # (between nodes, or inside a node's own loop — see DSPContext.cancel)
+        # instead of wastefully finishing a now-stale computation, freeing
+        # the thread for THIS request as soon as it notices and exits.
         if self._worker is not None and self._worker.isRunning():
+            if self._cancel_token is not None:
+                self._cancel_token.cancel()
             self._pending = (fit, overlays)
+            return
+        if self._base_worker is not None and self._base_worker.isRunning():
+            self._pending_base_ctx = (fit, overlays)
             return
         obj = self._get_source()
         if obj is None or getattr(obj, "data", None) is None:
             return
-        # Prepared base = full array with alignment + pre-crop (water mute). The
-        # remaining per-window filters run on the cropped ViewBox of this base;
-        # the export path runs the full pipeline in list order separately.
-        data, t0_full = self._prepared_base(obj)
         dist_km = obj.dist_km
-        n_traces = data.shape[1]
+        n_traces_total = int(getattr(obj, "n_traces", dist_km.size))
         dt_us = int(obj.dt_us)
         dt_ms = dt_us / 1000.0
+
+        # Resolve the visible COLUMN range EARLY for the common fit=False
+        # case — pure header/ViewBox data (dist_km, n_traces_total), no
+        # _prepared_base result needed yet — so _prepared_base (below) can be
+        # told which columns this refresh actually needs and read a BOUNDED
+        # slice of a deep cadena instead of the whole chain. fit=True needs
+        # the WHOLE chain regardless (the user asked to see everything), so
+        # it skips this and _prepared_base falls back to its whole-chain path.
+        if fit:
+            cvis0, cvis1 = 0, n_traces_total
+        else:
+            x_range, y_range = self.view.current_view_range()
+            xmin_v, xmax_v = sorted(x_range)
+            cvis0 = int(np.clip(np.searchsorted(dist_km, xmin_v, side="left"),
+                                0, n_traces_total - 1))
+            cvis1 = int(np.clip(np.searchsorted(dist_km, xmax_v, side="right"),
+                                cvis0 + 1, n_traces_total))
 
         # Re-read display params only when a setting actually changed (not on
         # every pan/zoom frame — avoids ~10 Qt widget reads per settle).
@@ -375,6 +765,52 @@ class PreviewController(QObject):
             self._disp_cache = self._get_display()
             self._disp_dirty = False
         disp = self._disp_cache
+
+        # Prepared base = static delay alignment + pre-crop (water mute)
+        # applied to a column-bounded slice covering at least [cvis0, cvis1)
+        # — see _prepared_base's docstring (Phase 7: no longer the whole
+        # chain, except when alignment is active or fit=True, both of which
+        # genuinely need it). The remaining per-window filters run on the
+        # cropped ViewBox of this base; the export path runs the full
+        # pipeline in list order separately.
+        #
+        # Phase 10: if the viewport spans an evicted chain segment the
+        # read_columns call inside _prepared_base would block the GUI thread
+        # on disk I/O.  Detect this BEFORE calling it: capture align on the
+        # GUI thread (safe), check the _pc_array cache directly, then ask the
+        # ProfileChain whether the requested columns are already in memory.
+        # On a MISS dispatch a BasePrepWorker which runs the read off-thread;
+        # on SUCCESS _on_base_prep_ready replays _refresh and hits the cache.
+        align_for_base = bool(disp.get("align", False))
+        _pc_hit = (
+            self._pc_array is not None
+            and self._pc_src is obj
+            and self._pc_key == (align_for_base, self._precrop_sig)
+            and self._pc_c0 <= cvis0 and cvis1 <= self._pc_c1)
+        if not _pc_hit and not align_for_base:
+            _cols_in_cache = getattr(obj, "columns_in_cache", None)
+            if _cols_in_cache is not None and not _cols_in_cache(cvis0, cvis1):
+                self._start_base_prep(obj, cvis0, cvis1, align_for_base,
+                                      fit, overlays)
+                return
+
+        data, t0_full, base_c0 = self._prepared_base(obj, cvis0, cvis1,
+                                                      _align=align_for_base)
+        n_traces = data.shape[1]                      # the (possibly bounded) width
+        dist_km_window = dist_km[base_c0:base_c0 + n_traces]   # paired LOCAL slice
+        # True listening-window depth/band (SegyProfile.active_ns/active_lo /
+        # ProfileChain). Duck-typed: any source/test double without these →
+        # None → full ns / [0, ns]. active_ns_for_traces (bottom only) feeds
+        # the viewport window cap's legacy path + the global-levels cap;
+        # active_band_for_traces (top+bottom — Strategy A) feeds the richer
+        # full_depth clamp and the margin-budget sizing below. Both are
+        # ALWAYS queried against the CHAIN-WIDE range — intentionally
+        # unaffected by _prepared_base's own column bound.
+        active_ns_for_traces = getattr(obj, "active_ns_for_traces", None)
+        active_band_for_traces = getattr(obj, "active_band_for_traces", None)
+        levels_active_ns = (active_ns_for_traces(0, n_traces_total)
+                            if active_ns_for_traces is not None else None)
+
         clip = float(disp.get("clip", DEFAULT_CLIP_PCT))
 
         # Recompute the LOCKED global levels only when something that
@@ -395,31 +831,80 @@ class PreviewController(QObject):
         pipeline_sig = tuple(n.signature() for n in self.pipeline.nodes)
         levels_key = (self._data_version, pipeline_sig, clip)
         global_levels_job = None
-        if levels_key != self._global_levels_key:
+        # While a param slider is actively dragged (_lod_active), FREEZE the
+        # locked levels: keep the last committed _global_vmax and skip the
+        # 5-block recompute for every throwaway intermediate value. The levels
+        # are zoom-independent anyway, so a brief mid-drag staleness is
+        # invisible; interactionEnded fires one final full-res refresh (lod
+        # inactive) that recomputes them correctly for the committed value.
+        # ``_levels_frozen`` extends the freeze briefly PAST a slider release:
+        # interactionEnded shows the final full-res raster immediately reusing
+        # the last ceiling, and a longer settle timer (LEVELS_SETTLE_MS) does
+        # the one real levels recompute afterwards — see _on_interaction_ended /
+        # _on_levels_settle. So a flurry of edit→release→edit never pays the
+        # 5-block pass per release.
+        if (levels_key != self._global_levels_key
+                and not self._lod_active and not self._levels_frozen):
             cached = self._global_levels_cache.get(levels_key)
             if cached is not None:
                 self._global_vmax, self._global_vmax_raw = cached
                 self._global_levels_key = levels_key
             else:
                 self._pending_levels_key = levels_key
-                global_levels_job = (lambda d=data, dt=dt_us, c=clip:
-                                     self._compute_global_levels(d, dt, c))
+                global_levels_job = (
+                    lambda d=data, dt=dt_us, c=clip, a=levels_active_ns:
+                    self._compute_global_levels(d, dt, c, active_ns=a))
 
-        # Trace halo only changes when the source or pipeline node set
-        # changes; cache it so pan/zoom skips DSPContext construction + node
-        # iteration. (No time halo any more — see the full_depth note below.)
+        # Trace halo + time halo only change when the source or pipeline node
+        # set changes; cache both so pan/zoom skips DSPContext construction +
+        # node iteration. Time halo was historically dropped here once
+        # full_depth=True made it unnecessary for the OLD "always the whole
+        # band" strategy — revived for Strategy B (see ``any_global_stats``/
+        # ``y_halo`` below), which needs each active node's own declared
+        # local-context requirement (``time_halo_samples`` — e.g. AGC's is
+        # exactly half its sliding-RMS window) to size a SAFE windowed
+        # extraction instead of always processing the whole active band.
         halo_key = (self._data_version, self._pipeline_version)
         if self._halo_cache is None or self._halo_cache[0] != halo_key:
             ctx = DSPContext.from_source(obj)
-            self._halo_cache = (halo_key, self.pipeline.max_trace_halo(ctx))
-        _, trace_halo = self._halo_cache
+            self._halo_cache = (halo_key, self.pipeline.max_trace_halo(ctx),
+                               self.pipeline.max_time_halo(ctx))
+        _, trace_halo, node_time_halo = self._halo_cache
+
+        # Strategy B eligibility (see DSPNode.GLOBAL_STATS's docstring —
+        # PredictiveDeconNode/LogCompressionNode/CLAHENode).
+        #
+        # Two-pass mode: when GLOBAL_STATS nodes are present BUT local nodes
+        # follow the last one, we split execution so only the global phase
+        # (pipeline_global: all nodes up to and including the last GLOBAL_STATS
+        # node) runs on the full active band, while the local phase
+        # (pipeline_local: all remaining nodes) sees only visible+halo. This
+        # breaks the stacking multiplier: AGC, Bandpass, Notch etc. go back to
+        # processing ~1500 rows even when Decon is in the chain.
+        #
+        # Alignment-shifted data: _prepared_base row-inserts delay offsets,
+        # making window_band sample indices disagree with data row indices —
+        # skip two-pass when align is on to avoid extracting the wrong rows.
+        any_global_stats = any(getattr(n, "GLOBAL_STATS", False)
+                               for n in self.pipeline.nodes)
+        has_local_after_gs = (any_global_stats and bool(self.pipeline_local.nodes)
+                              and not align_for_base)
+        # y_halo drives extract_visible_window's vertical windowing:
+        #  - None  → full active band (Strategy A only)
+        #  - value → visible+halo window (Strategy B, local phase)
+        # In two-pass mode y_halo is set so win.sub covers the local phase
+        # dimensions; the global phase builds its own full-band array inline.
+        y_halo = (None if any_global_stats and not has_local_after_gs
+                  else max(Y_HALO_MIN_SAMPLES, node_time_halo))
 
         # ── Determine the visible window ────────────────────────────────────
+        # fit=True needs the whole chain's extent (resolved only now that
+        # _prepared_base's whole-chain result is available); fit=False's
+        # x_range/y_range were already resolved early, above, to bound
+        # _prepared_base's read.
         if fit:
             x_range = (float(dist_km[0]), float(dist_km[-1]))
             y_range = (t0_full, t0_full + data.shape[0] * dt_ms)
-        else:
-            x_range, y_range = self.view.current_view_range()
 
         # ViewBox-limited extraction (preview only). Live horizontal detail:
         # the "Pixels / trace" control raises the column cap so zooming in
@@ -436,6 +921,92 @@ class PreviewController(QObject):
             max_cols_use = FK_MAX_COLS
         else:
             max_cols_use = eff_max_cols
+        # Interactive LOD: while a param slider is actively being dragged,
+        # slash the column extent (see LOD_SCALE's docstring) — masks a
+        # heavy node's per-call cost for the (inherently throwaway)
+        # intermediate frames; interactionEnded restores full resolution.
+        if self._lod_active:
+            max_cols_use = max(LOD_MIN_COLS, int(max_cols_use * LOD_SCALE))
+
+        # ── Pan-margin cache: GUI-thread re-slice fast path ─────────────────
+        # cvis0/cvis1 (the visible CHAIN-WIDE column bounds) were already
+        # resolved early, above (needed to bound _prepared_base's read) —
+        # reused here unchanged. The fast path is the zoomed-in raster
+        # lateral-pan scenario only: not A/B (its own wiper cache), not
+        # mid-drag (LOD owns that), not a fit/overlay pass, and not zoomed
+        # out past the render cap (the un-decimated band can't serve that).
+        # On a miss we fall straight through to a worker dispatch.
+        ab_on = bool(disp.get("ab_compare"))
+        visible_cols = cvis1 - cvis0
+        band_eligible = (not fit and not ab_on and not self._lod_active
+                         and visible_cols <= max_cols_use)
+        # LOCAL active band for the columns about to be touched — NOT the
+        # chain-wide ``levels_active_ns`` (that one intentionally stays
+        # worst-cased across the WHOLE chain for the separate global-levels
+        # job). Sizing the margin budget from the chain-wide value was the
+        # bug: panning inside a shallow segment of a deep cadena had its
+        # margin needlessly strangled by some unrelated deep segment
+        # elsewhere in the same chain — see the margin-budget fix below.
+        window_band = (active_band_for_traces(cvis0, cvis1)
+                       if active_band_for_traces is not None else None)
+        if band_eligible and not overlays and self._band_cache is not None:
+            # reslice_band operates on the cached ProcessedBand + the FULL
+            # chain's dist_km — its win.c_vis0/c_vis1 are ALREADY absolute,
+            # entirely independent of _prepared_base's own bounded read, so
+            # col_offset=0 here (vs base_c0 for the worker-dispatch path
+            # below, whose win is local to that bounded read).
+            rwin = reslice_band(
+                self._band_cache, dist_km, x_range, y_range,
+                max_cols=max_cols_use, data_version=self._data_version,
+                pipeline_sig=pipeline_sig)
+            if rwin is not None:
+                rkey = self._render_key(rwin, pipeline_sig, clip, disp)
+                if rkey != self._last_render_key:
+                    self._finish_refresh(
+                        self._band_cache.processed, obj=obj, win=rwin, disp=disp,
+                        dist_km=dist_km, n_traces=n_traces_total, t0_full=t0_full,
+                        dt_ms=dt_ms, fit=False, overlays=False, band_meta=None,
+                        col_offset=0)
+                    self._last_render_key = rkey
+                self._pending_levels_key = None      # no worker → no levels job
+                if _PERF:
+                    _LOG.info("perf pan-margin RESLICE hit (GUI thread, no worker)")
+                return
+
+        # Size a fresh margin band (only when eligible). The extra columns are
+        # bounded by PAN_BAND_BUDGET_BYTES so a deep file can't blow RAM — the
+        # margin shrinks to 0 (then this is exactly the pre-existing per-pan
+        # dispatch). When a margin IS granted, widen the extraction cap so the
+        # band stays un-decimated (col_stride == 1) for a clean 1:1 re-slice.
+        col_margin = 0
+        extract_max_cols = max_cols_use
+        if band_eligible:
+            # Margin-budget sizing: use the LOCAL window's depth, not the
+            # chain-wide worst case (the fix — see window_band's comment
+            # above). When Strategy B applies (y_halo is not None), the row
+            # count that will ACTUALLY be extracted is visible+halo, often
+            # far shallower than the whole local band — use whichever is
+            # smaller so a deep file's UNTOUCHED depth never strangles the
+            # margin for a window that won't even process it.
+            if window_band is not None:
+                local_depth = max(1, window_band[1] - window_band[0])
+            elif levels_active_ns:
+                local_depth = min(int(levels_active_ns), data.shape[0])
+            else:
+                local_depth = data.shape[0]
+            if y_halo is not None:
+                ymin_v, ymax_v = sorted(y_range)
+                s_vis0_est = max(0, int(np.floor((ymin_v - t0_full) / dt_ms)))
+                s_vis1_est = int(np.ceil((ymax_v - t0_full) / dt_ms)) + 1
+                windowed_depth = max(1, (s_vis1_est - s_vis0_est) + 2 * y_halo)
+                rows_est = min(local_depth, windowed_depth)
+            else:
+                rows_est = local_depth
+            budget_cols = PAN_BAND_BUDGET_BYTES // (max(1, rows_est) * 4)
+            half = max(0, (budget_cols - visible_cols) // 2)
+            col_margin = min(int(PAN_MARGIN_FRAC * visible_cols), half)
+            if col_margin > 0:
+                extract_max_cols = visible_cols + 2 * max(trace_halo, col_margin) + 8
         # full_depth=True: every selected trace is fetched at its FULL
         # vertical depth (all ns samples, no Y-cropping or row decimation),
         # NOT just the visible time window — a time-series filter (AGC,
@@ -446,25 +1017,144 @@ class PreviewController(QObject):
         # so without this, zooming in would "wash out" against the locked
         # palette. The DSP pipeline below runs on the full-depth array; the
         # Y-range crop happens AFTER, in win.crop_visible (_finish_refresh).
+        # Vertical windowing: Strategy A (active_band_for_traces — top+bottom
+        # real-signal trim) always applies when available; Strategy B
+        # (y_halo, set above) additionally narrows to visible+halo whenever
+        # no active node needs the WHOLE band. See extract_visible_window's
+        # active_band_lookup/y_halo docstrings.
+        # dist_km_window is the LOCAL slice of dist_km paired with `data`
+        # (identical to dist_km itself when _prepared_base returned the
+        # whole chain — fit=True or alignment-active) — win's c_vis0/c_vis1
+        # below come out LOCAL to base_c0, converted back to absolute at the
+        # 3 specific points that need it (_render_key/ProcessedBand/
+        # show_preview — see _finish_refresh's col_offset parameter).
         win = extract_visible_window(
-            data, dist_km, t0_ms=t0_full, dt_us=dt_us,
+            data, dist_km_window, t0_ms=t0_full, dt_us=dt_us,
             x_range=x_range, y_range=y_range,
             trace_halo=trace_halo,
             data_version=self._data_version,
-            max_cols=max_cols_use, full_depth=True)
+            max_cols=extract_max_cols, full_depth=True,
+            active_ns_lookup=active_ns_for_traces,
+            active_band_lookup=active_band_for_traces,
+            col_margin=col_margin, y_halo=y_halo)
+        # Eligible to populate the pan-margin cache when a real margin band was
+        # built un-decimated (col_stride == 1 ⇒ 1:1 re-slice; row_stride is
+        # always 1 under full_depth). Stored after the render in _finish_refresh.
+        # ``row0`` (the FULL-array row of win.sub's row 0) is recovered from
+        # win.s0 - win.r0 — see VisibleWindow's r0/s0 contract — rather than
+        # adding a new field: r0 = (s_vis0 - sh0) // row_stride, row_stride is
+        # always 1 under full_depth, so sh0 = s0 - r0 exactly.
+        band_meta = None
+        if (col_margin > 0 and win.col_stride == 1 and win.row_stride == 1):
+            # n_traces_total (CHAIN-WIDE, not the bounded `n_traces`) is what
+            # ProcessedBand.n_traces needs — reslice_band always compares
+            # against the full chain's dist_km, so band-edge detection
+            # (band.c1 == n_traces) must use the same chain-wide count even
+            # though this dispatch only processed a bounded slice.
+            band_meta = dict(trace_halo=trace_halo, dt_us=dt_us,
+                             data_ns=data.shape[0], pipeline_sig=pipeline_sig,
+                             row0=win.s0 - win.r0, n_traces_total=n_traces_total)
+        if _PERF and active_ns_for_traces is not None:
+            _LOG.info("perf active-depth cap: rows=%d of ns=%d (%.0f%% skipped)",
+                      win.sub.shape[0], data.shape[0],
+                      100.0 * (1.0 - win.sub.shape[0] / max(1, data.shape[0])))
+
+        # ── Settle gating ───────────────────────────────────────────────────
+        # A pure pan/zoom (overlays=False, not a fit) that resolved to the SAME
+        # VISIBLE viewport AND identical pipeline/display state yields a
+        # byte-identical image — skip the entire worker round-trip. The key is
+        # built from the VISIBLE trace/sample bounds (_render_key), so a 2-px
+        # nudge mapping to the same integer indices is gated, while a Y-zoom
+        # (which leaves the full_depth processed extent unchanged) correctly is
+        # NOT. A filter edit changes pipeline_sig, a clip/cmap change changes
+        # disp — both alter the key; an overlay-only refresh / a fit bypass it.
+        render_key = self._render_key(win, pipeline_sig, clip, disp,
+                                      col_offset=base_c0)
+        if (not fit and not overlays
+                and render_key == self._last_render_key):
+            # Nothing on screen would change — roll back the levels job we may
+            # have armed above (it must not run) and bail before dispatch.
+            self._pending_levels_key = None
+            return
 
         # ── Run the (memoized) pipeline on the full-depth bbox at the TRUE
         # dt (full_depth=True ⇒ effective_dt_us == dt_us always) ───────────
         # This is the heavy step (F-K's 2-D FFT, Deconvolution, …) — it runs on
         # a worker thread (see preview_worker.PipelineWorker) so the GUI thread
         # never blocks while it computes; _finish_refresh resumes on the result.
+        # A fresh CancelToken per dispatch: cancelling THIS one (see the
+        # worker-busy branch above) can never affect a future, unrelated run.
+        cancel_token = CancelToken()
+        self._cancel_token = cancel_token
         sub_ctx = DSPContext(dt_us=win.effective_dt_us, ns=win.sub.shape[0],
-                             n_traces=win.sub.shape[1])
+                             n_traces=win.sub.shape[1], cancel=cancel_token,
+                             preview=True)
+        if global_levels_job is not None:
+            global_levels_job = (
+                lambda d=data, dt=dt_us, c=clip, tok=cancel_token, a=levels_active_ns:
+                self._compute_global_levels(d, dt, c, cancel=tok, active_ns=a))
+        # NOTE: dist_km here is the FULL chain-wide array (NOT dist_km_window)
+        # — _finish_refresh's set_distance_axis call needs the whole chain's
+        # geometry for map-sync/pick lookups; win's LOCAL indices are
+        # converted back to absolute via col_offset at the 3 specific points
+        # that need it (see _finish_refresh's docstring).
         self._refresh_ctx = dict(obj=obj, win=win, disp=disp, dist_km=dist_km,
                                  n_traces=n_traces, t0_full=t0_full, dt_ms=dt_ms,
-                                 fit=fit, overlays=overlays)
-        worker = PipelineWorker(self.pipeline, win.sub, sub_ctx, win.token,
-                                global_levels_job=global_levels_job, parent=self)
+                                 fit=fit, overlays=overlays, band_meta=band_meta,
+                                 col_offset=base_c0)
+        # Telemetry: start of the round-trip clock, popped (not forwarded to
+        # _finish_refresh) in _on_pipeline_result. Kept out of render_key so it
+        # never affects gating.
+        self._refresh_dispatch_t = perf_counter() if _PERF else None
+        # Record the key for THIS dispatch so a later identical pan is gated.
+        # Reset to None on failure/cancel (see _on_pipeline_failed) so a
+        # never-rendered key can't wrongly suppress the next request.
+        self._last_render_key = render_key
+        # Two-pass split: Phase 1 runs pipeline_global on the full active band
+        # (same columns as win.sub but all active rows); Phase 2 extracts the
+        # visible+halo rows from Phase 1's output and runs pipeline_local on
+        # that narrower array.  win.sub was already sized with y_halo (the local
+        # window), so win.r0/r1/s0/s1 are local-window-relative and
+        # _finish_refresh needs no changes.  Default-argument capture in the
+        # closure prevents late-binding surprises.
+        split_fn = None
+        if has_local_after_gs:
+            full_lo = window_band[0] if window_band is not None else 0
+            full_hi = window_band[1] if window_band is not None else data.shape[0]
+            # Safety: full band must at least cover the local window (win.sub).
+            local_top = win.s0 - win.r0          # = sh0 from extract_visible_window
+            local_bot = local_top + win.sub.shape[0]   # = sh1 (exclusive)
+            full_hi = max(full_hi, local_bot)
+            win_full_sub = np.ascontiguousarray(
+                data[full_lo:full_hi, win.c0:win.c1])
+            full_token = (self._data_version, "gs",
+                          win.c0, win.c1, full_lo, full_hi)
+            lr0 = local_top - full_lo   # start of local window in global result
+            lr1 = lr0 + win.sub.shape[0]
+            _dt = dt_us
+            _ns_loc = win.sub.shape[0]
+            _nc_loc = win.sub.shape[1]
+            _pg = self.pipeline_global
+            _pl = self.pipeline_local
+            _ltok = win.token
+
+            def split_fn(cancel, _fw=win_full_sub, _ft=full_token,
+                         _lr0=lr0, _lr1=lr1, _dt=_dt,
+                         _ns=_ns_loc, _nc=_nc_loc,
+                         _pg=_pg, _pl=_pl, _ltok=_ltok):
+                fc = DSPContext(dt_us=_dt, ns=_fw.shape[0],
+                                n_traces=_fw.shape[1], cancel=cancel, preview=True)
+                g_out = _pg.process(_fw, fc, input_token=_ft, cancel=cancel)
+                loc = np.ascontiguousarray(g_out[_lr0:_lr1, :])
+                lc = DSPContext(dt_us=_dt, ns=_ns, n_traces=_nc,
+                                cancel=cancel, preview=True)
+                return _pl.process(loc, lc, input_token=_ltok, cancel=cancel)
+
+        worker = PipelineWorker(
+            self.pipeline, win.sub, sub_ctx, win.token,
+            split_fn=split_fn,
+            global_levels_job=global_levels_job,
+            cancel=cancel_token, parent=self)
         worker.succeeded.connect(self._on_pipeline_result)
         worker.failed.connect(self._on_pipeline_failed)
         worker.finished.connect(worker.deleteLater)
@@ -479,32 +1169,102 @@ class PreviewController(QObject):
 
         ``levels`` is the ``(vmax_proc, vmax_raw)`` the worker computed in
         the background when _refresh found no cached entry for
-        ``self._pending_levels_key`` — apply it now and cache it so the
-        SAME pipeline config never needs recomputing again."""
+        ``self._pending_levels_key`` — apply it now and cache it (both the
+        derived levels AND the raw sample arrays they came from, the latter
+        keyed without clip — see clip_changed) so the SAME pipeline config
+        never needs recomputing again, and a later clip-only change can
+        re-percentile these exact samples instantly instead."""
         ctx = self._refresh_ctx
         if levels is not None and self._pending_levels_key is not None:
-            self._global_vmax, self._global_vmax_raw = levels
-            self._global_levels_cache[self._pending_levels_key] = levels
+            vmax_proc, vmax_raw, raw_sample, processed_sample = levels
+            self._global_vmax, self._global_vmax_raw = vmax_proc, vmax_raw
+            self._global_levels_cache[self._pending_levels_key] = (vmax_proc, vmax_raw)
             self._global_levels_key = self._pending_levels_key
+            samples_key = self._pending_levels_key[:2]   # (data_version, pipeline_sig) — no clip
+            self._global_samples_cache[samples_key] = (raw_sample, processed_sample)
         self._pending_levels_key = None
         self._worker = None
         self._finish_refresh(processed, **ctx)
+        if _PERF and self._refresh_dispatch_t is not None:
+            _LOG.info("perf _refresh->result round-trip: %.1f ms (cols=%d, rows=%d)",
+                      (perf_counter() - self._refresh_dispatch_t) * 1e3,
+                      processed.shape[1], processed.shape[0])
+            self._refresh_dispatch_t = None
         self._dispatch_pending()
 
     def _on_pipeline_failed(self, token: object, message: str) -> None:
         self._worker = None
         self._pending_levels_key = None   # the job that would have filled it never ran
-        _LOG.error("DSP preview pipeline failed: %s", message)
+        # This dispatch never rendered, so its render_key does NOT describe the
+        # on-screen image — drop it so the gate can't wrongly skip the retry.
+        self._last_render_key = None
+        if message != CANCELLED_MESSAGE:
+            _LOG.error("DSP preview pipeline failed: %s", message)
+        # else: an intentional cooperative-cancellation abort (see _refresh's
+        # worker-busy branch) — expected, not an error, nothing to log.
         self._dispatch_pending()
+
+    # ── BasePrepWorker helpers (Phase 10: off-thread chain segment reload) ──
+
+    def _start_base_prep(self, obj: object, c0: int, c1: int, align: bool,
+                         fit: bool, overlays: bool) -> None:
+        """Dispatch a BasePrepWorker to read evicted chain columns off-thread.
+
+        ``align`` is captured HERE on the GUI thread (safe) and threaded into
+        ``_prepared_base`` via the ``_align`` kwarg so the worker never touches
+        Qt widget state.  On success, ``_on_base_prep_ready`` replays _refresh
+        which now finds ``_pc_array`` warm and dispatches PipelineWorker."""
+        self._pending_base_ctx = (fit, overlays)
+        token = (self._data_version, "base_prep", c0, c1)
+
+        def prep_fn(_obj=obj, _c0=c0, _c1=c1, _align=align):
+            self._prepared_base(_obj, _c0, _c1, _align=_align)
+
+        w = BasePrepWorker(prep_fn, token, parent=self)
+        w.succeeded.connect(self._on_base_prep_ready)
+        w.failed.connect(self._on_base_prep_failed)
+        self._base_worker = w
+        w.start()
+
+    def _on_base_prep_ready(self, token: object) -> None:
+        """_pc_array is warm — clear the worker slot, then replay pending work.
+
+        If a structural or param change arrived while the disk read was in
+        flight, ``_dispatch_pending`` handles it at the correct priority.
+        Otherwise replay the original (fit, overlays) context, which now
+        goes through _prepared_base as an instant cache HIT."""
+        self._base_worker = None
+        ctx = self._pending_base_ctx
+        self._pending_base_ctx = None
+        if self._pending_sync or self._pending_params:
+            self._dispatch_pending()
+            return
+        if ctx is not None and self._has_source:
+            fit, overlays = ctx
+            self._refresh(fit=fit, overlays=overlays)
+
+    def _on_base_prep_failed(self, token: object, msg: str) -> None:
+        """Segment reload failed — log and clear state.  The ViewBox stays
+        frozen at its last frame; the user can try panning back or reopening
+        the file."""
+        self._base_worker = None
+        self._pending_base_ctx = None
+        _LOG.error("BasePrepWorker: could not reload chain segment: %s", msg)
 
     def _dispatch_pending(self) -> None:
         """Replay the most recent trigger that arrived while the worker was busy.
-        A deferred ``_on_pipeline_changed`` (node list mutation) takes priority
-        over a plain refresh, since it must run before any new window is built."""
+        Priority: structural (pipeline_changed) > param-only (params_changed) >
+        plain refresh (pan/zoom). A structural change subsumes any pending param
+        change (the full _on_pipeline_changed rebuild handles both)."""
         if self._pending_sync:
             self._pending_sync = False
+            self._pending_params = False  # subsumed by structural rebuild
             self._pending = None
             self._on_pipeline_changed()
+        elif self._pending_params:
+            self._pending_params = False
+            self._pending = None
+            self._on_params_changed()
         elif self._pending is not None:
             fit, overlays = self._pending
             self._pending = None
@@ -516,6 +1276,9 @@ class PreviewController(QObject):
         toggle) — rare events where a brief wait is preferable to racing the
         worker thread over shared state. The common pan/zoom-while-computing
         case never calls this — it stays fully non-blocking via _pending."""
+        if self._base_worker is not None:
+            self._base_worker.wait()
+            self._base_worker = None
         if self._worker is not None:
             self._worker.wait()
             self._worker = None
@@ -523,11 +1286,39 @@ class PreviewController(QObject):
     def _finish_refresh(self, processed: np.ndarray, *, obj: object, win,
                         disp: dict, dist_km: np.ndarray, n_traces: int,
                         t0_full: float, dt_ms: float, fit: bool,
-                        overlays: bool) -> None:
+                        overlays: bool, band_meta: Optional[dict] = None,
+                        col_offset: int = 0) -> None:
+        """``dist_km`` is always the FULL, chain-wide array (map-sync/pick
+        lookups in ``set_distance_axis`` need the whole chain's geometry).
+        ``win``, however, may be LOCAL to a column-bounded ``_prepared_base``
+        read (Phase 7: the worker-dispatch path's ``win`` is local to
+        ``base_c0``; the pan-margin reslice path's ``rwin`` is already
+        absolute). ``col_offset`` is the ABSOLUTE column ``win``'s LOCAL
+        indices are relative to (0 / ``base_c0`` respectively) — added at
+        every point that indexes ``dist_km`` with a ``win`` index, or stores/
+        emits an absolute trace index for something OUTSIDE this call
+        (interpretation picks, the pan-margin cache)."""
         visible = win.crop_visible(processed)   # drop the halo rows+cols (decimated)
 
         if visible.size == 0:
             return
+
+        # Populate the pan-margin cache from this (margin-widened) dispatch so
+        # subsequent lateral pans within the band re-slice on the GUI thread
+        # (see PreviewController._refresh's fast path). ``processed`` is the
+        # full processed band; holding a reference is safe — DSP nodes never
+        # mutate their output in place, so this array is immutable once made,
+        # even after the pipeline prunes its own prefix cache. ``band_meta`` is
+        # None for the re-slice render itself (no re-store) and for any
+        # non-eligible dispatch (decimated / A-B / zoomed-out).
+        if band_meta is not None:
+            self._band_cache = ProcessedBand(
+                processed=processed, c0=win.c0 + col_offset,
+                c1=win.c1 + col_offset, n_traces=band_meta["n_traces_total"],
+                trace_halo=band_meta["trace_halo"], t0_ms=t0_full,
+                dt_us=band_meta["dt_us"], data_ns=band_meta["data_ns"],
+                data_version=self._data_version,
+                pipeline_sig=band_meta["pipeline_sig"], row0=band_meta["row0"])
 
         # ── Presentation ────────────────────────────────────────────────────
         from sbp_studio.core.constants import CMAPS
@@ -577,8 +1368,12 @@ class PreviewController(QObject):
             cmap_name += "_r"
 
         c1_idx = min(win.c_vis1 - 1, n_traces - 1)
-        dist0 = float(dist_km[win.c_vis0])
-        dist1 = float(dist_km[c1_idx])
+        # dist_km here is the FULL chain-wide array (see _refresh_ctx's
+        # comment) — win.c_vis0/c1_idx are LOCAL to a column-bounded
+        # _prepared_base read when col_offset != 0, so the absolute index
+        # into dist_km is the LOCAL index plus that offset.
+        dist0 = float(dist_km[win.c_vis0 + col_offset])
+        dist1 = float(dist_km[c1_idx + col_offset])
         t_top = t0_full + win.s0 * dt_ms
         t_bot = t0_full + win.s1 * dt_ms
 
@@ -594,7 +1389,7 @@ class PreviewController(QObject):
         # pan/zoom (see SeismicView._pick_x_km's docstring).
         self.view.show_preview(arr, dist0, dist1, t_top, t_bot,
                                vmax=vmax, vmin=vmin, fit=fit,
-                               c0=win.c_vis0, c1=c1_idx + 1)
+                               c0=win.c_vis0 + col_offset, c1=c1_idx + 1 + col_offset)
 
         # Emit after show_preview so the ViewBox is already fitted (fit=True):
         # the autoRange() inside show_preview fires sigRangeChanged, but
@@ -614,7 +1409,7 @@ class PreviewController(QObject):
                 raw=raw_visible, proc=proc_visible,
                 dist0=dist0, dist1=dist1, t_top=t_top, t_bot=t_bot,
                 vmax=vmax, vmin=vmin, cmap=cmap_name,
-                c0=win.c_vis0, c1=c1_idx + 1)
+                c0=win.c_vis0 + col_offset, c1=c1_idx + 1 + col_offset)
             split_km = dist0 + ab_split_frac * (dist1 - dist0)
             self.view.update_ab(True, split_km, t_top, t_bot, x0=dist0, x1=dist1)
             self.view.disable_wiggle()
@@ -741,7 +1536,9 @@ class PreviewController(QObject):
         obj = self._get_source()
         if obj is None or getattr(obj, "data", None) is None:
             return None
-        base, t0 = self._prepared_base(obj)        # full array: aligned + pre-crop mute
+        # No bounds passed → _prepared_base's whole-chain fallback (this path
+        # wants the full array regardless of scope; base_c0 is always 0 here).
+        base, t0, _base_c0 = self._prepared_base(obj)
         dt_us = int(obj.dt_us)
         node_cfgs = [(n.KEY, dict(n.params)) for n in self.pipeline.nodes]
 

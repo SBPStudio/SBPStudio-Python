@@ -97,6 +97,12 @@ class _ParamRow(QWidget):
     """A labelled slider+spinbox bound to one node param. Emits on value change."""
 
     changed = pyqtSignal()
+    # Interactive LOD (see PreviewController._on_interaction_started/_ended):
+    # fired on the SLIDER's own press/release only (not the spinbox — typing
+    # a value or using its arrows is a single discrete edit, not a drag with
+    # throwaway intermediate frames to mask the cost of).
+    interactionStarted = pyqtSignal()
+    interactionEnded = pyqtSignal()
 
     def __init__(self, node: DSPNode, spec: ParamSpec,
                  parent: Optional[QWidget] = None) -> None:
@@ -113,6 +119,8 @@ class _ParamRow(QWidget):
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(int(spec.lo * self._scale), int(spec.hi * self._scale))
         self.slider.setSingleStep(max(1, int(spec.step * self._scale)))
+        self.slider.sliderPressed.connect(self.interactionStarted.emit)
+        self.slider.sliderReleased.connect(self.interactionEnded.emit)
 
         if spec.decimals > 0:
             self.spin: QDoubleSpinBox | QSpinBox = QDoubleSpinBox()
@@ -247,9 +255,23 @@ class _BoolRow(QWidget):
 class PipelinePanel(QWidget):
     """Reorderable DSP node list + dynamic property editor (debounced)."""
 
-    # Emitted (debounced for param edits, immediate for structural edits) when
-    # the effective pipeline changes. A controller listens and re-runs preview.
+    # Emitted immediately on structural changes (add/remove/reorder/mute)
+    # and also used by the debounce path for any legacy connections. Structural
+    # changes invalidate the pan-margin cache (footprint may change) and must
+    # also call _sync_nodes() in the controller.
     pipeline_changed = pyqtSignal()
+    # Emitted (debounced, DEBOUNCE_MS) on parameter-only changes (slider /
+    # spinbox edits) — separated from pipeline_changed so the preview
+    # controller can refresh DSP WITHOUT clearing the pan-margin cache (the
+    # spatial footprint is unchanged; only the amplitude output within it
+    # differs). The pipeline_sig check in reslice_band guarantees the old
+    # cached band is never served with the new params.
+    params_changed = pyqtSignal()
+    # Forwarded from whichever _ParamRow's slider is currently being
+    # dragged (see _rebuild_editor) — drives PreviewController's interactive
+    # LOD (a slashed column extent for the duration of the drag).
+    interactionStarted = pyqtSignal()
+    interactionEnded = pyqtSignal()
 
     DEBOUNCE_MS = 200
 
@@ -263,7 +285,7 @@ class PipelinePanel(QWidget):
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(self.DEBOUNCE_MS)
-        self._debounce.timeout.connect(self.pipeline_changed.emit)
+        self._debounce.timeout.connect(self.params_changed.emit)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -656,6 +678,8 @@ class PipelinePanel(QWidget):
                 row = _BoolRow(node, spec)
             else:
                 row = _ParamRow(node, spec)
+                row.interactionStarted.connect(self.interactionStarted.emit)
+                row.interactionEnded.connect(self.interactionEnded.emit)
             row.changed.connect(self._schedule)   # param edit → debounced
             self._editor_rows.append(row)
             self._editor_form.addRow(tr_param(spec.label), row)
