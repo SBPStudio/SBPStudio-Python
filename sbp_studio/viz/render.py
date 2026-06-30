@@ -911,9 +911,13 @@ def render_profile_figure(
 
     clip_pct   = params.get("clip", 99.6)
     clip_lo_   = params.get("clip_lo", clip_lo)
-    vmin, vmax = _vmin_vmax(d, clip_pct, clip_lo_)
-    if params.get("amp_range") == "diverging":     # signed → colormap centred on 0
-        vmin = -vmax
+    if params.get("vmax_override"):
+        vmax = float(params["vmax_override"])
+        vmin = -vmax if params.get("amp_range") == "diverging" else 0.0
+    else:
+        vmin, vmax = _vmin_vmax(d, clip_pct, clip_lo_)
+        if params.get("amp_range") == "diverging":
+            vmin = -vmax
 
     cmap_base = CMAPS.get(params.get("cmap", "Viridis"), "viridis")
     cmap_name = cmap_base + "_r" if params.get("inv_cmap", False) else cmap_base
@@ -929,15 +933,15 @@ def render_profile_figure(
     # Layered: raster base (density) + optional wiggle/VA overlay. Density always
     # keeps the raster; 'Wiggle Only' (show_raster=False) applies in wiggle style.
     draw_raster = show_raster or style != "wiggle"
-    if draw_raster:
-        target  = (int(figsize[0] * dpi), int(figsize[1] * dpi))
-        resized = _colorize_for_target(d, cmap_name, vmin, vmax, target,
-                                       max_abs_pool=max_abs_pool)
-        # rasterized=True: the base stays a single embedded raster in vector
-        # output (PDF/SVG); the wiggle/VA overlay above remains true vector paths.
-        ax.imshow(resized, aspect="auto",
-                  interpolation=params.get("interp", "nearest"),
-                  extent=[x_lo, x_hi, t1, t0], rasterized=True)
+
+    # Add all axes decorations BEFORE the raster so tight_layout can settle the
+    # final axes geometry, then measure the exact axes pixel box, and only THEN
+    # colorize the data to that precise size.  This two-pass approach eliminates
+    # the double-resample: previously the RGBA was oversized to the full figure
+    # (figsize×dpi) and Matplotlib had to resample it again at draw time using
+    # hardcoded "antialiased".  Now the RGBA matches the axes box 1:1 so the
+    # imshow resample at draw time is a no-op and the user's interpolation choice
+    # is honoured without the dark-background bias that afflicted nearest-neighbor.
     if style == "wiggle":
         _draw_wiggle_overlay(ax, d, x_lo, x_hi, t0, t1, vmax=vmax,
                              va_fill=va_fill, show_wiggle_line=show_wiggle_line,
@@ -990,7 +994,26 @@ def render_profile_figure(
 
     _draw_picks(ax, picks, x_lo, x_hi, d.shape[1])
 
+    # Layout pass: settle all decorations so ax.get_position() reflects the
+    # real axes fraction after tight_layout trims margins for labels/colorbar.
     fig.tight_layout(pad=1.2)
+
+    if draw_raster:
+        # Measure the final axes pixel box from the settled layout.
+        ax_pos  = ax.get_position()
+        axes_w  = max(1, int(round(ax_pos.width  * figsize[0] * dpi)))
+        axes_h  = max(1, int(round(ax_pos.height * figsize[1] * dpi)))
+        resized = _colorize_for_target(d, cmap_name, vmin, vmax,
+                                       (axes_w, axes_h),
+                                       max_abs_pool=max_abs_pool,
+                                       interp=params.get("interp"))
+        ax.imshow(resized, aspect="auto",
+                  interpolation=params.get("interp") or "nearest",
+                  extent=[x_lo, x_hi, t1, t0], rasterized=True)
+        # Re-settle: adding the image rarely shifts axes geometry but the call
+        # is cheap and keeps the figure in a consistent state for the caller.
+        fig.tight_layout(pad=1.2)
+
     return fig
 
 
@@ -1064,42 +1087,33 @@ def render_chain_figure(
         int(np.searchsorted(ch.dist_km, bk)) for bk in ch.boundaries_km
     ] + [ch.n_traces]
 
-    tgt_h    = int(figsize[1] * dpi)   # target height in pixels
-    target_w = int(figsize[0] * dpi)   # target width in pixels
-
-    # Per-segment output pixel widths — proportional to trace count, last
-    # segment absorbs rounding so they sum exactly to target_w. This lets
-    # _colorize_for_target resize both axes in one pass on float32 (before
-    # colorization), eliminating the unbudgeted native-width intermediate that
-    # previously grew to n_traces × tgt_h × 4 bytes before the final resize.
-    seg_ns     = [e - s for s, e in zip(seg_boundaries[:-1], seg_boundaries[1:])]
-    total_tr   = ch.n_traces or 1
-    seg_widths = [round(target_w * n / total_tr) for n in seg_ns]
-    if seg_widths:
-        seg_widths[-1] = target_w - sum(seg_widths[:-1])
-
     # Density always keeps the raster; 'Wiggle Only' (show_raster=False) skips it.
     draw_raster = show_raster or style != "wiggle"
-    diverging  = params.get("amp_range") == "diverging"
-    rgba_segs  = []
-    seg_vmaxes = []
-    for i, (seg_start, seg_end) in enumerate(zip(seg_boundaries[:-1], seg_boundaries[1:])):
-        seg_d = d[:, seg_start:seg_end]
-        vm, vx = _vmin_vmax(seg_d, clip_pct, clip_lo_)
-        if diverging:                         # signed → colormap centred on 0
-            vm = -vx
-        seg_vmaxes.append(vx)
-        if draw_raster:                       # only build pixels we will show
-            seg_tgt = (max(1, seg_widths[i]), tgt_h)
-            rgba_segs.append(_colorize_for_target(seg_d, cmap_name, vm, vx, seg_tgt,
-                                                  max_abs_pool=max_abs_pool))
+    diverging   = params.get("amp_range") == "diverging"
+    _vmax_ov    = float(params["vmax_override"]) if params.get("vmax_override") else None
 
-    vmax_cb = float(np.median(seg_vmaxes)) if seg_vmaxes else 1.0
+    # Pass 1 — compute per-segment vmaxes only (cheap).  Colorization is deferred
+    # to after tight_layout so the RGBA is sized to the real axes pixel box, not
+    # the full figure (see the two-pass comment in render_profile_figure).
+    seg_ns    = [e - s for s, e in zip(seg_boundaries[:-1], seg_boundaries[1:])]
+    total_tr  = ch.n_traces or 1
+    seg_data: list = []    # (seg_slice, vm, vx) — views of d, no extra allocation
+    seg_vmaxes: list = []
+    for seg_start, seg_end in zip(seg_boundaries[:-1], seg_boundaries[1:]):
+        seg_d = d[:, seg_start:seg_end]
+        if _vmax_ov is not None:
+            vx = _vmax_ov
+            vm = -_vmax_ov if diverging else 0.0
+        else:
+            vm, vx = _vmin_vmax(seg_d, clip_pct, clip_lo_)
+            if diverging:
+                vm = -vx
+        seg_vmaxes.append(vx)
+        seg_data.append((seg_d, vm, vx))
+
+    vmax_cb = _vmax_ov if _vmax_ov is not None else (float(np.median(seg_vmaxes)) if seg_vmaxes else 1.0)
     vmin_cb = -vmax_cb if diverging else 0.0
-    # Segments are already at their final pixel dimensions; concatenation
-    # produces the complete (tgt_h, target_w, 4) array directly.
-    resized          = np.concatenate(rgba_segs, axis=1) if rgba_segs else None
-    n_traces_native  = ch.n_traces   # trace count for axis labelling (≠ pixel width)
+    n_traces_native = ch.n_traces   # trace count for axis labelling (≠ pixel width)
 
     fig = Figure(figsize=figsize, dpi=dpi, facecolor=C["panel"])
     ax  = fig.add_subplot(111)
@@ -1108,13 +1122,9 @@ def render_chain_figure(
     for sp in ax.spines.values():
         sp.set_edgecolor(C["accent"])
 
-    # Trace-axis extent uses the NATIVE trace count, not the (resized) pixel width.
+    # Trace-axis extent uses the NATIVE trace count, not the (yet-to-be-sized) pixel width.
     x_lo, x_hi = _x_axis_extent(x_axis, ch.dist_km[0], ch.dist_km[-1], n_traces_native)
-    if draw_raster and resized is not None:
-        # rasterized base raster; the wiggle/VA overlay stays vector in PDF/SVG.
-        ax.imshow(resized, aspect="auto",
-                  interpolation=params.get("interp", "nearest"),
-                  extent=[x_lo, x_hi, t1, t0], rasterized=True)
+
     if style == "wiggle":
         _draw_wiggle_overlay(ax, d, x_lo, x_hi, t0, t1, vmax=vmax_cb,
                              va_fill=va_fill, show_wiggle_line=show_wiggle_line,
@@ -1171,7 +1181,30 @@ def render_chain_figure(
 
     _draw_picks(ax, picks, x_lo, x_hi, n_traces_native)
 
+    # Layout pass: all decorations settled → measure the real axes pixel box.
     fig.tight_layout(pad=1.2)
+
+    if draw_raster:
+        # Pass 2 — colorize segments sized to the ACTUAL axes pixel dimensions.
+        ax_pos  = ax.get_position()
+        axes_w  = max(1, int(round(ax_pos.width  * figsize[0] * dpi)))
+        axes_h  = max(1, int(round(ax_pos.height * figsize[1] * dpi)))
+        seg_widths = [round(axes_w * n / total_tr) for n in seg_ns]
+        if seg_widths:
+            seg_widths[-1] = axes_w - sum(seg_widths[:-1])
+        rgba_segs = []
+        for i, (seg_d, vm, vx) in enumerate(seg_data):
+            seg_tgt = (max(1, seg_widths[i]), axes_h)
+            rgba_segs.append(_colorize_for_target(seg_d, cmap_name, vm, vx, seg_tgt,
+                                                  max_abs_pool=max_abs_pool,
+                                                  interp=params.get("interp")))
+        resized = np.concatenate(rgba_segs, axis=1) if rgba_segs else None
+        if resized is not None:
+            ax.imshow(resized, aspect="auto",
+                      interpolation=params.get("interp") or "nearest",
+                      extent=[x_lo, x_hi, t1, t0], rasterized=True)
+        fig.tight_layout(pad=1.2)
+
     return fig
 
 

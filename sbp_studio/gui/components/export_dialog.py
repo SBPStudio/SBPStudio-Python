@@ -26,6 +26,14 @@ from PyQt6.QtWidgets import (
 DPI_CHOICES = ["96", "150", "200", "300", "450", "600", "900", "1200", "1800", "2400"]
 DEFAULT_DPI = "1200"
 
+# Paper sizes imported here so the export dialog can show the budget estimate
+# using the selected paper dimensions instead of the view-scale figsize.
+# Defined in _render.py (the shared export-computation module) to avoid duplication.
+try:
+    from ..tabs._render import PAPER_SIZES
+except ImportError:
+    PAPER_SIZES = {"A4": (11.69, 8.27), "A3": (16.54, 11.69), "A0": (46.81, 33.11)}
+
 
 class ExportDialog(QDialog):
     """Collects the essential presentation options for a high-quality export."""
@@ -49,6 +57,11 @@ class ExportDialog(QDialog):
         for label, ext in (("PDF (vector)", "pdf"), ("PNG", "png"),
                             ("TIFF", "tiff"), ("SVG (vector)", "svg")):
             self.cb_format.addItem(label, ext)
+        self.cb_papersize = QComboBox()
+        for key in PAPER_SIZES:
+            self.cb_papersize.addItem(key)
+        self.cb_papersize.setCurrentText("A4")
+        self.cb_papersize.currentTextChanged.connect(lambda *_: self._update_budget_status())
         self.cb_dpi = QComboBox()
         self.cb_dpi.setEditable(True)
         self.cb_dpi.addItems(DPI_CHOICES)
@@ -90,6 +103,7 @@ class ExportDialog(QDialog):
 
         self._rows = [
             ("Format", self.cb_format),
+            ("Tamaño de Papel", self.cb_papersize),
             ("Resolution (DPI)", self.cb_dpi),
             ("Theme", self.cb_theme),
             ("X grid spacing (km)", self.sp_xtick),
@@ -184,8 +198,12 @@ class ExportDialog(QDialog):
             from ..tabs._render import (figsize_for_scale, effective_export_dpi,
                                         dpi_for_budget)
             chosen = self._dpi()
-            figsize = figsize_for_scale(self._source, self._scale_cfg, chosen,
-                                        self._velocity)
+            paper_key = self.cb_papersize.currentText()
+            if paper_key in PAPER_SIZES:
+                figsize = PAPER_SIZES[paper_key]
+            else:
+                figsize = figsize_for_scale(self._source, self._scale_cfg, chosen,
+                                            self._velocity)
             ns = int(getattr(self._source, "ns", 0))
             nt = int(getattr(self._source, "n_traces", 0))
             eff = effective_export_dpi(figsize, (ns, nt), chosen)
@@ -264,6 +282,7 @@ class ExportDialog(QDialog):
         return dict(
             # ── Exposed ──
             format=self.cb_format.currentData(),
+            paper_size=self.cb_papersize.currentText(),
             dpi=self._dpi(),
             theme=self.cb_theme.currentText(),
             draw_file_boundaries=self.cb_boundaries.isChecked(),
@@ -298,7 +317,8 @@ class ExportDialog(QDialog):
 
     def retranslate_ui(self) -> None:
         self.setWindowTitle(self.tr("Export options"))
-        labels = [self.tr("Format"), self.tr("Resolution (DPI)"), self.tr("Theme"),
+        labels = [self.tr("Format"), self.tr("Tamaño de Papel"),
+                  self.tr("Resolution (DPI)"), self.tr("Theme"),
                   self.tr("X grid spacing (km)"), self.tr("Y grid spacing (ms)"),
                   self.tr("Axis font size (pt)"), self.tr("Time-label font size (pt)"),
                   self.tr("Top margin (ms)"), self.tr("Bottom margin (ms)"),

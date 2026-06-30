@@ -35,8 +35,10 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import os
 import sys
 from pathlib import Path
+from time import perf_counter
 from typing import Callable, Optional, Tuple
 
 import numpy as np
@@ -54,8 +56,33 @@ from PyQt6.QtWidgets import (
     QSplitter, QVBoxLayout, QWidget,
 )
 
+from ...core.logger import get_logger
 from ..i18n import language_manager
 from ..theme import MONO, theme
+
+_LOG = get_logger("map")
+
+# Lightweight perf telemetry, off unless ``TOPAS_PERF=1`` (matches preview.py /
+# seismic_view.py) — when on, the per-call cost of re-uploading the visible
+# trackline segment is logged so the cadena pan cost is directly observable.
+_PERF = os.environ.get("TOPAS_PERF") == "1"
+
+
+def _unwrap_lons(lons: np.ndarray) -> np.ndarray:
+    """Return a display-safe copy of *lons* with dateline jumps unwrapped.
+
+    A survey that crosses the ±180° meridian produces consecutive longitudes
+    like […, 178, 179, -179, -178, …]. PyQtGraph draws a straight line across
+    the entire plot between those two points, causing a visual glitch and
+    potentially a crash on aspect-locked viewports. ``np.unwrap`` on the
+    radian-converted values converts that pair to […, 178, 179, 181, 182, …]
+    so the polyline stays continuous. The raw ``self._x`` array is preserved
+    unchanged for geographic checks (bbox, CRS detection, SHP export).
+    """
+    if lons.size < 2:
+        return lons.copy()
+    return np.rad2deg(np.unwrap(np.deg2rad(lons)))
+
 
 # Z-order bands. Basemap sits locked at the very bottom; the SEG-Y track/markers
 # at z ≥ 0 on top. Custom GIS layers live strictly in between, ordered by the
@@ -798,7 +825,8 @@ class MapView(QWidget):
         map_split.setSizes([1000, 190])
 
         # Track data (per trace).
-        self._x: Optional[np.ndarray] = None
+        self._x: Optional[np.ndarray] = None      # raw geographic coords (lon/lat or metres)
+        self._x_disp: Optional[np.ndarray] = None  # unwrapped display coords (dateline-safe)
         self._y: Optional[np.ndarray] = None
         # Authoritative geographic/projected flag derived from the ACTUAL CRS
         # (set_track / add_layer pass it down from the core; Bug #10). None =
@@ -923,10 +951,11 @@ class MapView(QWidget):
         self._geographic_hint = is_geographic
         self._x = np.asarray(x, dtype=float)
         self._y = np.asarray(y, dtype=float)
-        self.curve_full.setData(self._x, self._y)
+        self._x_disp = _unwrap_lons(self._x)
+        self.curve_full.setData(self._x_disp, self._y)
         if self._x.size:
-            self.marker_start.setData([self._x[0]], [self._y[0]])   # green = SOL
-            self.marker_end.setData([self._x[-1]], [self._y[-1]])   # red   = EOL
+            self.marker_start.setData([self._x_disp[0]], [self._y[0]])   # green = SOL
+            self.marker_end.setData([self._x_disp[-1]], [self._y[-1]])   # red   = EOL
         self.curve_seg.setData([], [])
         self._ensure_track_layer()          # the track is a managed list layer
         self._update_track_anchor()
@@ -948,10 +977,14 @@ class MapView(QWidget):
         n = self._x.size
         t0 = max(0, min(int(trace0), n - 1))
         t1 = max(t0 + 1, min(int(trace1), n))
-        self.curve_seg.setData(self._x[t0:t1], self._y[t0:t1])
+        t_start = perf_counter() if _PERF else 0.0
+        self.curve_seg.setData(self._x_disp[t0:t1], self._y[t0:t1])
+        if _PERF:
+            _LOG.info("perf MapView.set_visible_range: %.1f ms (%d pts)",
+                      (perf_counter() - t_start) * 1e3, t1 - t0)
 
     def clear(self) -> None:
-        self._x = self._y = None
+        self._x = self._y = self._x_disp = None
         self._geographic_hint = None     # next track re-establishes it (Bug #10)
         self.curve_full.setData([], [])
         self.curve_seg.setData([], [])
@@ -985,7 +1018,7 @@ class MapView(QWidget):
                 size=12, brush=pg.mkBrush("#ff3030"), pen=pg.mkPen("w", width=1.5))
             self._nav_marker.setZValue(80)   # above every layer, including drawn shapes
             self.plot.getViewBox().addItem(self._nav_marker, ignoreBounds=True)
-        self._nav_marker.setData([self._x[idx]], [self._y[idx]])
+        self._nav_marker.setData([self._x_disp[idx]], [self._y[idx]])
         self._nav_marker.setVisible(True)
 
     def hide_navigation_marker(self) -> None:
@@ -2220,8 +2253,9 @@ class MapView(QWidget):
         y = np.asarray(y, dtype=float)
         if x.size == 0:
             return
+        x_disp = _unwrap_lons(x)   # dateline-safe display coords; raw x kept for bbox check
         color = _LAYER_COLORS[self._layer_count % len(_LAYER_COLORS)]
-        line = pg.PlotDataItem(x, y, pen=pg.mkPen(color, width=2))
+        line = pg.PlotDataItem(x_disp, y, pen=pg.mkPen(color, width=2))
         if source_id is not None:
             # CRITICAL: the click only reaches sigClicked if the underlying
             # PlotCurveItem is made CLICKABLE — setAcceptedMouseButtons alone
@@ -2234,7 +2268,7 @@ class MapView(QWidget):
             line.setCurveClickable(True, width=8)
             line.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
 
-            def _on_track_clicked(_item, ev, _x=x, _y=y, sid=source_id) -> None:
+            def _on_track_clicked(_item, ev, _x=x_disp, _y=y, sid=source_id) -> None:
                 p = self.plot.getViewBox().mapSceneToView(ev.scenePos())
                 idx = int(np.argmin((_x - p.x()) ** 2 + (_y - p.y()) ** 2))
                 self.layer_source_clicked.emit(sid, idx)
@@ -2242,15 +2276,15 @@ class MapView(QWidget):
             line.sigClicked.connect(_on_track_clicked)
         else:
             line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        start = pg.ScatterPlotItem([x[0]], [y[0]], size=8,
+        start = pg.ScatterPlotItem([x_disp[0]], [y[0]], size=8,
                                    brush=pg.mkBrush(theme.color("ok")), pen=None)
-        end = pg.ScatterPlotItem([x[-1]], [y[-1]], size=8,
+        end = pg.ScatterPlotItem([x_disp[-1]], [y[-1]], size=8,
                                  brush=pg.mkBrush(theme.color("warn")), pen=None)
         for it in (start, end):
             it.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         mid = len(x) // 2
         li = self._register_layer(name, [line, start, end], "vector",
-                                  anchor=(float(x[mid]), float(y[mid])), markers=[start, end])
+                                  anchor=(float(x_disp[mid]), float(y[mid])), markers=[start, end])
         li.setData(_ROLE_SOURCE_ID, source_id)
         # Show the world basemap if these coordinates look geographic, then frame
         # the newly added geometry so the user sees it land (autoRange ignores the
@@ -2343,7 +2377,7 @@ class MapView(QWidget):
         if self._track_item is None or self._x is None or self._x.size == 0:
             return
         mid = self._x.size // 2
-        self._track_item.setData(_ROLE_ANCHOR, (float(self._x[mid]), float(self._y[mid])))
+        self._track_item.setData(_ROLE_ANCHOR, (float(self._x_disp[mid]), float(self._y[mid])))
         if self._track_item.data(_ROLE_LABEL_ON):
             self._show_label(self._track_item)   # reposition if currently shown
 

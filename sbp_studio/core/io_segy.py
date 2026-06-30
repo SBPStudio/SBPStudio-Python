@@ -87,6 +87,51 @@ _INT32_MAX = 2_147_483_647
 # high-latitude / Antarctic campaigns) yet small relative to a survey line.
 TRACK_SMOOTH_KERNEL = 11
 
+# Active-depth detection (SegyProfile.active_lo/active_ns): many marine
+# surveys record every shot with a FIXED listening window sized for the
+# deepest expected water depth across the whole campaign, so a file covering
+# a shallower stretch is mostly DEAD samples — trailing zeros below the real
+# signal (active_ns, the original bottom-only detection) AND, just as often,
+# LEADING zeros above it: a high-res SBP system starts recording at the ping
+# but the sub-bottom reflectors of interest don't arrive until after the
+# water-column travel time, which can be thousands of samples in deep water.
+# See model.SegyProfile.active_lo/active_ns's docstring. A row counts as
+# "live" once its max amplitude across all traces exceeds this fraction of
+# the profile's own clip_p99 (a per-file noise/scale reference, never an
+# absolute constant).
+ACTIVE_DEPTH_REL_THRESH = 0.01
+# Safety margin (samples) kept beyond the first/last detected live row on
+# EACH side — guards against a slightly conservative detection and gives
+# windowed filters with a small halo room past the cutoff.
+ACTIVE_DEPTH_MARGIN_SAMPLES = 50
+
+
+def _detect_active_band(data: np.ndarray, clip_p99: float) -> Tuple[int, int]:
+    """``(lo, hi)`` — the first and last+1 row (depth) with amplitude above
+    ``ACTIVE_DEPTH_REL_THRESH`` of ``clip_p99``, each padded by
+    ``ACTIVE_DEPTH_MARGIN_SAMPLES`` and clamped to ``[0, ns]`` — see
+    SegyProfile.active_lo/active_ns. Falls back to the full ``(0, ns)`` band
+    if every row is at/under the threshold (a blank file, or pure noise with
+    no real scale) — never returns something that would cut off real
+    signal."""
+    ns = data.shape[0]
+    if clip_p99 <= 0:
+        return 0, ns
+    threshold = ACTIVE_DEPTH_REL_THRESH * clip_p99
+    row_max = np.max(np.abs(data), axis=1)
+    live_rows = np.flatnonzero(row_max > threshold)
+    if live_rows.size == 0:
+        return 0, ns
+    lo = max(0, int(live_rows[0]) - ACTIVE_DEPTH_MARGIN_SAMPLES)
+    hi = min(ns, int(live_rows[-1]) + 1 + ACTIVE_DEPTH_MARGIN_SAMPLES)
+    return lo, hi
+
+
+def _detect_active_ns(data: np.ndarray, clip_p99: float) -> int:
+    """Backward-compatible bottom-only view of :func:`_detect_active_band` —
+    see SegyProfile.active_ns."""
+    return _detect_active_band(data, clip_p99)[1]
+
 
 # ── Internal helpers ────────────────────────────────────────────────────────────
 
@@ -312,7 +357,7 @@ def _dist_km(lons: np.ndarray, lats: np.ndarray, coord_unit: int) -> np.ndarray:
         -180 <= float(np.nanmedian(lons)) <= 180 and
         -90  <= float(np.nanmedian(lats)) <= 90)
     if _is_geo:
-        lat_m = np.mean(lats)
+        lat_m = np.nanmean(lats)
         d = np.sqrt((dlat * 111.32)**2 +
                     (dlon * 111.32 * np.cos(np.radians(lat_m)))**2)
     else:
@@ -555,10 +600,13 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
         prof.data     = data
         prof.amp_max  = np.max(np.abs(prof.data), axis=0)
         prof.clip_p99 = float(np.percentile(np.abs(prof.data), 99))
+        prof.active_lo, prof.active_ns = _detect_active_band(prof.data, prof.clip_p99)
     else:
         prof.data    = None
         prof.amp_max = None
         prof.clip_p99 = None
+        prof.active_lo = None
+        prof.active_ns = None
 
     prof.dur_ms  = prof.ns * prof.dt_us / 1000.0
     prof.t_ms    = prof.delay_ms + np.arange(prof.ns) * prof.dt_us / 1000.0

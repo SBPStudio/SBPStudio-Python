@@ -92,25 +92,34 @@ def _ref_compute_spectrum(data: np.ndarray, fs: float) -> SpectrumResult:
     step     = nfft // 2
     n_frames = max(1, (ns - nfft) // step + 1)
 
-    pwr = np.zeros((len(freqs), n_tr), dtype=np.float64)
+    # Cast to float32 early: the Welch frame loop otherwise builds a complex128
+    # intermediate (nfft × n_traces) per frame, spiking RAM by ~1.5 GB on wide
+    # profiles (50k traces, nfft 4096). float32 input → complex64 rfft → float32
+    # power accumulator halves both the per-frame spike and the pwr matrix.
+    data_f32 = np.ascontiguousarray(data, dtype=np.float32)
+    win_f32  = win.astype(np.float32)
+
+    pwr = np.zeros((len(freqs), n_tr), dtype=np.float32)
     for k in range(n_frames):
-        seg  = data[k * step: k * step + nfft, :] * win[:, None]
+        seg  = data_f32[k * step: k * step + nfft, :] * win_f32[:, None]
         pwr += np.abs(np.fft.rfft(seg, axis=0)) ** 2
     pwr /= n_frames
 
-    pwr_norm   = pwr / (pwr.max(axis=0, keepdims=True) + 1e-30)
-    spec_2d_db = 10 * np.log10(pwr_norm + 1e-30)
+    pwr_norm   = pwr / (pwr.max(axis=0, keepdims=True) + np.float32(1e-30))
+    spec_2d_db = (10 * np.log10(pwr_norm + np.float32(1e-30))).astype(np.float32)
 
-    pwr_mean     = pwr.mean(axis=1)
+    # Upcast only the small per-frequency mean (n_freqs elements, not n_traces)
+    # to float64 for the downstream statistics; pwr stays float32.
+    pwr_mean     = pwr.mean(axis=1).astype(np.float64)
     ref          = pwr_mean.max() + 1e-30
     spec_mean_db = 10 * np.log10(pwr_mean / ref)
 
-    pwr_p10 = np.percentile(pwr, 10, axis=1)
-    pwr_p50 = np.percentile(pwr, 50, axis=1)
-    pwr_p90 = np.percentile(pwr, 90, axis=1)
-    spec_p10_db = 10 * np.log10(pwr_p10 / ref)
-    spec_p50_db = 10 * np.log10(pwr_p50 / ref)
-    spec_p90_db = 10 * np.log10(pwr_p90 / ref)
+    # Single 3-quantile pass — 3× cheaper than three separate percentile calls
+    # over the (n_freqs, n_traces) pwr matrix.
+    pwr_p10, pwr_p50, pwr_p90 = np.percentile(pwr, [10, 50, 90], axis=1)
+    spec_p10_db = 10 * np.log10(pwr_p10.astype(np.float64) / ref)
+    spec_p50_db = 10 * np.log10(pwr_p50.astype(np.float64) / ref)
+    spec_p90_db = 10 * np.log10(pwr_p90.astype(np.float64) / ref)
 
     peak_hz     = float(freqs[np.argmax(pwr_mean)])
 

@@ -200,20 +200,20 @@ def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     ``None``/empty draws nothing (the default — batch exports never pass it).
     """
     from sbp_studio.viz.render import build_theme
+    from sbp_studio.gui.tabs._render import PAPER_SIZES
     # Full-resolution DSP pipeline (alignment + nodes) — shared with the viewport
     # HQ export so the crop is processed identically.
     data, _t0_full = _process_full_array(
         obj, params, node_cfg, align_enabled, cancel)
-    # ORIGINAL scaling: figsize from compute_figsize (n_traces·px/dpi width floored
-    # at 8in, height from the aspect ratio) — the proven, normal export sizing.
-    # effective_export_dpi is the ONLY retained safeguard: it raises the render DPI
-    # just enough that target ≥ (n_traces, ns) so Matplotlib never silently
-    # DOWNSAMPLES the matrix (which softened deep-profile PDFs). It adjusts pixel
-    # density only — the physical figsize (scaling) is untouched.
-    # Figsize from the SELECTED scale mode (aspect / VE / hybrid). The exported
-    # aspect ratio (and VE) are fixed by the mode; effective_export_dpi then raises
-    # the DPI so the embedded raster carries the full native grid (no decimation).
-    figsize = figsize_for_scale(obj, scale_cfg, int(cfg["dpi"]), cfg["velocity"])
+    # figsize: paper size (fixed landscape inches) when the user selected one,
+    # otherwise the view-scale-derived figsize (aspect / VE / hybrid mode).
+    # Paper size exports skip the post-render WYSIWYG aspect loop since the
+    # page dimensions are fixed by the chosen standard size.
+    paper_key = cfg.get("paper_size", "")
+    if paper_key in PAPER_SIZES:
+        figsize = PAPER_SIZES[paper_key]
+    else:
+        figsize = figsize_for_scale(obj, scale_cfg, int(cfg["dpi"]), cfg["velocity"])
     render_dpi = effective_export_dpi(figsize, data.shape, int(cfg["dpi"]))
     # RAM cap (parity with the CLI): never let the raster exceed the memory
     # budget. effective_export_dpi can raise the DPI toward 2400 to hit the native
@@ -255,7 +255,10 @@ def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
                                 **render_opts)
     # WYSIWYG aspect fit: grow the figure so the DATA box hits the mode's effective
     # aspect at full size (decorations take a fixed inch margin) — restores pixels.
-    aspect = eff_aspect
+    # Skipped when a paper size is set: the page dimensions are fixed by the chosen
+    # standard size; the two-pass RGBA sizing inside render_*_figure already ensures
+    # the raster fills the exact axes box without a secondary Matplotlib resample.
+    aspect = None if paper_key in PAPER_SIZES else eff_aspect
     if aspect:
         seis = next((a for a in fig.axes if a.get_images()), None)
         if seis is not None:
@@ -386,6 +389,10 @@ class SubTabbedTab(QWidget):
         self._on_boundaries_toggled(self.controls.boundaries_visible())
         self.controls.align_toggled.connect(lambda *_: self.preview.alignment_changed())
         self.controls.display_changed.connect(self.preview.display_changed)
+        # Clip slider: deliberately NOT display_changed — instant
+        # [vmin, vmax] update from cached samples, no PipelineWorker
+        # round-trip (see PreviewController.clip_changed).
+        self.controls.clip_changed.connect(self.preview.clip_changed)
         # Live raster pixel-scaling (nearest/bilinear) — a paint-time hint on the
         # view, not a data change, so it's applied directly (no DSP refresh).
         self.controls.interp_changed.connect(self._seismic.set_image_interpolation)
@@ -735,6 +742,25 @@ class SubTabbedTab(QWidget):
         # (t0 = min_delay when aligned).
         align_enabled = self.controls.align_enabled()
         params["align"] = align_enabled
+
+        # WYSIWYG amplitude: inject the live viewport's locked vmin/vmax so the
+        # PDF matches what's on screen exactly — the core renderer otherwise
+        # recomputes its own percentile from the full array, which differs from
+        # the preview's 5-block estimate and causes the "washed out PDF" effect.
+        if self._seismic is not None and self._seismic.has_image():
+            _live_vmin, _live_vmax = self._seismic.current_levels()
+            if _live_vmax is not None and _live_vmax > 0:
+                params["vmax_override"] = _live_vmax
+            # WYSIWYG aspect (free mode): use the live ViewBox's pixel proportions
+            # as the figure's W/H ratio so the export page has the same
+            # landscape/portrait feel as the screen — without this, free mode
+            # always falls back to the VE formula, which ignores the user's
+            # manual zoom.
+            if scale_cfg.get("mode") == "free":
+                _vb = self._seismic.plot.getViewBox()
+                _vb_w = max(1.0, _vb.width())
+                _vb_h = max(1.0, _vb.height())
+                scale_cfg = dict(scale_cfg, pixel_aspect=_vb_w / _vb_h)
 
         # Picks must be read from the live SeismicView HERE, on the GUI thread
         # (Qt widgets aren't thread-safe) — get_picks() already returns a

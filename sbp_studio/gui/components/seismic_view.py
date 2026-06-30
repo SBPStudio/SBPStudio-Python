@@ -49,7 +49,11 @@ _PERF = os.environ.get("TOPAS_PERF") == "1"
 # row-major: arr[row, col] → row = Y (time), col = X (distance).
 pg.setConfigOption("imageAxisOrder", "row-major")
 pg.setConfigOption("antialias", False)
-pg.setConfigOption("useOpenGL", True)   # hardware-accelerated pan/zoom
+try:
+    import PyQt6.QtOpenGL  # noqa: F401 — import probe; absent when Qt built without GL
+    pg.setConfigOption("useOpenGL", True)
+except ImportError:
+    pg.setConfigOption("useOpenGL", False)
 
 # FIX mark tuple: (number, distance_km, label)
 FixMark = Tuple[int, float, str]

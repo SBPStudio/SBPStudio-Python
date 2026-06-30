@@ -28,6 +28,15 @@ import numpy as np
 # huge-matrix export from producing an enormous embedded raster.
 EXPORT_DPI_CEILING = 2400
 
+# Standard paper sizes for the export dialog's paper-size dropdown.
+# Landscape orientation (width > height) suits seismic profiles.
+# Keys must match the QComboBox items in ExportDialog.
+PAPER_SIZES: dict = {
+    "A4": (11.69,  8.27),
+    "A3": (16.54, 11.69),
+    "A0": (46.81, 33.11),
+}
+
 # Peak host-RAM the Matplotlib/Agg raster holds per output pixel — mirrors the
 # CLI's commands._RASTER_BYTES_PER_PX so the GUI export obeys the SAME memory
 # limit. ~4 live RGBA buffers + slack (the WYSIWYG loop draws the canvas a few
@@ -193,6 +202,10 @@ def figsize_for_scale(source: Any, scale_cfg: dict, dpi: int,
     if mode == "aspect":
         ratio = scale_cfg.get("ratio") or 1.0
         h = max(0.5, w / ratio)
+    elif mode == "free" and scale_cfg.get("pixel_aspect"):
+        # WYSIWYG free mode: caller injected the ViewBox's W/H pixel ratio so the
+        # exported figure has the same landscape/portrait feel as the live screen.
+        h = max(0.5, w / float(scale_cfg["pixel_aspect"]))
     else:
         ve = scale_cfg.get("ve") or 1.0
         h = max(0.5, ve * depth_km / GUI_X_SCALE)
