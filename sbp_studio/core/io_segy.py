@@ -909,6 +909,11 @@ def _safe_coord(v: float, div: float) -> int:
     return int(np.clip(round(v / div), -_INT32_MAX, _INT32_MAX))
 
 
+def _safe_coords_bulk(arr: np.ndarray, div: float) -> np.ndarray:
+    """Vectorised _safe_coord — returns an int32 array for bulk attribute writes."""
+    return np.clip(np.round(arr / div), -_INT32_MAX, _INT32_MAX).astype(np.int32)
+
+
 def _build_transformer(src_str: str, dst_str: str) -> tuple:
     """
     Build a pyproj Transformer and return (tf, out_sc, new_uc, dst_geo, div).
@@ -1094,31 +1099,44 @@ def reproject_one(
             with segyio.create(outpath, spec) as dst:
                 dst.bin    = src.bin
                 dst.text[0] = src.text[0]
-                for i in range(n_src):
-                    cancel.check()
-                    if i % 500 == 0:
-                        log(f"  traza {i+1}/{n_src}…")
-                        progress(0.1 + 0.9 * i / n_src,
-                                 f"traza {i+1}/{n_src}")
-                    # Full trace header CLONED first (preserves
-                    # DelayRecordingTime, shotpoints, every other field) —
-                    # only the 6 coordinate fields below are ever
-                    # overwritten, regardless of amplitude_transform.
-                    h = dict(src.header[i])
-                    h.update({
-                        segyio.TraceField.SourceX:           _safe_coord(nxs[i], div),
-                        segyio.TraceField.SourceY:           _safe_coord(nys[i], div),
-                        segyio.TraceField.GroupX:            _safe_coord(nxs[i], div),
-                        segyio.TraceField.GroupY:            _safe_coord(nys[i], div),
+
+                cancel.check()
+                progress(0.15, "copying headers…")
+
+                # Phase 1: C-level bulk header clone — eliminates the Python
+                # per-trace loop and every dict(src.header[i]) allocation.
+                dst.header[:] = src.header[:]
+
+                # Phase 2: bulk overwrite the 6 coordinate fields only.
+                # One Python list-comprehension (6-key dicts, not 91) + one
+                # C-level write; SourceGroupScalar / CoordinateUnits are
+                # 2-byte fields — segyio truncates int32 → int16 on write.
+                scaled_x = _safe_coords_bulk(nxs, div)
+                scaled_y = _safe_coords_bulk(nys, div)
+                dst.header[:] = [
+                    {
+                        segyio.TraceField.SourceX:           int(scaled_x[i]),
+                        segyio.TraceField.SourceY:           int(scaled_y[i]),
+                        segyio.TraceField.GroupX:            int(scaled_x[i]),
+                        segyio.TraceField.GroupY:            int(scaled_y[i]),
                         segyio.TraceField.SourceGroupScalar: out_sc,
                         segyio.TraceField.CoordinateUnits:   new_uc,
-                    })
-                    dst.header[i] = h
-                    if processed is None:
-                        dst.trace[i] = src.trace[i]
-                    else:
-                        dst.trace[i] = np.ascontiguousarray(
-                            processed[:, i], dtype=np.float32)
+                    }
+                    for i in range(n_src)
+                ]
+
+                cancel.check()
+                progress(0.70, "copying samples…")
+
+                # Phase 3: bulk trace data copy.
+                # .raw bypasses per-trace IBM/IEEE conversion; byte-faithful
+                # for both float formats.  For the filtered path, processed
+                # is (ns, n_traces) → transpose to (n_traces, ns) for segyio.
+                if processed is None:
+                    dst.trace.raw[:] = src.trace.raw[:]
+                else:
+                    dst.trace[:] = np.ascontiguousarray(
+                        processed.T, dtype=np.float32)
 
         progress(1.0, "done")
         log(f"✔ Guardado: {Path(outpath).name}")
@@ -1211,28 +1229,42 @@ def reproject_chain(
                                 "amplitude_transform changed the array shape: "
                                 f"{full.shape} -> {processed.shape}")
 
-                    for i in range(int(src.tracecount)):
-                        cancel.check()
-                        if global_idx % 1000 == 0:
-                            log(f"    traza {global_idx+1}/{n_total}…")
-                            progress(global_idx / n_total,
-                                     f"traza {global_idx+1}/{n_total}")
-                        dst.header[global_idx] = src.header[i]
-                        dst.header[global_idx].update({
-                            segyio.TraceField.SourceX:           _safe_coord(nxs[i], div),
-                            segyio.TraceField.SourceY:           _safe_coord(nys[i], div),
-                            segyio.TraceField.GroupX:            _safe_coord(nxs[i], div),
-                            segyio.TraceField.GroupY:            _safe_coord(nys[i], div),
+                    n_src_i   = int(src.tracecount)
+                    seg_start = global_idx
+                    seg_end   = global_idx + n_src_i
+
+                    cancel.check()
+                    log(f"    trazas {seg_start+1}–{seg_end}/{n_total}…")
+                    progress(seg_start / n_total,
+                             f"traza {seg_start+1}/{n_total}")
+
+                    # Phase 1: C-level bulk header clone for this segment.
+                    dst.header[seg_start:seg_end] = src.header[:]
+
+                    # Phase 2: bulk overwrite coord + TraceNumber (7-key dicts).
+                    scaled_x = _safe_coords_bulk(nxs, div)
+                    scaled_y = _safe_coords_bulk(nys, div)
+                    dst.header[seg_start:seg_end] = [
+                        {
+                            segyio.TraceField.SourceX:           int(scaled_x[i]),
+                            segyio.TraceField.SourceY:           int(scaled_y[i]),
+                            segyio.TraceField.GroupX:            int(scaled_x[i]),
+                            segyio.TraceField.GroupY:            int(scaled_y[i]),
                             segyio.TraceField.SourceGroupScalar: out_sc,
                             segyio.TraceField.CoordinateUnits:   new_uc,
-                            segyio.TraceField.TraceNumber:       global_idx + 1,
-                        })
-                        if processed is None:
-                            dst.trace[global_idx] = src.trace[i]
-                        else:
-                            dst.trace[global_idx] = np.ascontiguousarray(
-                                processed[:, i], dtype=np.float32)
-                        global_idx += 1
+                            segyio.TraceField.TraceNumber:       seg_start + i + 1,
+                        }
+                        for i in range(n_src_i)
+                    ]
+
+                    # Phase 3: bulk trace data for this segment.
+                    if processed is None:
+                        dst.trace.raw[seg_start:seg_end] = src.trace.raw[:]
+                    else:
+                        dst.trace[seg_start:seg_end] = np.ascontiguousarray(
+                            processed.T, dtype=np.float32)
+
+                    global_idx = seg_end
 
         progress(1.0, "done")
         log(f"✔ Guardado: {Path(outpath).name}")
@@ -1317,18 +1349,27 @@ def join_profiles(
             for p_idx, sd in enumerate(ch.profiles):
                 log(f"  Copiando {p_idx+1}/{len(ch.profiles)}: {sd.name}…")
                 with segyio.open(sd.path, ignore_geometry=True) as src:
-                    for i in range(int(src.tracecount)):
-                        cancel.check()
-                        if global_idx % 1000 == 0:
-                            progress(global_idx / n_total,
-                                     f"traza {global_idx+1}/{n_total}")
-                        # Copy header verbatim; only update TraceNumber
-                        dst.header[global_idx] = src.header[i]
-                        dst.header[global_idx].update({
-                            segyio.TraceField.TraceNumber: global_idx + 1,
-                        })
-                        dst.trace[global_idx] = src.trace[i]
-                        global_idx += 1
+                    n_src_i   = int(src.tracecount)
+                    seg_start = global_idx
+                    seg_end   = global_idx + n_src_i
+
+                    cancel.check()
+                    progress(seg_start / n_total,
+                             f"traza {seg_start+1}/{n_total}")
+
+                    # Phase 1: C-level bulk header clone for this segment.
+                    dst.header[seg_start:seg_end] = src.header[:]
+
+                    # Phase 2: overwrite TraceNumber only (1-key dicts).
+                    dst.header[seg_start:seg_end] = [
+                        {segyio.TraceField.TraceNumber: seg_start + i + 1}
+                        for i in range(n_src_i)
+                    ]
+
+                    # Phase 3: bulk trace data (byte-faithful raw copy).
+                    dst.trace.raw[seg_start:seg_end] = src.trace.raw[:]
+
+                    global_idx = seg_end
 
         progress(1.0, "done")
         log(f"✔ Guardado: {Path(outpath).name}")
