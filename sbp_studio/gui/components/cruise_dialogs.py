@@ -14,6 +14,22 @@ Both open with a prominent banner describing the required directory structure
 (a base dir containing ``SGY/`` and ``RAW/`` subfolders, each with one folder
 per seismic line). Processing runs synchronously behind a wait cursor — the same
 one-shot behaviour as the original tools.
+
+Layout notes (post-mortem of the first cut)
+--------------------------------------------
+The very first version left the phase list squeezed into a small, immediately-
+scrolling area while empty space sat below it — two concrete bugs, now fixed:
+``AcquisitionStatsDialog`` hard-capped its scroll area at
+``setMaximumHeight(220)`` regardless of how tall the dialog itself was, and
+neither dialog ever called ``resize()`` (only ``setMinimumSize``), so both
+opened pinned near their minimum floor. Fixed here via ``QGroupBox`` sections
+(matching the original tkinter ``LabelFrame`` hierarchy), an explicit
+``setMinimumHeight`` floor on each phase row (so text fields never collapse),
+Expanding size policies with no artificial height cap on the phases scroll
+area, and :func:`_grow_for_new_row`, which grows the dialog's own height by one
+row's worth of space each time a phase is added — capped to the screen's
+available height, past which the (still generously-sized) scroll area takes
+over gracefully instead of squishing anything.
 """
 from __future__ import annotations
 
@@ -23,9 +39,9 @@ from typing import List, Optional
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QCursor, QFont
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
+    QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from ..theme import MONO, theme
@@ -54,6 +70,31 @@ class _DirStructureBanner(QLabel):
             " border-radius: 4px; padding: 8px 10px;")
 
 
+def _group_box(title: str) -> QGroupBox:
+    """A themed QGroupBox matching the app's bold/bright section-header look
+    (see theme.py's ``QLabel#section`` rule) — the visual-hierarchy anchor the
+    original tkinter tool used ``LabelFrame`` for ("Proyecto", "Fases del
+    proyecto", "Archivos de salida"). Un-styled QGroupBox would otherwise
+    render with the OS's light-mode default frame (the app only sets a QSS
+    stylesheet, not a dark QPalette), clashing badly with the dark theme."""
+    box = QGroupBox(title)
+    box.setStyleSheet(
+        "QGroupBox {"
+        f"  border: 1px solid {theme.color('accent')};"
+        "   border-radius: 6px;"
+        "   margin-top: 12px;"
+        "   font-weight: bold;"
+        f"  color: {theme.color('bright')};"
+        "   padding-top: 6px;"
+        "}"
+        "QGroupBox::title {"
+        "   subcontrol-origin: margin;"
+        "   left: 10px;"
+        "   padding: 0 6px;"
+        "}")
+    return box
+
+
 class _PhaseRowBase(QWidget):
     """Common framing for one removable phase row (bordered card + ✕ button)."""
 
@@ -62,7 +103,7 @@ class _PhaseRowBase(QWidget):
         self._remove_cb = remove_cb
         self.setStyleSheet(
             f"QWidget#phaseCard {{ border: 1px solid {theme.color('accent')};"
-            " border-radius: 4px; }}")
+            " border-radius: 4px; }")
         self.setObjectName("phaseCard")
 
 
@@ -72,20 +113,60 @@ def _browse_dir(parent: QWidget, line_edit: QLineEdit, title: str) -> None:
         line_edit.setText(d)
 
 
+def _grow_for_new_row(dialog: QDialog, row_min_height: int, spacing: int) -> None:
+    """Grow ``dialog``'s height by one row's worth of space when a phase is
+    added, so the scroll area genuinely gets bigger instead of immediately
+    scrolling — capped to the screen's available height so the window never
+    grows off-screen. Past that cap, the scroll area's own scrollbar (already
+    enabled via setWidgetResizable + an Expanding size policy) takes over."""
+    screen = dialog.screen() or QApplication.primaryScreen()
+    max_h = (screen.availableGeometry().height() - 80) if screen is not None else 900
+    new_h = min(dialog.height() + row_min_height + spacing, max_h)
+    if new_h > dialog.height():
+        dialog.resize(dialog.width(), new_h)
+
+
+def _phases_scroll_area(phases_box: QVBoxLayout) -> QScrollArea:
+    """Build the scrollable container hosting the phase rows. Expanding in
+    BOTH directions with no maximum height — the earlier version's hard
+    ``setMaximumHeight(220)`` on this exact widget was the concrete bug behind
+    "a scrollbar appears immediately even though there is empty space below":
+    it capped the phases area at 220px no matter how tall the dialog grew,
+    while whatever sat below it (a log console, in one case) soaked up all the
+    leftover space instead."""
+    container = QWidget()
+    container.setLayout(phases_box)
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+    scroll.setWidget(container)
+    return scroll
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # Tool A — Files & Coordinates
 # ════════════════════════════════════════════════════════════════════════════════
+
+# Two stacked rows (sheet/label/zone/detect/remove, then directory/browse) at
+# normal control height, plus card margins/spacing — a floor so a row can
+# never be squeezed below legible size regardless of how little room the
+# scroll viewport currently has.
+_FILES_ROW_MIN_HEIGHT = 92
+
 
 class _FilesPhaseRow(_PhaseRowBase):
     """One phase: sheet name, section label, forced UTM zone (+ detect), dir."""
 
     def __init__(self, index: int, remove_cb, parent=None) -> None:
         super().__init__(remove_cb, parent)
+        self.setMinimumHeight(_FILES_ROW_MIN_HEIGHT)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(6, 6, 6, 6)
-        lay.setSpacing(4)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
 
         top = QHBoxLayout()
+        top.setSpacing(6)
         self.ed_sheet = QLineEdit(self.tr("{n}ª FASE").format(n=index))
         self.ed_sheet.setMaximumWidth(110)
         self.ed_label = QLineEdit()
@@ -110,6 +191,7 @@ class _FilesPhaseRow(_PhaseRowBase):
         lay.addLayout(top)
 
         bot = QHBoxLayout()
+        bot.setSpacing(6)
         self.ed_dir = QLineEdit()
         self.ed_dir.setPlaceholderText(self.tr("Base directory (contains SGY/ and RAW/)"))
         btn_browse = QPushButton("📁")
@@ -193,9 +275,12 @@ class FilesCoordinatesDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(self.tr("Cruise — Files & Coordinates"))
         self.setMinimumSize(720, 560)
+        self.resize(780, 680)
         self._rows: List[_FilesPhaseRow] = []
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
 
         banner = _DirStructureBanner(self.tr(
             "<b>Required directory structure.</b> The base directory of each "
@@ -205,28 +290,39 @@ class FilesCoordinatesDialog(QDialog):
             "folders. Line start/end coordinates are read from the SEG-Y headers."))
         root.addWidget(banner)
 
-        proj_row = QHBoxLayout()
-        proj_row.addWidget(QLabel(self.tr("Project name:")))
+        # ── "Proyecto" ──
+        grp_project = _group_box(self.tr("Project"))
+        proj_lay = QHBoxLayout(grp_project)
+        proj_lay.setContentsMargins(10, 14, 10, 10)
+        proj_lay.setSpacing(8)
+        proj_lay.addWidget(QLabel(self.tr("Project name:")))
         self.ed_project = QLineEdit()
-        proj_row.addWidget(self.ed_project, 1)
-        root.addLayout(proj_row)
+        proj_lay.addWidget(self.ed_project, 1)
+        root.addWidget(grp_project)
 
-        # Scrollable phases area.
+        # ── "Fases del proyecto" — phase rows + Add button, exactly like the
+        # original LabelFrame (which hosted both together). ──
+        grp_phases = _group_box(self.tr("Phases of the project"))
+        phases_lay = QVBoxLayout(grp_phases)
+        phases_lay.setContentsMargins(10, 14, 10, 10)
+        phases_lay.setSpacing(8)
+
         self._phases_box = QVBoxLayout()
-        self._phases_box.setSpacing(6)
-        phases_container = QWidget()
-        phases_container.setLayout(self._phases_box)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(phases_container)
-        root.addWidget(scroll, 1)
+        self._phases_box.setSpacing(8)
+        scroll = _phases_scroll_area(self._phases_box)
+        phases_lay.addWidget(scroll, 1)
 
         self.btn_add = QPushButton(self.tr("+ Add phase"))
         self.btn_add.clicked.connect(self._add_phase)
-        root.addWidget(self.btn_add, 0, Qt.AlignmentFlag.AlignLeft)
+        phases_lay.addWidget(self.btn_add, 0, Qt.AlignmentFlag.AlignLeft)
+        root.addWidget(grp_phases, 1)
 
-        # Output paths.
-        out_form = QFormLayout()
+        # ── "Archivos de salida" ──
+        grp_out = _group_box(self.tr("Output files"))
+        out_form = QFormLayout(grp_out)
+        out_form.setContentsMargins(10, 14, 10, 10)
+        out_form.setVerticalSpacing(8)
+        out_form.setHorizontalSpacing(8)
         reg_row = QHBoxLayout()
         self.ed_out_reg = QLineEdit()
         btn_reg = QPushButton(self.tr("Browse…"))
@@ -241,7 +337,7 @@ class FilesCoordinatesDialog(QDialog):
         coord_row.addWidget(btn_coord)
         out_form.addRow(self.tr("Registry Excel:"), reg_row)
         out_form.addRow(self.tr("Coordinates Excel:"), coord_row)
-        root.addLayout(out_form)
+        root.addWidget(grp_out)
 
         self.btn_generate = QPushButton(self.tr("Generate both Excel files"))
         self.btn_generate.setObjectName("primary")
@@ -258,6 +354,7 @@ class FilesCoordinatesDialog(QDialog):
         row = _FilesPhaseRow(len(self._rows) + 1, self._remove_phase)
         self._rows.append(row)
         self._phases_box.addWidget(row)
+        _grow_for_new_row(self, _FILES_ROW_MIN_HEIGHT, self._phases_box.spacing())
 
     def _remove_phase(self, row: _FilesPhaseRow) -> None:
         if len(self._rows) == 1:
@@ -345,14 +442,21 @@ class FilesCoordinatesDialog(QDialog):
 # Tool B — Acquisition Stats
 # ════════════════════════════════════════════════════════════════════════════════
 
+# One control row per phase (name/dir/browse/remove) at normal control height,
+# plus card margins — same "never collapse below legible size" floor as
+# _FILES_ROW_MIN_HEIGHT above, sized for this row's single line of controls.
+_STATS_ROW_MIN_HEIGHT = 56
+
+
 class _StatsPhaseRow(_PhaseRowBase):
     """One phase: name + directory."""
 
     def __init__(self, index: int, remove_cb, parent=None) -> None:
         super().__init__(remove_cb, parent)
+        self.setMinimumHeight(_STATS_ROW_MIN_HEIGHT)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(6, 6, 6, 6)
-        lay.setSpacing(4)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
         self.ed_name = QLineEdit(self.tr("Phase {n}").format(n=index))
         self.ed_name.setMaximumWidth(130)
         self.ed_dir = QLineEdit()
@@ -393,9 +497,12 @@ class AcquisitionStatsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(self.tr("Cruise — Acquisition Stats"))
         self.setMinimumSize(760, 620)
+        self.resize(820, 720)
         self._rows: List[_StatsPhaseRow] = []
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
 
         banner = _DirStructureBanner(self.tr(
             "<b>Required directory structure.</b> Each phase directory must "
@@ -405,31 +512,39 @@ class AcquisitionStatsDialog(QDialog):
             "time and navigation headers."))
         root.addWidget(banner)
 
+        # ── "Fases a procesar" — phase rows + Add button, matching the
+        # original LabelFrame (which hosted both together). ──
+        grp_phases = _group_box(self.tr("Phases to process"))
+        phases_lay = QVBoxLayout(grp_phases)
+        phases_lay.setContentsMargins(10, 14, 10, 10)
+        phases_lay.setSpacing(8)
+
         self._phases_box = QVBoxLayout()
-        self._phases_box.setSpacing(6)
-        phases_container = QWidget()
-        phases_container.setLayout(self._phases_box)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(phases_container)
-        scroll.setMaximumHeight(220)
-        root.addWidget(scroll)
+        self._phases_box.setSpacing(8)
+        scroll = _phases_scroll_area(self._phases_box)
+        phases_lay.addWidget(scroll, 1)
 
         self.btn_add = QPushButton(self.tr("+ Add phase"))
         self.btn_add.clicked.connect(self._add_phase)
-        root.addWidget(self.btn_add, 0, Qt.AlignmentFlag.AlignLeft)
+        phases_lay.addWidget(self.btn_add, 0, Qt.AlignmentFlag.AlignLeft)
+        root.addWidget(grp_phases, 1)
 
         self.btn_calc = QPushButton(self.tr("⚡ Calculate metrics"))
         self.btn_calc.setObjectName("primary")
         self.btn_calc.clicked.connect(self._run)
         root.addWidget(self.btn_calc)
 
+        # ── "Resultados" ──
+        grp_log = _group_box(self.tr("Results"))
+        log_lay = QVBoxLayout(grp_log)
+        log_lay.setContentsMargins(10, 14, 10, 10)
         self.txt_log = QPlainTextEdit()
         self.txt_log.setReadOnly(True)
         self.txt_log.setFont(QFont(MONO, 9))
         self.txt_log.setSizePolicy(QSizePolicy.Policy.Expanding,
                                    QSizePolicy.Policy.Expanding)
-        root.addWidget(self.txt_log, 1)
+        log_lay.addWidget(self.txt_log)
+        root.addWidget(grp_log, 2)
 
         self._add_phase()
 
@@ -437,6 +552,7 @@ class AcquisitionStatsDialog(QDialog):
         row = _StatsPhaseRow(len(self._rows) + 1, self._remove_phase)
         self._rows.append(row)
         self._phases_box.addWidget(row)
+        _grow_for_new_row(self, _STATS_ROW_MIN_HEIGHT, self._phases_box.spacing())
 
     def _remove_phase(self, row: _StatsPhaseRow) -> None:
         if len(self._rows) == 1:
