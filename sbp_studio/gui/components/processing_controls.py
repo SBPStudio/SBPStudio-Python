@@ -178,7 +178,13 @@ class ProcessingControls(QWidget):
     scale_changed = pyqtSignal()  # aspect ratio changed (live)
     boundaries_toggled = pyqtSignal(bool)  # show/hide file-seam lines (live)
     align_toggled = pyqtSignal(bool)  # delay-alignment geometry toggled (rebuild base)
-    display_changed = pyqtSignal()  # cmap / clip / FIX changed → recolour preview
+    display_changed = pyqtSignal()  # cmap / FIX / etc. changed → recolour preview
+    # Clip slider moved — deliberately SEPARATE from display_changed: the
+    # controller answers this with an instant ImageItem.setLevels() from
+    # cached sample arrays, never a full _refresh()/PipelineWorker dispatch
+    # (see PreviewController.clip_changed) — must track a slider drag at
+    # 60 fps, which a worker round-trip per tick cannot guarantee.
+    clip_changed = pyqtSignal()
     interp_changed = pyqtSignal(str)  # 'nearest' | 'bilinear' → live ImageItem paint hint
     # Interpretation & Picking (Phase 3): checkable — True while picking mode
     # is active (double-click on the section places a marker).
@@ -363,8 +369,8 @@ class ProcessingControls(QWidget):
         # array before the dynamic DSP nodes), not a movable filter. File-seam
         # boundaries are a presentation overlay toggled live in the view —
         # moved to the "Marcas y Exportación" tab below (added straight to
-        # self._v2 regardless of the current build target, since align_delays/
-        # ab_compare on either side of it stay on this tab).
+        # self._v2 regardless of the current build target, since align_delays
+        # stays on this tab).
         self.sec_geometry = self._section()
         self.align_delays = QCheckBox()
         self.align_delays.setChecked(True)
@@ -374,13 +380,6 @@ class ProcessingControls(QWidget):
         self.show_boundaries.setChecked(False)   # default OFF (CRITICAL per spec)
         self.show_boundaries.toggled.connect(self.boundaries_toggled.emit)
         self._v2.addWidget(self.show_boundaries)   # lives on "Marcas y Exportación"
-        # A/B Compare: split the section into RAW (left) vs the live DSP
-        # pipeline output (right), with a labeled divider, so a filter's effect
-        # is judged side-by-side. A presentation toggle → drives display_changed.
-        self.ab_compare = QCheckBox()
-        self.ab_compare.setChecked(False)
-        self.ab_compare.toggled.connect(lambda *_: self.display_changed.emit())
-        v.addWidget(self.ab_compare)
 
         # ── Scale / proportions — FOUR mutually-exclusive vertical modes ─────
         # The live PyQtGraph preview AND the matplotlib export both follow the
@@ -597,18 +596,19 @@ class ProcessingControls(QWidget):
         v.addLayout(render_row)
 
         # ── Pixel interpolation for HQ Render / Image Export (and, live, the
-        # on-screen raster) — nearest keeps hard pixel edges (historical look);
-        # bilinear/bicubic smooth the upsampled raster. Nearest is the default so
-        # existing renders are unaffected until the user opts in. Compact pill
-        # toggles (QRadioButton, indicator-less per theme.py's segmented-control
-        # style) — same look as the amplitude-range / scale-mode rows above.
+        # on-screen raster) — nearest keeps hard pixel edges; bilinear/bicubic
+        # smooth the upsampled raster. Bicubic is the default: the highest-
+        # quality resampling, so exports look their best out of the box (the
+        # user can drop to nearest for a hard-pixel look). Compact pill toggles
+        # (QRadioButton, indicator-less per theme.py's segmented-control style)
+        # — same look as the amplitude-range / scale-mode rows above.
         interp_row = QHBoxLayout()
         interp_row.setContentsMargins(0, 0, 0, 0)
         interp_row.setSpacing(4)
         self.rb_interp_nearest = QRadioButton()
         self.rb_interp_bilinear = QRadioButton()
         self.rb_interp_bicubic = QRadioButton()
-        self.rb_interp_nearest.setChecked(True)
+        self.rb_interp_bicubic.setChecked(True)
         self._interp_group = QButtonGroup(self)
         self._interp_group.addButton(self.rb_interp_nearest)
         self._interp_group.addButton(self.rb_interp_bilinear)
@@ -676,7 +676,7 @@ class ProcessingControls(QWidget):
         self.inv_cmap.toggled.connect(lambda *_: self.display_changed.emit())
         self.amp_diverging.toggled.connect(lambda *_: self.display_changed.emit())
         self.amp_sequential.toggled.connect(lambda *_: self.display_changed.emit())
-        self.clip.valueChanged.connect(lambda *_: self.display_changed.emit())
+        self.clip.valueChanged.connect(lambda *_: self.clip_changed.emit())
         self.fix.toggled.connect(lambda *_: self.display_changed.emit())
         self.fix_interval.valueChanged.connect(lambda *_: self.display_changed.emit())
 
@@ -692,8 +692,19 @@ class ProcessingControls(QWidget):
         (_base.py's _build_controls_dock) owns the panel's lifetime/
         instance; this widget only places it — keeping every control inside
         one of the two stacked tab pages, with nothing left sitting above
-        or outside the tab strip."""
-        self._v1.insertWidget(0, panel)
+        or outside the tab strip.
+
+        Stretch factor 5 (vs the static controls' implicit 0 and the trailing
+        anchor spacer's 1 — see the "Controles content ends here" addStretch
+        below): without an explicit stretch here, ALL of the tab's surplus
+        vertical space was claimed by that spacer, leaving the panel (and the
+        QSplitter inside it) pinned to its bare minimum size — no matter how
+        much taller the dock actually was, the panel's own draggable splitter
+        had zero slack to redistribute and appeared completely locked. Giving
+        the panel the dominant share still leaves the spacer a token amount so
+        the static controls above it keep their historical "anchored to top"
+        feel."""
+        self._v1.insertWidget(0, panel, 5)
 
     def tab_bar(self) -> QTabBar:
         """The "Controles y Procesado" / "Marcas y Exportación" tab strip —
@@ -769,8 +780,6 @@ class ProcessingControls(QWidget):
             # Amplitude range: diverging (−1..1, signed) vs sequential (0..1, |amp|).
             amp_range=("diverging" if self.amp_diverging.isChecked()
                        else "sequential"),
-            # A/B Compare: raw|processed split render (see PreviewController).
-            ab_compare=self.ab_compare.isChecked(),
             # Pixel-scaling mode for HQ Render / Image Export rasters.
             interp=self.interp_mode(),
         )
@@ -1148,10 +1157,6 @@ class ProcessingControls(QWidget):
         self.align_delays.setText(self.tr("Compensate delays (align groups)"))
         self.show_boundaries.setText(self.tr("Show file boundaries"))
         self.show_boundaries.setToolTip(self.tr("Show file boundaries (red lines)"))
-        self.ab_compare.setText(self.tr("A/B Compare"))
-        self.ab_compare.setToolTip(self.tr(
-            "Split the section: raw data on the left, the DSP pipeline output "
-            "on the right, with a labeled divider."))
         self.sec_scale.setText(self.tr("SCALE / PROPORTIONS"))
         self.rb_free.setText(self.tr("Free (Fit to window)"))
         self.rb_free.setToolTip(self.tr(

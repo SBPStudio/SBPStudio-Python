@@ -855,6 +855,21 @@
 </context><context>
     <name>MainWindow</name>
     <message>
+        <location filename="..\main_window.py" line="1" />
+        <source>Cruise</source>
+        <translation>Campaña</translation>
+    </message>
+    <message>
+        <location filename="..\main_window.py" line="1" />
+        <source>Files &amp; Coordinates</source>
+        <translation>Ficheros</translation>
+    </message>
+    <message>
+        <location filename="..\main_window.py" line="1" />
+        <source>Acquisition Stats</source>
+        <translation>Estadísticas</translation>
+    </message>
+    <message>
         <location filename="..\main_window.py" line="422" />
         <source>Loading traces…</source>
         <translation>Cargando trazas…</translation>
@@ -2776,5 +2791,382 @@ Continue anyway?</source>
         <location filename="..\components\picking_export_dialog.py" line="66" />
         <source>Import is disabled while markers are already placed — importing replaces the current list. Clear the markers first.</source>
         <translation>Importar está deshabilitado mientras ya hay marcadores colocados — importar reemplaza la lista actual. Elimina primero los marcadores.</translation>
+    </message>
+</context><context>
+    <name>_FilesPhaseRow</name>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="1" />
+        <source>{n}ª FASE</source>
+        <translation>{n}ª FASE</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="2" />
+        <source>Detect the UTM zone from the first SGY</source>
+        <translation>Detecta la zona UTM del primer SGY</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="3" />
+        <source>Sheet:</source>
+        <translation>Pestaña:</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="4" />
+        <source>Label:</source>
+        <translation>Etiqueta:</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="5" />
+        <source>UTM zone:</source>
+        <translation>Zona UTM:</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="6" />
+        <source>Base directory (contains SGY/ and RAW/)</source>
+        <translation>Directorio base (contiene SGY/ y RAW/)</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="7" />
+        <source>Directory:</source>
+        <translation>Directorio:</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="8" />
+        <source>Select base directory (must contain SGY/ and RAW/)</source>
+        <translation>Seleccionar directorio base (debe contener SGY/ y RAW/)</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="9" />
+        <source>No directory</source>
+        <translation>Sin directorio</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="10" />
+        <source>Select the base directory first.</source>
+        <translation>Selecciona primero el directorio base.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="11" />
+        <source>No SGY files</source>
+        <translation>Sin ficheros SGY</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="12" />
+        <source>No .sgy files were found in SGY/ or RAW/.
+Enter the zone manually.</source>
+        <translation>No se encontraron ficheros .sgy en SGY/ ni RAW/.
+Introduce el huso manualmente.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="13" />
+        <source>Read error</source>
+        <translation>Error de lectura</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="14" />
+        <source>Could not read the coordinate from:
+{name}</source>
+        <translation>No se pudo leer la coordenada de:
+{name}</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="15" />
+        <source>UTM zone detected</source>
+        <translation>Zona UTM detectada</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="16" />
+        <source>File analysed: {name}
+First-trace longitude: {lon:.5f}°
+
+Detected UTM zone: {zone} → EPSG:326{zone:02d}
+
+You can change it before generating.</source>
+        <translation>Fichero analizado: {name}
+Longitud del primer trace: {lon:.5f}°
+
+Huso UTM detectado: {zone} → EPSG:326{zone:02d}
+
+Puedes cambiarlo antes de generar.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="17" />
+        <source>The sheet name cannot be empty.</source>
+        <translation>El nombre de pestaña no puede estar vacío.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="18" />
+        <source>Missing directory for phase '{p}'.</source>
+        <translation>Falta el directorio para la fase '{p}'.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="19" />
+        <source>Directory not found:
+{p}</source>
+        <translation>Directorio no encontrado:
+{p}</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="20" />
+        <source>UTM zone '{z}' out of range (1-60).</source>
+        <translation>Zona UTM '{z}' fuera de rango (1-60).</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="21" />
+        <source>UTM zone '{z}' is not a valid number.</source>
+        <translation>Zona UTM '{z}' no es un número válido.</translation>
+    </message>
+</context><context>
+    <name>FilesCoordinatesDialog</name>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="1" />
+        <source>Cruise — Files &amp; Coordinates</source>
+        <translation>Campaña — Ficheros y coordenadas</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="2" />
+        <source>&lt;b&gt;Required directory structure.&lt;/b&gt; The base directory of each phase must contain &lt;b&gt;SGY/&lt;/b&gt; and &lt;b&gt;RAW/&lt;/b&gt; subfolders, each with one folder per seismic line (e.g. &lt;code&gt;SGY/L1/*.sgy&lt;/code&gt;). Alternatively the base directory may itself hold the per-line folders. Line start/end coordinates are read from the SEG-Y headers.</source>
+        <translation>&lt;b&gt;Estructura de directorios requerida.&lt;/b&gt; El directorio base de cada fase debe contener las subcarpetas &lt;b&gt;SGY/&lt;/b&gt; y &lt;b&gt;RAW/&lt;/b&gt;, cada una con una carpeta por línea sísmica (p. ej. &lt;code&gt;SGY/L1/*.sgy&lt;/code&gt;). Alternativamente, el propio directorio base puede contener las carpetas de líneas. Las coordenadas de inicio/fin de línea se leen de las cabeceras SEG-Y.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="3" />
+        <source>Project name:</source>
+        <translation>Nombre del proyecto:</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="4" />
+        <source>+ Add phase</source>
+        <translation>+ Añadir fase</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="5" />
+        <source>Browse…</source>
+        <translation>Examinar…</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="6" />
+        <source>Registry Excel:</source>
+        <translation>Excel de registro:</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="7" />
+        <source>Coordinates Excel:</source>
+        <translation>Excel de coordenadas:</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="8" />
+        <source>Generate both Excel files</source>
+        <translation>Generar ambos Excel</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="9" />
+        <source>Ready.</source>
+        <translation>Listo.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="10" />
+        <source>Notice</source>
+        <translation>Aviso</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="11" />
+        <source>At least one phase is required.</source>
+        <translation>Debe haber al menos una fase.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="12" />
+        <source>Save output file</source>
+        <translation>Guardar archivo de salida</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="13" />
+        <source>Excel (*.xlsx)</source>
+        <translation>Excel (*.xlsx)</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="14" />
+        <source>Error</source>
+        <translation>Error</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="15" />
+        <source>Enter the project name.</source>
+        <translation>Introduce el nombre del proyecto.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="16" />
+        <source>Phase error</source>
+        <translation>Error en fase</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="17" />
+        <source>Processing…</source>
+        <translation>Procesando…</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="18" />
+        <source>Registry — file in use:
+{p}</source>
+        <translation>Registro — archivo en uso:
+{p}</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="19" />
+        <source>Coordinates — file in use:
+{p}</source>
+        <translation>Coordenadas — archivo en uso:
+{p}</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="20" />
+        <source>Completed with errors.</source>
+        <translation>Completado con errores.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="21" />
+        <source>Errors while generating</source>
+        <translation>Errores al generar</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="22" />
+        <source>Saved: {a}  |  {b}</source>
+        <translation>Guardados: {a}  |  {b}</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="23" />
+        <source>Completed</source>
+        <translation>Completado</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="24" />
+        <source>Files generated successfully.
+
+Registry ({rn}):
+{rl}
+
+Coordinates ({cn}):
+{cl}</source>
+        <translation>Archivos generados correctamente.
+
+Registro ({rn}):
+{rl}
+
+Coordenadas ({cn}):
+{cl}</translation>
+    </message>
+</context><context>
+    <name>_StatsPhaseRow</name>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="1" />
+        <source>Phase {n}</source>
+        <translation>Fase {n}</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="2" />
+        <source>Base directory (SGY)</source>
+        <translation>Directorio base (SGY)</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="3" />
+        <source>Select base directory (SGY)</source>
+        <translation>Seleccionar directorio base (SGY)</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="4" />
+        <source>Name:</source>
+        <translation>Nombre:</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="5" />
+        <source>Directory:</source>
+        <translation>Directorio:</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="6" />
+        <source>The phase name cannot be empty.</source>
+        <translation>El nombre de la fase no puede estar vacío.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="7" />
+        <source>Missing directory for phase '{p}'.</source>
+        <translation>Falta el directorio para la fase '{p}'.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="8" />
+        <source>Directory not found for phase '{p}':
+{d}</source>
+        <translation>Directorio no encontrado en la fase '{p}':
+{d}</translation>
+    </message>
+</context><context>
+    <name>AcquisitionStatsDialog</name>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="1" />
+        <source>Cruise — Acquisition Stats</source>
+        <translation>Campaña — Estadísticas de adquisición</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="2" />
+        <source>&lt;b&gt;Required directory structure.&lt;/b&gt; Each phase directory must contain the seismic lines as &lt;code&gt;*.sgy&lt;/code&gt; files — either directly, in per-line subfolders, or under an &lt;b&gt;SGY/&lt;/b&gt; subfolder. Ping rate, interval and vessel speed are computed from the SEG-Y time and navigation headers.</source>
+        <translation>&lt;b&gt;Estructura de directorios requerida.&lt;/b&gt; El directorio de cada fase debe contener las líneas sísmicas como ficheros &lt;code&gt;*.sgy&lt;/code&gt;, ya sea directamente, en subcarpetas por línea, o bajo una subcarpeta &lt;b&gt;SGY/&lt;/b&gt;. La tasa de disparo, el intervalo y la velocidad del buque se calculan a partir de las cabeceras de tiempo y navegación SEG-Y.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="3" />
+        <source>+ Add phase</source>
+        <translation>+ Añadir fase</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="4" />
+        <source>⚡ Calculate metrics</source>
+        <translation>⚡ Calcular métricas</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="5" />
+        <source>Notice</source>
+        <translation>Aviso</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="6" />
+        <source>At least one phase is required.</source>
+        <translation>Debe haber al menos una fase.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="7" />
+        <source>Phase error</source>
+        <translation>Error en fase</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="8" />
+        <source>🚀 PROJECT-WIDE AVERAGES:</source>
+        <translation>🚀 MÉTRICAS MEDIAS TOTALES (PROYECTO):</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="9" />
+        <source>   Ping rate:      {v:.2f} Hz</source>
+        <translation>   Tasa de disparo:   {v:.2f} Hz</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="10" />
+        <source>   Ping interval:  {v:.3f} s</source>
+        <translation>   Intervalo:         {v:.3f} s</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="11" />
+        <source>   Vessel speed:   {v:.2f} knots</source>
+        <translation>   Velocidad buque:   {v:.2f} nudos</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="12" />
+        <source>   Vessel speed:   no navigation data</source>
+        <translation>   Velocidad buque:   sin datos de navegación</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="13" />
+        <source>⚠️ No valid data found in the whole project.</source>
+        <translation>⚠️ No se encontraron datos válidos en todo el proyecto.</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="14" />
+        <source>Calculation error</source>
+        <translation>Error en el cálculo</translation>
     </message>
 </context></TS>

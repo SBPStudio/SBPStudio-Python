@@ -125,6 +125,17 @@ class MainWindow(QMainWindow):
         self._act_cli_guide.triggered.connect(self._show_cli_guide)
         self._menu_cli.addAction(self._act_cli_guide)
 
+        # ── Cruise menu (EXACTLY between CLI and Help) ───────────────────────
+        # Campaign-management tools ported from former standalone scripts:
+        # file/coordinate Excel generation + acquisition statistics.
+        self._menu_cruise = mb.addMenu("")
+        self._act_cruise_files = QAction("", self)
+        self._act_cruise_files.triggered.connect(self._show_cruise_files)
+        self._menu_cruise.addAction(self._act_cruise_files)
+        self._act_cruise_stats = QAction("", self)
+        self._act_cruise_stats.triggered.connect(self._show_cruise_stats)
+        self._menu_cruise.addAction(self._act_cruise_stats)
+
         # ── Help ─────────────────────────────────────────────────────────────
         self._menu_help = mb.addMenu("")
         self._act_help_module = QAction("", self)
@@ -1009,6 +1020,15 @@ class MainWindow(QMainWindow):
                     "data (SBP sonars).\nPyQt6 interface, decoupled from the "
                     "processing core."))
 
+    # ── Cruise (campaign) tools ──────────────────────────────────────────────
+    def _show_cruise_files(self) -> None:
+        from .components.cruise_dialogs import FilesCoordinatesDialog
+        FilesCoordinatesDialog(self).exec()
+
+    def _show_cruise_stats(self) -> None:
+        from .components.cruise_dialogs import AcquisitionStatsDialog
+        AcquisitionStatsDialog(self).exec()
+
     # ════════════════════════════════════════════════════════════════════════
     # i18n
     # ════════════════════════════════════════════════════════════════════════
@@ -1021,6 +1041,9 @@ class MainWindow(QMainWindow):
         self._menu_cli.setTitle(self.tr("CLI"))
         self._act_cli.setText(self.tr("Activate Console"))
         self._act_cli_guide.setText(self.tr("Command Guide"))
+        self._menu_cruise.setTitle(self.tr("Cruise"))
+        self._act_cruise_files.setText(self.tr("Files & Coordinates"))
+        self._act_cruise_stats.setText(self.tr("Acquisition Stats"))
         self._menu_help.setTitle(self.tr("Help"))
         self._btn_cancel.setToolTip(self.tr("Cancel the current task"))
         self._theme_actions["dark"].setText(self.tr("Dark"))
