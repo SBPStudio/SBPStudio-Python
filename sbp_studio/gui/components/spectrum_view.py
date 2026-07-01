@@ -26,7 +26,7 @@ import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QRectF, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
 
 from ..i18n import language_manager
@@ -69,6 +69,9 @@ class SpectrumView(QWidget):
         bar.addSpacing(10)
         bar.addWidget(self.lbl_scope)
         bar.addWidget(self.cb_scope)
+        self.chk_global_norm = QCheckBox()
+        self.chk_global_norm.stateChanged.connect(self._on_norm_toggle)
+        bar.addWidget(self.chk_global_norm)
         bar.addStretch(1)
         root.addLayout(bar)
 
@@ -115,7 +118,7 @@ class SpectrumView(QWidget):
         self.spectro.invertY(False)
         for ax in ("left", "bottom"):
             self.spectro.getAxis(ax).enableAutoSIPrefix(False)
-        self.img = pg.ImageItem()
+        self.img = pg.ImageItem(axisOrder='row-major')
         self.spectro.addItem(self.img)
         self._cbar = None
         self._spectro_lines: list = []
@@ -130,6 +133,10 @@ class SpectrumView(QWidget):
         self._bars = None
         self._band_peak_idx = -1     # which band carries the most energy
         self._n_bands = 0
+        self._last_sp:         None           = None
+        self._last_fs:         float          = 1.0
+        self._last_dist_km:    None           = None
+        self._last_boundaries: Sequence[float] = ()
 
         self.glw.ci.layout.setRowStretchFactor(0, 3)
         self.glw.ci.layout.setRowStretchFactor(1, 2)
@@ -184,18 +191,11 @@ class SpectrumView(QWidget):
         self.psd.setXRange(0, f_max, padding=0)
 
         # ── 2-D spectrogram ──
-        f_mask = sp.freqs <= f_max * 1000.0
-        spec2d = np.asarray(sp.spec_2d_db)[f_mask, :]
-        if dist_km is not None and len(dist_km):
-            x0, x1 = float(dist_km[0]), float(dist_km[-1])
-        else:
-            x0, x1 = 0.0, float(spec2d.shape[1])
-        self.img.setImage(spec2d, autoLevels=False)
-        self.img.setLevels([-50.0, 0.0])
-        self.img.setLookupTable(self._inferno_lut())
-        self.img.setRect(QRectF(x0, 0.0, max(1e-6, x1 - x0), f_max))
-        self._draw_spectro_lines(boundaries, bw3_lo, bw3_hi, pk)
-        self._update_cbar()
+        self._last_sp         = sp
+        self._last_fs         = fs
+        self._last_dist_km    = dist_km
+        self._last_boundaries = boundaries
+        self._draw_spectro(sp, fs, dist_km, boundaries)
 
         # ── Band-energy distribution ──
         self._draw_bands(sp)
@@ -211,6 +211,34 @@ class SpectrumView(QWidget):
         if self._bars is not None:
             self.bandplot.removeItem(self._bars); self._bars = None
         self.stats.setText("")
+
+    def _draw_spectro(self, sp, fs: float, dist_km, boundaries: Sequence[float]) -> None:
+        """Render the 2-D spectrogram honouring the global-norm toggle (#16)."""
+        f_max  = min(20.0, fs / 2000.0)
+        f_mask = sp.freqs <= f_max * 1000.0
+        bw3_lo = sp.bw_3db_lo / 1000.0
+        bw3_hi = sp.bw_3db_hi / 1000.0
+        pk     = sp.peak_hz   / 1000.0
+        use_global = self.chk_global_norm.isChecked()
+        raw    = (sp.spec_2d_db_global
+                  if use_global and hasattr(sp, "spec_2d_db_global")
+                  else sp.spec_2d_db)
+        spec2d = np.asarray(raw)[f_mask, :]
+        if dist_km is not None and len(dist_km):
+            x0, x1 = float(dist_km[0]), float(dist_km[-1])
+        else:
+            x0, x1 = 0.0, float(spec2d.shape[1])
+        self.img.setImage(spec2d, autoLevels=False)
+        self.img.setLevels([-50.0, 0.0])
+        self.img.setLookupTable(self._inferno_lut())
+        self.img.setRect(QRectF(x0, 0.0, max(1e-6, x1 - x0), f_max))
+        self._draw_spectro_lines(boundaries, bw3_lo, bw3_hi, pk)
+        self._update_cbar()
+
+    def _on_norm_toggle(self, _state: int) -> None:
+        if self._last_sp is not None:
+            self._draw_spectro(self._last_sp, self._last_fs,
+                               self._last_dist_km, self._last_boundaries)
 
     # ── Internals ───────────────────────────────────────────────────────────
 
@@ -352,8 +380,9 @@ class SpectrumView(QWidget):
         self.lbl_scope.setText(self.tr("Scope:"))
         self.cb_scope.setItemText(0, self.tr("Current ViewBox"))
         self.cb_scope.setItemText(1, self.tr("Full profile"))
+        self.chk_global_norm.setText(self.tr("Global norm."))
         self.psd.setLabel("bottom", self.tr("Frequency (kHz)"))
-        self.psd.setLabel("left", self.tr("Amplitude (dB re. max)"))
+        self.psd.setLabel("left", self.tr("PSD (dB re. max)"))
         self.psd.setTitle(self.tr("Welch spectrum + percentiles"),
                           color=theme.color("text"), size="9pt")
         self.spectro.setLabel("bottom", self.tr("Distance (km)"))

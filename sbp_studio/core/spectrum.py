@@ -53,7 +53,8 @@ class SpectrumResult:
     spec_p10_db:  np.ndarray   # (n_freqs,) — 10th percentile
     spec_p50_db:  np.ndarray   # (n_freqs,) — median
     spec_p90_db:  np.ndarray   # (n_freqs,) — 90th percentile
-    spec_2d_db:   np.ndarray   # (n_freqs, n_traces) — per-trace normalised dB
+    spec_2d_db:        np.ndarray   # (n_freqs, n_traces) — per-trace normalised dB
+    spec_2d_db_global: np.ndarray   # (n_freqs, n_traces) — ensemble-max normalised dB (#16)
     peak_hz:      float        # frequency of max power (Hz)
     centroid_hz:  float        # spectral centroid (Hz)
     bw_3db_lo:    float        # -3 dB bandwidth lower edge (Hz)
@@ -105,8 +106,24 @@ def _ref_compute_spectrum(data: np.ndarray, fs: float) -> SpectrumResult:
         pwr += np.abs(np.fft.rfft(seg, axis=0)) ** 2
     pwr /= n_frames
 
+    # #18: true one-sided Welch PSD normalization.
+    # Dividing by (fs × Σwin²) converts raw |FFT|² accumulator into
+    # physical power-spectral-density (u²/Hz). One-sided spectrum: all
+    # interior bins (neither DC nor Nyquist) are doubled because the two-
+    # sided energy folds onto them symmetrically.
+    _psd_norm = np.float32(float(fs) * float(np.sum(win_f32 ** 2)))
+    if _psd_norm > 0:
+        pwr /= _psd_norm
+        pwr[1:-1] *= np.float32(2.0)
+
     pwr_norm   = pwr / (pwr.max(axis=0, keepdims=True) + np.float32(1e-30))
     spec_2d_db = (10 * np.log10(pwr_norm + np.float32(1e-30))).astype(np.float32)
+
+    # #16: global-normalization variant — single ensemble max so relative
+    # amplitude across ALL traces is preserved (per-trace normalisation
+    # destroys that information).
+    global_max        = pwr.max() + np.float32(1e-30)
+    spec_2d_db_global = (10 * np.log10(pwr / global_max + np.float32(1e-30))).astype(np.float32)
 
     # Upcast only the small per-frequency mean (n_freqs elements, not n_traces)
     # to float64 for the downstream statistics; pwr stays float32.
@@ -143,14 +160,29 @@ def _ref_compute_spectrum(data: np.ndarray, fs: float) -> SpectrumResult:
     roll_off_idx = np.searchsorted(cum_energy, 0.85)
     roll_off_hz  = float(freqs[min(roll_off_idx, len(freqs) - 1)])
 
-    sig_mask   = (freqs >= 500) & (freqs <= 15000)
-    noise_mask = freqs > 15000
-    sig_pwr    = pwr_mean[sig_mask].mean()   if sig_mask.any()   else 1e-30
-    noise_pwr  = pwr_mean[noise_mask].mean() if noise_mask.any() else 1e-30
-    snr_db     = float(10 * np.log10(sig_pwr / (noise_pwr + 1e-30)))
+    # #17: Nyquist-aware SNR — gate the noise band so it never extends past
+    # 85 % of Nyquist (avoids aliasing artefacts at the band edge).
+    # When Nyquist is below ~17.6 kHz the noise band becomes empty; fall
+    # back to a bandwidth-relative SNR (lower-75% vs upper-25%) so the
+    # metric is always meaningful, guarded by noise_mask.any().
+    nyq            = fs / 2.0
+    noise_floor_hz = min(15000.0, nyq * 0.85)
+    sig_mask   = (freqs >= 500) & (freqs <= noise_floor_hz)
+    noise_mask = freqs > noise_floor_hz
+    sig_pwr    = pwr_mean[sig_mask].mean() if sig_mask.any() else 1e-30
+    if noise_mask.any():
+        noise_pwr = pwr_mean[noise_mask].mean()
+    else:
+        # Nyquist too low for a dedicated noise band: relative SNR fallback —
+        # signal = lower 75% of the available bandwidth, noise = upper 25%.
+        bw_split   = float(freqs[0]) + 0.75 * (float(freqs[-1]) - float(freqs[0]))
+        sig_mask_r = freqs <= bw_split
+        nse_mask_r = freqs >  bw_split
+        sig_pwr    = pwr_mean[sig_mask_r].mean() if sig_mask_r.any() else 1e-30
+        noise_pwr  = pwr_mean[nse_mask_r].mean() if nse_mask_r.any() else 1e-30
+    snr_db = float(10 * np.log10(sig_pwr / (noise_pwr + 1e-30)))
 
     # Per-band energy distribution (% of total) over the SBP bands of interest.
-    nyq          = fs / 2.0
     pwr_mean_lin = 10.0 ** (spec_mean_db / 10.0)
     band_labels: list = []
     band_powers: list = []
@@ -170,6 +202,7 @@ def _ref_compute_spectrum(data: np.ndarray, fs: float) -> SpectrumResult:
         spec_p50_db=spec_p50_db,
         spec_p90_db=spec_p90_db,
         spec_2d_db=spec_2d_db,
+        spec_2d_db_global=spec_2d_db_global,
         peak_hz=peak_hz,
         centroid_hz=centroid_hz,
         bw_3db_lo=bw3_lo, bw_3db_hi=bw3_hi,
