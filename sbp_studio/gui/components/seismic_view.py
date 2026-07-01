@@ -300,7 +300,7 @@ class SeismicView(QWidget):
         self._fix_lines: List[pg.InfiniteLine] = []
         self._fix_trace_indices: List[int] = []
 
-        # A/B Compare overlay: a vertical divider + "A (anchor)" / "B (final)"
+        # A/B Compare overlay: a vertical divider + "A (Before)" / "B (After)"
         # labels drawn over the anchor|processed composite raster (the controller
         # composites the image; this view only draws the marker). Lazily
         # created on first activation, then shown/hidden — see update_ab.
@@ -1333,7 +1333,7 @@ class SeismicView(QWidget):
 
         The controller has already spliced anchor|processed into the shown image;
         this only marks the boundary at ``split_km`` with a vertical DRAGGABLE
-        line and the "A (anchor)" / "B (final)" captions, and clamps the line
+        line and the "A (Before)" / "B (After)" captions, and clamps the line
         to the visible window [x0, x1]. Lazily creates the items the first
         time A/B is engaged, then toggles their visibility. Dragging the line
         emits :pyattr:`ab_split_changed`; the controller recomposes the split
@@ -1372,8 +1372,8 @@ class SeismicView(QWidget):
         self._ab_label_top = min(float(t_top), float(t_bot))   # cached for drag
         self._ab_divider.setPos(float(split_km))   # programmatic → no sigDragged
         self._ab_divider.setVisible(True)
-        self._ab_label_a.setText(self.tr("A (anchor)"))
-        self._ab_label_b.setText(self.tr("B (final)"))
+        self._ab_label_a.setText(self.tr("A (Before)"))
+        self._ab_label_b.setText(self.tr("B (After)"))
         self._position_ab_labels(float(split_km))
         self._ab_label_a.setVisible(True)
         self._ab_label_b.setVisible(True)

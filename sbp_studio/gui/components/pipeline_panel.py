@@ -30,7 +30,8 @@ from PyQt6.QtGui import QAction, QColor, QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame,
     QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem, QMenu,
-    QMessageBox, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget, QWidgetAction,
+    QMessageBox, QPushButton, QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QWidgetAction,
 )
 
 from ..dsp import (
@@ -253,6 +254,27 @@ class _BoolRow(QWidget):
         self.changed.emit()
 
 
+class _DragReorderList(QListWidget):
+    """QListWidget whose InternalMove drag-drops reliably announce a reorder.
+
+    ``model().rowsMoved`` is NOT dependable for a QListWidget InternalMove:
+    Qt implements the move as an insert-at-target + remove-source pair rather
+    than a true ``moveRows``, so which signal fires (``rowsMoved`` vs
+    ``rowsInserted``/``rowsRemoved``) is version-dependent — on several Qt
+    builds ``rowsMoved`` never fires at all, which is why reordering filters
+    silently failed to refresh the A/B baseline (the user had to toggle A/B
+    off/on). Overriding ``dropEvent`` to emit AFTER the base class has applied
+    the move is the Qt-correct, version-independent hook: it fires once per
+    user drop and never during programmatic ``addItem``/``clear`` rebuilds.
+    """
+
+    rows_reordered = pyqtSignal()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        super().dropEvent(event)
+        self.rows_reordered.emit()
+
+
 class PipelinePanel(QWidget):
     """Reorderable DSP node list + dynamic property editor (debounced)."""
 
@@ -314,16 +336,23 @@ class PipelinePanel(QWidget):
         root.addLayout(preset_row)
 
         # ── Node list (drag-drop reorder; per-row mute checkbox) ──
-        self.list = QListWidget()
+        self.list = _DragReorderList()
         self.list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # Vertically Expanding so the filter tree grows to fill the controls
+        # column (with the stretch factor below) — the panel is otherwise pinned
+        # to its size hint and cannot be dragged taller.
+        self.list.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                QSizePolicy.Policy.Expanding)
         self.list.currentItemChanged.connect(lambda *_: self._rebuild_editor())
         # Per-row checkbox = node mute/bypass (see _on_item_changed). itemChanged
         # also fires on text edits, but we only ever change text via setText with
         # the check-state preserved, so the handler simply re-syncs node.enabled.
         self.list.itemChanged.connect(self._on_item_changed)
-        # rowsMoved fires after a drag-drop reorder completes.
-        self.list.model().rowsMoved.connect(self._on_reordered)
+        # A completed drag-drop reorder → structural change (order-dependent
+        # caches, incl. the A/B baseline, must refresh). dropEvent-based, not
+        # the unreliable model().rowsMoved — see _DragReorderList.
+        self.list.rows_reordered.connect(self._on_reordered)
         root.addWidget(self.list, 1)
 
         # ── Add / Remove / Clear (mirrors the Loaded Profiles tree's button row:

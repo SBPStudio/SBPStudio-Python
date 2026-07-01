@@ -2297,14 +2297,14 @@ Perímetro: {2}</translation>
         <translation>Amplitud</translation>
     </message>
     <message>
-        <location filename="..\components\seismic_view.py" line="760" />
-        <source>A (raw)</source>
-        <translation>A (sin procesar)</translation>
+        <location filename="..\components\seismic_view.py" line="1375" />
+        <source>A (Before)</source>
+        <translation>A (Previo)</translation>
     </message>
     <message>
-        <location filename="..\components\seismic_view.py" line="761" />
-        <source>B (filtered)</source>
-        <translation>B (filtrado)</translation>
+        <location filename="..\components\seismic_view.py" line="1376" />
+        <source>B (After)</source>
+        <translation>B (Final)</translation>
     </message>
     <message>
         <location filename="..\components\seismic_view.py" line="619" />

@@ -43,6 +43,7 @@ import matplotlib
 matplotlib.use("Agg")  # must be called before importing Figure
 import matplotlib.colors as mcolors
 import matplotlib.patheffects as patheffects
+from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 
@@ -737,6 +738,12 @@ def _colorize_for_target(d: np.ndarray, cmap_name: str,
         :func:`_resize_rgba` (``"nearest"`` forces hard edges; default keeps the
         historical BILINEAR/LANCZOS smooth behaviour).
     """
+    # #10: failing filters (division-by-zero, sqrt of negative, etc.) leak
+    # NaN/Inf into the array. Left unhandled, these map to transparent/black
+    # pixels in the RGBA colormap instead of the neutral background — replace
+    # them with 0.0 (mid-scale, harmless) before any resampling or colorizing.
+    d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+
     src_h, src_w = d.shape
     tgt_w, tgt_h = target_px
 
@@ -783,11 +790,6 @@ WIGGLE_MAX_TRACES = 1200
 # legible while guaranteeing a gap between adjacent traces' max excursions.
 WIGGLE_GAIN_DEFAULT = 0.9
 
-# CV threshold for switching from imshow (uniform) to pcolormesh (non-uniform)
-# in render_profile_figure.  CV = std(Δkm) / mean(Δkm); 5% captures real
-# irregular-ping surveys while ignoring sub-percent GPS jitter (#14).
-_DIST_CV_THRESH = 0.05
-
 
 def _draw_wiggle_overlay(ax, d: np.ndarray, x_lo: float, x_hi: float,
                          t0: float, t1: float, *, vmax: float,
@@ -820,17 +822,42 @@ def _draw_wiggle_overlay(ax, d: np.ndarray, x_lo: float, x_hi: float,
     spacing = float(np.median(np.diff(centres))) if n_draw > 1 else span / max(1, n_cols)
     deflect = max(abs(spacing), 1e-6) * float(wiggle_gain)
     t = np.linspace(t0, t1, n_rows)
-    for j, xc in zip(cols, centres):
-        amp = np.clip(d[:, j] / vmax, -1.0, 1.0)
-        x = xc + amp * deflect
-        if show_wiggle_line:
-            ax.plot(x, t, color=color, lw=lw, antialiased=True, zorder=6)
-        if va_fill:
-            # interpolate=True: matplotlib linearly interpolates the fill boundary
-            # at zero-crossings → mathematically clean vector paths in PDF/SVG
-            # (no raster-like stair-steps at the positive/negative transitions).
-            ax.fill_betweenx(t, xc, x, where=(amp > 0), color=color,
-                             linewidth=0, interpolate=True, zorder=6)
+
+    # #9: build ALL traces' geometry as vectorized NumPy arrays and hand them
+    # to a single LineCollection / PolyCollection each, instead of calling
+    # ax.plot()/ax.fill_betweenx() once per trace. Each of those per-trace
+    # calls pays Matplotlib's Artist-creation + transform-registration
+    # overhead; on a 1200-trace wiggle overlay that overhead dominates the
+    # actual draw time. Two collections == two Artists, regardless of n_draw.
+    amp_all = np.clip(d[:, cols] / vmax, -1.0, 1.0)        # (n_rows, n_draw)
+    x_all   = centres[None, :] + amp_all * deflect         # (n_rows, n_draw)
+
+    if show_wiggle_line:
+        line_segs = np.empty((n_draw, n_rows, 2), dtype=float)
+        line_segs[:, :, 0] = x_all.T
+        line_segs[:, :, 1] = t[None, :]
+        lc = LineCollection(line_segs, colors=color, linewidths=lw,
+                            antialiaseds=True, zorder=6)
+        ax.add_collection(lc)
+
+    if va_fill:
+        # Positive-lobe hull: clipping the deflection to >=0 collapses the
+        # boundary onto the trace's own baseline (xc) at every negative
+        # excursion, so the polygon area vanishes there automatically —
+        # equivalent to the old where=(amp>0)+interpolate=True fill without
+        # needing to hand-detect zero-crossings per sample.
+        pos_all   = np.maximum(amp_all, 0.0)
+        xhull_all = centres[None, :] + pos_all * deflect   # (n_rows, n_draw)
+        t_rev = t[::-1]
+        polys = []
+        for j in range(n_draw):
+            xc  = centres[j]
+            fwd  = np.column_stack((xhull_all[:, j], t))
+            back = np.column_stack((np.full(n_rows, xc), t_rev))
+            polys.append(np.vstack((fwd, back)))
+        pc = PolyCollection(polys, facecolors=color, edgecolors="none", zorder=6)
+        ax.add_collection(pc)
+
     ax.set_xlim(x_lo, x_hi)
     ax.set_ylim(t1, t0)            # time downward — matches the imshow extent
 
@@ -1004,44 +1031,29 @@ def render_profile_figure(
     fig.tight_layout(pad=1.2)
 
     if draw_raster:
-        # #14: choose rendering path based on trace-spacing uniformity.
-        # Coefficient of variation of inter-trace distances: > _DIST_CV_THRESH
-        # AND x_axis=="distance" → pcolormesh with real km X-coordinates so
-        # the horizontal axis is geophysically accurate (WYSIWYG).  All other
-        # cases use the optimised two-pass imshow path (colorize-to-pixel-size
-        # then raster, no double-resample).
-        _spacing = np.diff(sd.dist_km)
-        _mean_sp = float(_spacing.mean()) if _spacing.size else 0.0
-        _cv      = (float(_spacing.std()) / _mean_sp
-                    if _mean_sp > 0 else 0.0)
-        _use_mesh = x_axis == "distance" and _cv > _DIST_CV_THRESH
-
-        if _use_mesh:
-            # Non-uniform spacing: pcolormesh with actual km X-coordinates.
-            # shading='nearest' → Z[i,j] centred on (X[j], Y[i]); no extra
-            # edge array needed.  y-axis explicitly inverted (t0 at top).
-            t_axis = np.linspace(t0, t1, d.shape[0])
-            ax.pcolormesh(sd.dist_km[:d.shape[1]], t_axis, d,
-                          cmap=cmap_name,
-                          norm=mcolors.Normalize(vmin, vmax),
-                          shading="nearest",
-                          rasterized=True)
-            ax.set_xlim(x_lo, x_hi)
-            ax.set_ylim(t1, t0)     # inverted: shallow time at top
-        else:
-            # Uniform (or near-uniform) spacing: optimised two-pass path —
-            # colorize to the exact axes pixel box then imshow 1:1 (no
-            # Matplotlib resampling, no double-resample bias).
-            ax_pos  = ax.get_position()
-            axes_w  = max(1, int(round(ax_pos.width  * figsize[0] * dpi)))
-            axes_h  = max(1, int(round(ax_pos.height * figsize[1] * dpi)))
-            resized = _colorize_for_target(d, cmap_name, vmin, vmax,
-                                           (axes_w, axes_h),
-                                           max_abs_pool=max_abs_pool,
-                                           interp=params.get("interp"))
-            ax.imshow(resized, aspect="auto",
-                      interpolation=params.get("interp") or "nearest",
-                      extent=[x_lo, x_hi, t1, t0], rasterized=True)
+        # Two-pass raster path (always): colorize the float array to the EXACT
+        # axes pixel box, then imshow it 1:1 (no Matplotlib re-resample, no
+        # double-resample bias). ``extent`` places it on whichever X axis mode
+        # is active — for "distance" the km extent is a UNIFORM linear mapping
+        # of the trace columns (dist_km[0]..dist_km[-1]); genuinely non-uniform
+        # ping spacing is intentionally NOT honoured here.
+        #
+        # The former WYSIWYG non-uniform-spacing path (pcolormesh, then a
+        # NonUniformImage) was removed: it colorized the FULL native array
+        # up-front (a 14k×20k chain = ~1.1 GiB RGBA — the reported export
+        # MemoryError) and/or vector-drew one polygon per data cell, which was
+        # both a stability risk and a severe slowdown. System stability and the
+        # memory-bounded two-pass sizing overrule perfect distance scaling.
+        ax_pos  = ax.get_position()
+        axes_w  = max(1, int(round(ax_pos.width  * figsize[0] * dpi)))
+        axes_h  = max(1, int(round(ax_pos.height * figsize[1] * dpi)))
+        resized = _colorize_for_target(d, cmap_name, vmin, vmax,
+                                       (axes_w, axes_h),
+                                       max_abs_pool=max_abs_pool,
+                                       interp=params.get("interp"))
+        ax.imshow(resized, aspect="auto",
+                  interpolation=params.get("interp") or "nearest",
+                  extent=[x_lo, x_hi, t1, t0], rasterized=True)
 
         # Re-settle: cheap call that keeps the figure in a consistent state.
         fig.tight_layout(pad=1.2)
@@ -1092,7 +1104,8 @@ def render_chain_figure(
     """
     Render a ProfileChain as a headless Matplotlib figure.
 
-    Per-segment vmax normalisation, boundary vlines, colorbar = median vmax.
+    Global vmax normalisation (max across segments), boundary vlines, colorbar
+    shares the same global vmax — avoids brightness seams at file joins (#15).
     ``x_axis`` ("distance"|"trace"|"km") selects the bottom-axis mode — see the
     module-level X-axis helpers. Defaults to "distance" (historical behaviour).
 
@@ -1143,7 +1156,12 @@ def render_chain_figure(
         seg_vmaxes.append(vx)
         seg_data.append((seg_d, vm, vx))
 
-    vmax_cb = _vmax_ov if _vmax_ov is not None else (float(np.median(seg_vmaxes)) if seg_vmaxes else 1.0)
+    # #15: normalise EVERY segment (and the colorbar) to the same GLOBAL max
+    # instead of the per-segment/median vmax. Per-segment normalisation makes
+    # each chain-joined file self-contrast-stretch to its own clip percentile,
+    # so a quiet segment next to a loud one shows a visible brightness "seam"
+    # at the file boundary even though nothing physically changed there.
+    vmax_cb = _vmax_ov if _vmax_ov is not None else (float(max(seg_vmaxes)) if seg_vmaxes else 1.0)
     vmin_cb = -vmax_cb if diverging else 0.0
     n_traces_native = ch.n_traces   # trace count for axis labelling (≠ pixel width)
 
@@ -1186,7 +1204,7 @@ def render_chain_figure(
     cb = fig.colorbar(sm, ax=ax, pad=0.01, fraction=0.015)
     cb.ax.yaxis.set_tick_params(color=C["sub"], labelsize=7)
     cb.ax.yaxis.set_tick_params(labelcolor=C["sub"])
-    cb.set_label("Amplitude (median vmax)", color=C["sub"], fontsize=8)
+    cb.set_label("Amplitude (global vmax)", color=C["sub"], fontsize=8)
 
     title_str = title_override or (
         f"{ch.label}  ·  {ch.n_traces} tr  ·  {ch.dt_us} µs  ·  "
@@ -1225,9 +1243,11 @@ def render_chain_figure(
         if seg_widths:
             seg_widths[-1] = axes_w - sum(seg_widths[:-1])
         rgba_segs = []
-        for i, (seg_d, vm, vx) in enumerate(seg_data):
+        for i, (seg_d, _vm, _vx) in enumerate(seg_data):
             seg_tgt = (max(1, seg_widths[i]), axes_h)
-            rgba_segs.append(_colorize_for_target(seg_d, cmap_name, vm, vx, seg_tgt,
+            # #15: use the unified vmin_cb/vmax_cb (same values driving the
+            # colorbar) for every segment, not this segment's own vm/vx.
+            rgba_segs.append(_colorize_for_target(seg_d, cmap_name, vmin_cb, vmax_cb, seg_tgt,
                                                   max_abs_pool=max_abs_pool,
                                                   interp=params.get("interp")))
         resized = np.concatenate(rgba_segs, axis=1) if rgba_segs else None
