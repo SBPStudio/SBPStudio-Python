@@ -2919,6 +2919,21 @@ Puedes cambiarlo antes de generar.</translation>
     <name>FilesCoordinatesDialog</name>
     <message>
         <location filename="..\components\cruise_dialogs.py" line="1" />
+        <source>Project</source>
+        <translation>Proyecto</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="1" />
+        <source>Phases of the project</source>
+        <translation>Fases del proyecto</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="1" />
+        <source>Output files</source>
+        <translation>Archivos de salida</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="1" />
         <source>Cruise — Files &amp; Coordinates</source>
         <translation>Campaña — Ficheros y coordenadas</translation>
     </message>
@@ -3099,6 +3114,16 @@ Coordenadas ({cn}):
     </message>
 </context><context>
     <name>AcquisitionStatsDialog</name>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="1" />
+        <source>Phases to process</source>
+        <translation>Fases a procesar</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="1" />
+        <source>Results</source>
+        <translation>Resultados</translation>
+    </message>
     <message>
         <location filename="..\components\cruise_dialogs.py" line="1" />
         <source>Cruise — Acquisition Stats</source>
