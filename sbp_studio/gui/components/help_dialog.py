@@ -20,9 +20,10 @@ from __future__ import annotations
 from typing import List, Optional, Tuple
 
 from PyQt6.QtCore import QCoreApplication
+from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
-    QDialog, QDialogButtonBox, QHBoxLayout, QListWidget, QSplitter,
-    QTextBrowser, QVBoxLayout, QWidget,
+    QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QSplitter, QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from ..i18n import language_manager
@@ -35,7 +36,7 @@ from ..theme import theme
 # language_manager.language_changed fires — see HelpDialog._retranslate_nav.
 _SECTION_ANCHORS: Tuple[str, ...] = (
     "overview", "seismic", "dsp", "map", "spectrum", "headers",
-    "reprojector", "cli",
+    "export", "campaign", "reprojector", "cli",
 )
 
 # Map a main-tab index → the anchor the "How this module works" action jumps to.
@@ -53,6 +54,8 @@ def _section_label(anchor: str) -> str:
         "map":         QCoreApplication.translate("HelpDialog", "Visualizer · Map"),
         "spectrum":    QCoreApplication.translate("HelpDialog", "Visualizer · Spectrum"),
         "headers":     QCoreApplication.translate("HelpDialog", "Visualizer · Headers"),
+        "export":      QCoreApplication.translate("HelpDialog", "Export (single & batch)"),
+        "campaign":    QCoreApplication.translate("HelpDialog", "Cruise / Campaign"),
         "reprojector": QCoreApplication.translate("HelpDialog", "Reprojector"),
         "cli":         QCoreApplication.translate("HelpDialog", "CLI & Batch processing"),
     }
@@ -173,6 +176,29 @@ optional <b>Wiggle / Variable-Area (VA)</b> overlay.</p>
       produces a Matplotlib-quality overlay of the current crop without exporting
       a file.</li>
 </ul>
+<h3>Scale &amp; aspect modes</h3>
+<ul>
+  <li><b>Mouse wheel</b> — over the section zooms both axes together; over the
+      X or Y <i>axis</i> stretches/compresses that axis alone (the visual
+      compression control).</li>
+  <li><b>Libre (free)</b> — unlocked aspect: whatever you set with the wheel
+      stays. Exports made in this mode reproduce the on-screen landscape/portrait
+      feel (the live ViewBox pixel aspect and amplitude ceiling are injected —
+      WYSIWYG).</li>
+  <li><b>Aspecto</b> — a locked W:H ratio; the height is recomputed from the
+      width so the ratio holds exactly.</li>
+  <li><b>VE</b> — a fixed <i>vertical exaggeration</i>, independent of line
+      length: every line gets the same visual compression regardless of its km —
+      the right mode when batch exports must be visually comparable.</li>
+  <li><b>Híbrido</b> — VE-based height, capped so W/H never exceeds a maximum
+      aspect.</li>
+  <li><b>Traces/cm</b> — horizontal density: figure width = n_traces ÷
+      (traces/cm). Depth is derived from TWT with the sound velocity
+      (default 1500&nbsp;m/s).</li>
+  <li><b>Pixel interpolation</b> — Nearest / Bilinear / <b>Bicubic (default)</b>
+      pill toggles under the render buttons; applied to the live raster, the HQ
+      viewport render and file exports alike.</li>
+</ul>
 
 <a name="dsp"></a><h2>Visualizer ▸ Filters / DSP — the node pipeline</h2>
 <p>Processing is an <b>ordered, reorderable pipeline of DSP nodes</b>. Each node
@@ -278,6 +304,79 @@ or simply not offered.</p>
       profile is reloaded and pushed back into the app state, so the Seismic
       view's vertical (time) scale and the DSP context refresh <i>immediately</i>
       — no re-open needed.</li>
+</ul>
+
+<a name="export"></a><h2>Export — single files &amp; batches</h2>
+<p>Every export runs through the same headless Matplotlib engine as the CLI, and
+inherits the LIVE state of the viewer: the active DSP pipeline (muted nodes
+excluded), palette, clip, alignment and scale mode — what you see is what you
+export.</p>
+<h3>Individual export</h3>
+<ul>
+  <li><i>Export image…</i> opens the options dialog: format (<b>PDF/SVG</b>
+      vector, <b>PNG</b>, <b>TIFF</b>), A-series paper size, DPI, theme
+      (dark/light/print), X/Y grid spacing, axis &amp; time-label font sizes,
+      top/bottom margins (ms), red file-boundary seams, <b>max-abs pooling</b>
+      (keeps thin bright reflectors alive when downsampling) and an
+      interpretation-marker overlay.</li>
+  <li><b>Memory budget (GB)</b> — the dialog shows a LIVE estimate of the output
+      raster size, quality % vs native and RAM footprint; a DPI that would exceed
+      the budget is clamped to a safe value automatically, and free RAM is
+      validated once more before rendering starts.</li>
+  <li><b>Directory memory</b> — the Save dialog reopens in the folder of your
+      previous export for the rest of the session.</li>
+  <li>Rendering runs on a background worker with cancellable progress.</li>
+</ul>
+<h3>Batch export (multi-selection)</h3>
+<ul>
+  <li>Multi-select profiles <i>or</i> chains in the sidebar → right-click →
+      <i>Export selected in batch…</i>. ONE options dialog configures the whole
+      batch; the current DSP/presentation settings apply uniformly to every
+      item.</li>
+  <li><b>Naming</b> — each line is written as <code>&lt;folder&gt;.&lt;format&gt;</code>,
+      named after the folder holding its source SEG-Y (e.g.
+      <code>…/SGY/L1/</code> → <code>L1.pdf</code>), into that same folder.</li>
+  <li><b>Custom output folder</b> — tick <i>Save all files to a custom folder</i>
+      in the dialog to redirect EVERY file of the batch into one directory of
+      your choice. Names are preserved; if two lines' folders share a name, the
+      second file is de-duplicated with the source file stem instead of silently
+      overwriting.</li>
+  <li><b>Memory-flat</b> — each item is loaded just-in-time and released after
+      rendering; one failed item never aborts the rest of the batch.</li>
+</ul>
+<h3>Wiggle / Variable-Area in exports</h3>
+<ul>
+  <li>The export follows the live section style: Density raster, or Wiggle with
+      the optional VA fill — deflection gain and line visibility honoured, with
+      the drawn-trace budget capped (1200) so vector PDFs stay light.</li>
+</ul>
+
+<a name="campaign"></a><h2>Cruise / Campaign tools</h2>
+<p>The <b>Cruise</b> menu (between CLI and Help) hosts two campaign-management
+tools. Both expect a base directory containing <code>SGY/</code> and
+<code>RAW/</code> subfolders with one folder per seismic line — or the base
+directory itself holding the per-line folders.</p>
+<h3>Files &amp; Coordinates</h3>
+<ul>
+  <li>Generates TWO Excel workbooks per project: a file <b>registry</b> (one
+      sheet per phase: line ID, start/end date &amp; time parsed from the
+      14-digit filename timestamps, first/last <code>.raw</code> and
+      <code>.sgy</code> files) and a <b>coordinates/length</b> workbook
+      (start/end lon-lat read from the SEG-Y trace headers, UTM
+      easting/northing, and in-sheet length formulas in m / km / nautical
+      miles).</li>
+  <li><b>UTM zone per phase</b> — auto-detected from the first SGY (🔍 button)
+      or forced manually; forcing one zone keeps a line's start and end in the
+      SAME zone across zone boundaries, so the Euclidean length stays valid.</li>
+</ul>
+<h3>Acquisition Stats</h3>
+<ul>
+  <li>Computes <b>ping rate (Hz)</b>, <b>ping interval (s)</b> and <b>vessel
+      speed (knots)</b> from the SEG-Y time headers (bytes 157–166) and
+      navigation headers — per file, per line and per phase, plus a
+      project-wide average, streamed into a monospace results log.</li>
+  <li>Lines may sit directly in the phase folder, in per-line subfolders, or
+      under an <code>SGY/</code> subfolder.</li>
 </ul>
 
 <a name="reprojector"></a><h2>Reprojector — CRS transforms &amp; joins</h2>
@@ -394,6 +493,31 @@ Variable (VA)</b>.</p>
   <li><b>Renderizar Completo</b> reajusta toda la sección; <b>Renderizar
       Viewport HQ</b> produce una superposición de calidad Matplotlib del
       recorte actual sin exportar un archivo.</li>
+</ul>
+<h3>Modos de escala y aspecto</h3>
+<ul>
+  <li><b>Rueda del ratón</b> — sobre la sección acerca/aleja ambos ejes a la
+      vez; sobre el <i>eje</i> X o Y estira/comprime solo ese eje (el control
+      de compresión visual).</li>
+  <li><b>Libre</b> — aspecto sin bloquear: lo que ajustes con la rueda se
+      mantiene. Las exportaciones hechas en este modo reproducen la sensación
+      apaisado/vertical de la pantalla (se inyectan el aspecto en píxeles del
+      ViewBox en vivo y el techo de amplitud — WYSIWYG).</li>
+  <li><b>Aspecto</b> — una relación An:Al bloqueada; la altura se recalcula a
+      partir del ancho para que la relación se mantenga exacta.</li>
+  <li><b>VE</b> — una <i>exageración vertical</i> fija, independiente de la
+      longitud de la línea: todas las líneas reciben la misma compresión visual
+      sin importar sus km — el modo correcto cuando las exportaciones por lotes
+      deben ser visualmente comparables.</li>
+  <li><b>Híbrido</b> — altura basada en VE, con tope para que An/Al nunca
+      supere un aspecto máximo.</li>
+  <li><b>Trazas/cm</b> — densidad horizontal: ancho de la figura = n_trazas ÷
+      (trazas/cm). La profundidad se deriva del TWT con la velocidad del sonido
+      (1500&nbsp;m/s por defecto).</li>
+  <li><b>Interpolación de píxeles</b> — botones Más cercano / Bilineal /
+      <b>Bicúbico (por defecto)</b> bajo los botones de render; se aplica por
+      igual al raster en vivo, al render HQ del viewport y a las exportaciones
+      de archivo.</li>
 </ul>
 
 <a name="dsp"></a><h2>Visualizador ▸ Filtros / DSP — el pipeline de nodos</h2>
@@ -524,6 +648,88 @@ simplemente no se ofrece.</p>
       volver a abrir.</li>
 </ul>
 
+<a name="export"></a><h2>Exportación — archivos individuales y por lotes</h2>
+<p>Toda exportación pasa por el mismo motor Matplotlib headless que la CLI, y
+hereda el estado EN VIVO del visor: el pipeline DSP activo (los nodos
+silenciados se excluyen), la paleta, el clip, el alineado y el modo de escala —
+lo que ves es lo que exportas.</p>
+<h3>Exportación individual</h3>
+<ul>
+  <li><i>Exportar imagen…</i> abre el diálogo de opciones: formato
+      (<b>PDF/SVG</b> vectorial, <b>PNG</b>, <b>TIFF</b>), tamaño de papel
+      serie A, DPI, tema (oscuro/claro/impresión), espaciado de cuadrícula X/Y,
+      tamaños de fuente de ejes y etiquetas de tiempo, márgenes superior e
+      inferior (ms), líneas rojas de límite de archivo, <b>pooling máx-abs</b>
+      (mantiene vivos los reflectores finos y brillantes al reducir la
+      resolución) y una superposición de marcadores de interpretación.</li>
+  <li><b>Presupuesto de memoria (GB)</b> — el diálogo muestra una estimación EN
+      VIVO del tamaño del raster de salida, el % de calidad frente a la nativa
+      y la huella de RAM; un DPI que excediera el presupuesto se limita
+      automáticamente a un valor seguro, y la RAM libre se valida una vez más
+      antes de empezar a renderizar.</li>
+  <li><b>Memoria de directorio</b> — el diálogo de Guardar se reabre en la
+      carpeta de tu exportación anterior durante el resto de la sesión.</li>
+  <li>El renderizado se ejecuta en un worker en segundo plano con progreso
+      cancelable.</li>
+</ul>
+<h3>Exportación por lotes (selección múltiple)</h3>
+<ul>
+  <li>Selecciona varios perfiles <i>o</i> cadenas en la barra lateral → clic
+      derecho → <i>Exportar selección por lotes…</i>. UN solo diálogo de
+      opciones configura todo el lote; los ajustes DSP/de presentación actuales
+      se aplican uniformemente a cada elemento.</li>
+  <li><b>Nomenclatura</b> — cada línea se escribe como
+      <code>&lt;carpeta&gt;.&lt;formato&gt;</code>, con el nombre de la carpeta
+      que contiene su SEG-Y de origen (p.&nbsp;ej. <code>…/SGY/L1/</code> →
+      <code>L1.pdf</code>), dentro de esa misma carpeta.</li>
+  <li><b>Carpeta de salida personalizada</b> — marca <i>Guardar todos los
+      archivos en una carpeta personalizada</i> en el diálogo para redirigir
+      TODOS los archivos del lote a un único directorio de tu elección. Los
+      nombres se conservan; si las carpetas de dos líneas comparten nombre, el
+      segundo archivo se desduplica con el nombre del fichero de origen en
+      lugar de sobrescribir silenciosamente.</li>
+  <li><b>RAM plana</b> — cada elemento se carga justo a tiempo y se libera tras
+      renderizarse; un elemento fallido nunca aborta el resto del lote.</li>
+</ul>
+<h3>Wiggle / Área Variable en las exportaciones</h3>
+<ul>
+  <li>La exportación sigue el estilo de la sección en vivo: raster de densidad,
+      o Wiggle con el relleno VA opcional — se respetan la ganancia de
+      deflexión y la visibilidad de la línea, con el presupuesto de trazas
+      dibujadas limitado (1200) para que los PDF vectoriales sigan siendo
+      ligeros.</li>
+</ul>
+
+<a name="campaign"></a><h2>Herramientas de Campaña</h2>
+<p>El menú <b>Campaña</b> (entre CLI y Ayuda) aloja dos herramientas de gestión
+de campaña. Ambas esperan un directorio base que contenga las subcarpetas
+<code>SGY/</code> y <code>RAW/</code> con una carpeta por línea sísmica — o el
+propio directorio base conteniendo las carpetas de líneas.</p>
+<h3>Ficheros y Coordenadas</h3>
+<ul>
+  <li>Genera DOS libros Excel por proyecto: un <b>registro</b> de ficheros (una
+      hoja por fase: ID de línea, fecha y hora de inicio/fin extraídas de las
+      marcas de tiempo de 14 dígitos del nombre de fichero, primer/último
+      <code>.raw</code> y <code>.sgy</code>) y un libro de
+      <b>coordenadas/longitudes</b> (lon-lat de inicio/fin leídas de las
+      cabeceras de traza SEG-Y, este/norte UTM, y fórmulas de longitud en hoja
+      en m / km / millas náuticas).</li>
+  <li><b>Zona UTM por fase</b> — detectada automáticamente del primer SGY
+      (botón 🔍) o forzada a mano; forzar una zona mantiene el inicio y el fin
+      de una línea en la MISMA zona a través de los límites de huso, de modo
+      que la longitud euclidiana sigue siendo válida.</li>
+</ul>
+<h3>Estadísticas de Adquisición</h3>
+<ul>
+  <li>Calcula la <b>tasa de disparo (Hz)</b>, el <b>intervalo de disparo
+      (s)</b> y la <b>velocidad del buque (nudos)</b> a partir de las cabeceras
+      de tiempo SEG-Y (bytes 157–166) y de navegación — por fichero, por línea
+      y por fase, más una media de todo el proyecto, volcadas en un registro de
+      resultados monoespaciado.</li>
+  <li>Las líneas pueden estar directamente en la carpeta de la fase, en
+      subcarpetas por línea, o bajo una subcarpeta <code>SGY/</code>.</li>
+</ul>
+
 <a name="reprojector"></a><h2>Reproyector — transformaciones de CRS y uniones</h2>
 <ul>
   <li>Reproyecta uno o varios archivos SEG-Y a un nuevo CRS (preajustes EPSG o
@@ -582,6 +788,23 @@ class HelpDialog(QDialog):
         self.resize(900, 680)
 
         root = QVBoxLayout(self)
+
+        # ── Search bar — filters/highlights the guide content dynamically ──
+        # Typing highlights EVERY occurrence in the body (ExtraSelections) and
+        # jumps to the first one; Enter cycles to the next match (wrapping).
+        # The highlight is re-applied automatically after any body rebuild
+        # (theme or language switch — see _reload).
+        search_row = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._on_search_changed)
+        self.search.returnPressed.connect(self._find_next)
+        self.lbl_matches = QLabel("")
+        self.lbl_matches.setObjectName("sub")
+        search_row.addWidget(self.search, 1)
+        search_row.addWidget(self.lbl_matches, 0)
+        root.addLayout(search_row)
+
         split = QSplitter()
 
         self.nav = QListWidget()
@@ -631,6 +854,52 @@ class HelpDialog(QDialog):
         if 0 <= row < len(sections):
             self.browser.scrollToAnchor(sections[row][1])
 
+    # ── Search ────────────────────────────────────────────────────────────────
+
+    def _on_search_changed(self, text: str) -> None:
+        """Highlight every occurrence of ``text`` in the body and jump to the
+        first one. Case-insensitive (QTextDocument.find's default)."""
+        text = text.strip()
+        self.browser.setExtraSelections([])
+        if not text:
+            self.lbl_matches.setText("")
+            return
+        doc = self.browser.document()
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor(theme.color("sel")))
+        fmt.setForeground(QColor(theme.color("bright")))
+        selections = []
+        cursor = QTextCursor(doc)
+        while True:
+            cursor = doc.find(text, cursor)
+            if cursor.isNull():
+                break
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = cursor
+            sel.format = fmt
+            selections.append(sel)
+        self.browser.setExtraSelections(selections)
+        n = len(selections)
+        self.lbl_matches.setText(
+            self.tr("{0} matches").format(n) if n else self.tr("No matches"))
+        if n:
+            # Jump to the first match: rewind, then let find() position/scroll.
+            top = self.browser.textCursor()
+            top.movePosition(QTextCursor.MoveOperation.Start)
+            self.browser.setTextCursor(top)
+            self.browser.find(text)
+
+    def _find_next(self) -> None:
+        """Enter in the search field → advance to the next match, wrapping."""
+        text = self.search.text().strip()
+        if not text:
+            return
+        if not self.browser.find(text):
+            top = self.browser.textCursor()
+            top.movePosition(QTextCursor.MoveOperation.Start)
+            self.browser.setTextCursor(top)
+            self.browser.find(text)
+
     def _reload(self, *_) -> None:
         """Rebuild the HTML in the ACTIVE language (also re-applies theme colours)."""
         bg, fg = theme.color("panel"), theme.color("text")
@@ -639,6 +908,10 @@ class HelpDialog(QDialog):
                f"a{{color:{link};}} code{{color:{theme.color('bright')};}}"
                f"th,td{{border-color:{theme.color('sub')};}}</style>")
         self.browser.setHtml(css + _help_html())
+        # setHtml wipes ExtraSelections — re-apply the active search so a theme
+        # or language switch never silently drops the user's highlights.
+        if self.search.text().strip():
+            self._on_search_changed(self.search.text())
 
     def _retranslate_nav(self) -> None:
         """Rebuild the nav-list labels in the active language, preserving selection."""
@@ -652,6 +925,7 @@ class HelpDialog(QDialog):
 
     def _retranslate(self, *_) -> None:
         self.setWindowTitle(self.tr("Documentation"))
+        self.search.setPlaceholderText(self.tr("Search the guide…"))
         # A language switch must also rebuild the nav labels AND the HTML body —
         # both were previously hardcoded English literals that this signal never
         # touched, so switching to Spanish left the dialog's content in English.

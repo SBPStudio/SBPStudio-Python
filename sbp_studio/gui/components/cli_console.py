@@ -485,7 +485,8 @@ Escribe el comando y sus argumentos y pulsa <b>Intro</b>.</p>
 <ul>
   <li><code>info</code> — metadatos de un SEG-Y</li>
   <li><code>check</code> — inspecciona cabeceras (EBCDIC + binarias) y detecta anomalías</li>
-  <li><code>patch-header</code> — corrige <code>dt</code>/<code>ns</code> en la cabecera, in situ (r+)</li>
+  <li><code>patch-header</code> — corrige <code>dt</code> y/o la cabecera
+      textual, in situ (r+); <code>ns</code> no es parcheable por diseño</li>
   <li><code>process</code> — ejecuta una cadena DSP headless y guarda un nuevo SEG-Y</li>
   <li><code>export-image</code> — exporta el perfil/cadena como imagen (PNG/PDF…)</li>
   <li><code>batch-export</code> — renderiza varios archivos/carpetas a un directorio</li>
@@ -519,8 +520,11 @@ cópiala con Ctrl+C). Usan un archivo real de la campaña ANT26:</p>
 <pre>check {_GUIDE_FILE}</pre>
 
 <p><b>6 · Corrección de metadatos</b> — fija el intervalo de muestreo a 50 µs
-(se propaga a todas las trazas) y el nº de muestras. <b>Modifica el archivo</b>:</p>
-<pre>patch-header {_GUIDE_FILE} --dt 50 --ns 2048 --dry-run</pre>
+(se propaga a todas las trazas de la cabecera). Quita <code>--dry-run</code>
+para escribir de verdad — <b>modifica el archivo</b>. (<code>ns</code> no es
+parcheable por diseño: cambiarlo sin redimensionar los datos corrompería el
+archivo.)</p>
+<pre>patch-header {_GUIDE_FILE} --dt 50 --dry-run</pre>
 
 <p><b>7 · Cadena DSP headless</b> — banda + blanqueo espectral + AGC, a un nuevo SEG-Y:</p>
 <pre>process {_GUIDE_FILE} {_GUIDE_OUT}\\ANT26_proc.seg --pipeline "bandpass(1000,8000),whiten(1000,8000,300),agc(200)"</pre>
@@ -528,6 +532,12 @@ cópiala con Ctrl+C). Usan un archivo real de la campaña ANT26:</p>
 <p><b>8 · Exportación por lotes</b> — todas las líneas de una carpeta a PDF con la
 paleta seismc y exageración vertical fija:</p>
 <pre>batch-export .\\examples\\_real_in\\ANT26\\SGY --format pdf --cmap seismc --x-scale 2 --ve 15 --out {_GUIDE_OUT}</pre>
+
+<p><b>9 · Espectro de frecuencias</b> — figura PNG del espectro de amplitud:</p>
+<pre>spectrum {_GUIDE_FILE} --format png --out {_GUIDE_OUT}\\ANT26_spec.png</pre>
+
+<p><b>10 · Marcas FIX</b> — puntos de tiempo cada 5 minutos a Shapefile:</p>
+<pre>fix {_GUIDE_FILE} --interval 5 --format shp --out {_GUIDE_OUT}\\ANT26_fix.shp</pre>
 
 <p>El procesamiento se ejecuta en segundo plano: la interfaz no se bloquea y el
 progreso y los mensajes aparecen en el área de la consola.</p>
@@ -565,7 +575,8 @@ command and its arguments and press <b>Enter</b>.</p>
 <ul>
   <li><code>info</code> — SEG-Y metadata</li>
   <li><code>check</code> — inspects headers (EBCDIC + binary) and detects anomalies</li>
-  <li><code>patch-header</code> — fixes <code>dt</code>/<code>ns</code> in the header, in place (r+)</li>
+  <li><code>patch-header</code> — fixes <code>dt</code> and/or the textual
+      header, in place (r+); <code>ns</code> is not patchable by design</li>
   <li><code>process</code> — runs a headless DSP chain and saves a new SEG-Y</li>
   <li><code>export-image</code> — exports the profile/chain as an image (PNG/PDF…)</li>
   <li><code>batch-export</code> — renders several files/folders to a directory</li>
@@ -599,8 +610,10 @@ copy with Ctrl+C). They use a real file from the ANT26 survey:</p>
 <pre>check {_GUIDE_FILE}</pre>
 
 <p><b>6 · Metadata correction</b> — sets the sample interval to 50&nbsp;µs
-(propagated to all traces) and the sample count. <b>Modifies the file</b>:</p>
-<pre>patch-header {_GUIDE_FILE} --dt 50 --ns 2048 --dry-run</pre>
+(propagated to every trace header). Drop <code>--dry-run</code> to actually
+write — <b>modifies the file</b>. (<code>ns</code> is not patchable by design:
+changing it without resizing the data would corrupt the file.)</p>
+<pre>patch-header {_GUIDE_FILE} --dt 50 --dry-run</pre>
 
 <p><b>7 · Headless DSP chain</b> — bandpass + spectral whitening + AGC, to a new SEG-Y:</p>
 <pre>process {_GUIDE_FILE} {_GUIDE_OUT}\\ANT26_proc.seg --pipeline "bandpass(1000,8000),whiten(1000,8000,300),agc(200)"</pre>
@@ -608,6 +621,12 @@ copy with Ctrl+C). They use a real file from the ANT26 survey:</p>
 <p><b>8 · Batch export</b> — every line in a folder to PDF with the seismc
 palette and fixed vertical exaggeration:</p>
 <pre>batch-export .\\examples\\_real_in\\ANT26\\SGY --format pdf --cmap seismc --x-scale 2 --ve 15 --out {_GUIDE_OUT}</pre>
+
+<p><b>9 · Frequency spectrum</b> — PNG figure of the amplitude spectrum:</p>
+<pre>spectrum {_GUIDE_FILE} --format png --out {_GUIDE_OUT}\\ANT26_spec.png</pre>
+
+<p><b>10 · FIX marks</b> — time marks every 5 minutes to a Shapefile:</p>
+<pre>fix {_GUIDE_FILE} --interval 5 --format shp --out {_GUIDE_OUT}\\ANT26_fix.shp</pre>
 
 <p>Processing runs in the background: the interface never freezes and
 progress/messages appear in the console area.</p>

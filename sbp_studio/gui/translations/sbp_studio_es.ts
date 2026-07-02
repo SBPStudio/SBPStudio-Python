@@ -739,6 +739,31 @@
 </context><context>
     <name>HelpDialog</name>
     <message>
+        <location filename="..\components\help_dialog.py" line="1" />
+        <source>Export (single &amp; batch)</source>
+        <translation>Exportación (individual y por lotes)</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="1" />
+        <source>Cruise / Campaign</source>
+        <translation>Campaña</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="1" />
+        <source>Search the guide…</source>
+        <translation>Buscar en la guía…</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="1" />
+        <source>{0} matches</source>
+        <translation>{0} coincidencias</translation>
+    </message>
+    <message>
+        <location filename="..\components\help_dialog.py" line="1" />
+        <source>No matches</source>
+        <translation>Sin coincidencias</translation>
+    </message>
+    <message>
         <location filename="..\components\help_dialog.py" line="654" />
         <source>Documentation</source>
         <translation>Documentación</translation>
