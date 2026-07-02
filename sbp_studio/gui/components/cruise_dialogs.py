@@ -12,8 +12,13 @@ match the TopasSuite aesthetic. All heavy lifting lives GUI-free in
 
 Both open with a prominent banner describing the required directory structure
 (a base dir containing ``SGY/`` and ``RAW/`` subfolders, each with one folder
-per seismic line). Processing runs synchronously behind a wait cursor — the same
-one-shot behaviour as the original tools.
+per seismic line). Processing runs on a background :class:`CoreWorker` QThread
+(the same worker contract the export path uses) so the GUI never freezes; log
+and result lines stream back through queued signals, which Qt delivers on the
+GUI thread. ``closeEvent`` and ``reject`` are intercepted while a worker is
+running: the close is deferred (with a cooperative cancel request) until the
+thread finishes, so a mid-run close can never destroy the widgets a queued
+slot is about to touch — nor a still-running QThread, which Qt aborts on.
 
 Layout notes (post-mortem of the first cut)
 --------------------------------------------
@@ -37,7 +42,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QCursor, QFont
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
@@ -45,6 +50,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..theme import MONO, theme
+from ..workers.base import CoreWorker
 from ...core import campaign
 
 
@@ -277,6 +283,10 @@ class FilesCoordinatesDialog(QDialog):
         self.setMinimumSize(720, 560)
         self.resize(780, 680)
         self._rows: List[_FilesPhaseRow] = []
+        self._worker: Optional[CoreWorker] = None
+        self._close_requested = False
+        self._out_reg = ""
+        self._out_coord = ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -397,36 +407,51 @@ class FilesCoordinatesDialog(QDialog):
         if not out_coord.endswith(".xlsx"):
             out_coord += ".xlsx"
 
+        self._out_reg = out_reg
+        self._out_coord = out_coord
         self.btn_generate.setEnabled(False)
         self.lbl_status.setText(self.tr("Processing…"))
-        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
-        errors: List[str] = []
-        sum_reg: List[str] = []
-        sum_coord: List[str] = []
-        try:
+
+        # tr() is resolved HERE, on the GUI thread — the worker only appends
+        # pre-translated strings (installing/removing translators concurrently
+        # with a lookup is the one documented tr() thread hazard).
+        msg_reg_locked = self.tr("Registry — file in use:\n{p}").format(p=out_reg)
+        msg_coord_locked = self.tr("Coordinates — file in use:\n{p}").format(p=out_coord)
+
+        def job(_progress, cancel):
+            errors: List[str] = []
+            sum_reg: List[str] = []
+            sum_coord: List[str] = []
             try:
                 sum_reg = campaign.build_registro_excel(phases, proj, out_reg)
             except PermissionError:
-                errors.append(self.tr("Registry — file in use:\n{p}").format(p=out_reg))
+                errors.append(msg_reg_locked)
             except Exception as e:  # noqa: BLE001 — surface any builder error
                 errors.append(f"Registry — {e}")
+            cancel.check()
             try:
                 sum_coord = campaign.build_coordenadas_excel(phases, proj, out_coord)
             except PermissionError:
-                errors.append(self.tr("Coordinates — file in use:\n{p}").format(p=out_coord))
+                errors.append(msg_coord_locked)
             except Exception as e:  # noqa: BLE001
                 errors.append(f"Coordinates — {e}")
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.btn_generate.setEnabled(True)
+            return errors, sum_reg, sum_coord
 
+        self._worker = CoreWorker(job, parent=self)
+        self._worker.succeeded.connect(self._on_generate_done)
+        self._worker.failed.connect(self._on_generate_failed)
+        self._worker.finished.connect(self._on_worker_finished)
+        self._worker.start()
+
+    def _on_generate_done(self, result) -> None:
+        errors, sum_reg, sum_coord = result
         if errors:
             self.lbl_status.setText(self.tr("Completed with errors."))
             QMessageBox.critical(self, self.tr("Errors while generating"),
                                  "\n\n".join(errors))
             return
         self.lbl_status.setText(self.tr("Saved: {a}  |  {b}").format(
-            a=Path(out_reg).name, b=Path(out_coord).name))
+            a=Path(self._out_reg).name, b=Path(self._out_coord).name))
         reg_lines = "\n".join(f"  • {s}" for s in sum_reg)
         coord_lines = "\n".join(f"  • {s}" for s in sum_coord)
         QMessageBox.information(
@@ -434,8 +459,45 @@ class FilesCoordinatesDialog(QDialog):
             self.tr("Files generated successfully.\n\n"
                     "Registry ({rn}):\n{rl}\n\n"
                     "Coordinates ({cn}):\n{cl}").format(
-                        rn=Path(out_reg).name, rl=reg_lines,
-                        cn=Path(out_coord).name, cl=coord_lines))
+                        rn=Path(self._out_reg).name, rl=reg_lines,
+                        cn=Path(self._out_coord).name, cl=coord_lines))
+
+    def _on_generate_failed(self, title: str, message: str) -> None:
+        self.lbl_status.setText(self.tr("Completed with errors."))
+        QMessageBox.critical(self, title, message)
+
+    def _on_worker_finished(self) -> None:
+        w, self._worker = self._worker, None
+        if w is not None:
+            w.wait()          # run() has returned — this is a near-instant join
+            w.deleteLater()
+        self.btn_generate.setEnabled(True)
+        if self._close_requested:
+            self._close_requested = False
+            self.reject()     # unguarded now that the worker is gone
+
+    # ── Close guards — never destroy the dialog while the worker runs ─────────
+
+    def _defer_close(self) -> bool:
+        """If a worker is running, request cancel + defer the close. Returns
+        True when the close was deferred (caller must NOT proceed)."""
+        if self._worker is None:
+            return False
+        self._close_requested = True
+        self._worker.request_cancel()
+        self.lbl_status.setText(self.tr("Cancelling…"))
+        return True
+
+    def closeEvent(self, event) -> None:  # X button
+        if self._defer_close():
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def reject(self) -> None:  # Esc key
+        if self._defer_close():
+            return
+        super().reject()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -499,6 +561,8 @@ class AcquisitionStatsDialog(QDialog):
         self.setMinimumSize(760, 620)
         self.resize(820, 720)
         self._rows: List[_StatsPhaseRow] = []
+        self._worker: Optional[CoreWorker] = None
+        self._close_requested = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -574,41 +638,87 @@ class AcquisitionStatsDialog(QDialog):
 
         self.btn_calc.setEnabled(False)
         self.txt_log.clear()
-        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
-        all_hz: List[float] = []
-        all_s: List[float] = []
-        all_kn: List[float] = []
-        try:
+
+        def job(progress, cancel):
+            all_hz: List[float] = []
+            all_s: List[float] = []
+            all_kn: List[float] = []
             for name, path in phases:
+                cancel.check()   # cooperative stop between phases
                 log_str, hz, s, kn = campaign.calculate_metrics_for_phase(name, path)
-                self.txt_log.appendPlainText(log_str + "\n")
+                # Stream each phase's log through the (queued) progress signal
+                # — the slot appends to txt_log on the GUI thread.
+                progress(float("nan"), log_str + "\n")
                 all_hz += hz
                 all_s += s
                 all_kn += kn
-                QApplication.processEvents()
+            return all_hz, all_s, all_kn
 
-            self.txt_log.appendPlainText("=" * 70)
-            if all_hz:
-                avg_hz = sum(all_hz) / len(all_hz)
-                avg_s = sum(all_s) / len(all_s)
-                self.txt_log.appendPlainText(self.tr("🚀 PROJECT-WIDE AVERAGES:"))
+        self._worker = CoreWorker(job, parent=self)
+        self._worker.progress.connect(self._on_log_line)
+        self._worker.succeeded.connect(self._on_stats_done)
+        self._worker.failed.connect(self._on_stats_failed)
+        self._worker.finished.connect(self._on_worker_finished)
+        self._worker.start()
+
+    def _on_log_line(self, _fraction: float, message: str) -> None:
+        self.txt_log.appendPlainText(message)
+
+    def _on_stats_done(self, result) -> None:
+        all_hz, all_s, all_kn = result
+        self.txt_log.appendPlainText("=" * 70)
+        if all_hz:
+            avg_hz = sum(all_hz) / len(all_hz)
+            avg_s = sum(all_s) / len(all_s)
+            self.txt_log.appendPlainText(self.tr("🚀 PROJECT-WIDE AVERAGES:"))
+            self.txt_log.appendPlainText(
+                self.tr("   Ping rate:      {v:.2f} Hz").format(v=avg_hz))
+            self.txt_log.appendPlainText(
+                self.tr("   Ping interval:  {v:.3f} s").format(v=avg_s))
+            if all_kn:
+                avg_v = sum(all_kn) / len(all_kn)
                 self.txt_log.appendPlainText(
-                    self.tr("   Ping rate:      {v:.2f} Hz").format(v=avg_hz))
-                self.txt_log.appendPlainText(
-                    self.tr("   Ping interval:  {v:.3f} s").format(v=avg_s))
-                if all_kn:
-                    avg_v = sum(all_kn) / len(all_kn)
-                    self.txt_log.appendPlainText(
-                        self.tr("   Vessel speed:   {v:.2f} knots").format(v=avg_v))
-                else:
-                    self.txt_log.appendPlainText(
-                        self.tr("   Vessel speed:   no navigation data"))
+                    self.tr("   Vessel speed:   {v:.2f} knots").format(v=avg_v))
             else:
                 self.txt_log.appendPlainText(
-                    self.tr("⚠️ No valid data found in the whole project."))
-            self.txt_log.appendPlainText("=" * 70)
-        except Exception as e:  # noqa: BLE001 — report and keep the dialog usable
-            QMessageBox.critical(self, self.tr("Calculation error"), str(e))
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.btn_calc.setEnabled(True)
+                    self.tr("   Vessel speed:   no navigation data"))
+        else:
+            self.txt_log.appendPlainText(
+                self.tr("⚠️ No valid data found in the whole project."))
+        self.txt_log.appendPlainText("=" * 70)
+
+    def _on_stats_failed(self, _title: str, message: str) -> None:
+        QMessageBox.critical(self, self.tr("Calculation error"), message)
+
+    def _on_worker_finished(self) -> None:
+        w, self._worker = self._worker, None
+        if w is not None:
+            w.wait()          # run() has returned — this is a near-instant join
+            w.deleteLater()
+        self.btn_calc.setEnabled(True)
+        if self._close_requested:
+            self._close_requested = False
+            self.reject()     # unguarded now that the worker is gone
+
+    # ── Close guards — never destroy the dialog while the worker runs ─────────
+
+    def _defer_close(self) -> bool:
+        """If a worker is running, request cancel + defer the close. Returns
+        True when the close was deferred (caller must NOT proceed)."""
+        if self._worker is None:
+            return False
+        self._close_requested = True
+        self._worker.request_cancel()
+        self.txt_log.appendPlainText(self.tr("Cancelling…"))
+        return True
+
+    def closeEvent(self, event) -> None:  # X button
+        if self._defer_close():
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def reject(self) -> None:  # Esc key
+        if self._defer_close():
+            return
+        super().reject()

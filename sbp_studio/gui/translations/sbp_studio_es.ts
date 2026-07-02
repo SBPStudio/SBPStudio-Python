@@ -3068,6 +3068,11 @@ Puedes cambiarlo antes de generar.</translation>
         <translation>Procesando…</translation>
     </message>
     <message>
+        <location filename="..\components\cruise_dialogs.py" line="17" />
+        <source>Cancelling…</source>
+        <translation>Cancelando…</translation>
+    </message>
+    <message>
         <location filename="..\components\cruise_dialogs.py" line="18" />
         <source>Registry — file in use:
 {p}</source>
@@ -3168,6 +3173,11 @@ Coordenadas ({cn}):
         <location filename="..\components\cruise_dialogs.py" line="1" />
         <source>Phases to process</source>
         <translation>Fases a procesar</translation>
+    </message>
+    <message>
+        <location filename="..\components\cruise_dialogs.py" line="1" />
+        <source>Cancelling…</source>
+        <translation>Cancelando…</translation>
     </message>
     <message>
         <location filename="..\components\cruise_dialogs.py" line="1" />

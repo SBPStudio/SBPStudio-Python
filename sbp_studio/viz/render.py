@@ -742,7 +742,13 @@ def _colorize_for_target(d: np.ndarray, cmap_name: str,
     # NaN/Inf into the array. Left unhandled, these map to transparent/black
     # pixels in the RGBA colormap instead of the neutral background — replace
     # them with 0.0 (mid-scale, harmless) before any resampling or colorizing.
-    d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+    # Gated: np.nan_to_num always allocates a full copy (a ~1 GB transient on
+    # large profiles), while np.isfinite(np.sum(...)) is an allocation-free
+    # reduction — NaN/Inf propagate through the sum, so a finite total proves
+    # the array is already clean. float64 accumulation keeps the sum itself
+    # from overflowing on huge all-finite float32 arrays (false positive).
+    if not np.isfinite(np.sum(d, dtype=np.float64)):
+        d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
 
     src_h, src_w = d.shape
     tgt_w, tgt_h = target_px
@@ -781,6 +787,13 @@ def _colorize_for_target(d: np.ndarray, cmap_name: str,
 # so the wiggle stays legible and the export (and any vector PDF) stays light.
 WIGGLE_MAX_TRACES = 1200
 
+# Budget: max vertex rows per wiggle trace. Deep records (30k+ samples) would
+# otherwise build native-resolution float64 polygon/line geometry — ~1 GB of
+# sub-pixel detail no output medium can display. 4096 rows covers a 13.6-inch
+# plot at 300 dpi with one vertex per pixel row; rows are MAX-|amplitude|
+# pooled (same operator as the raster path) so reflector peaks survive.
+WIGGLE_MAX_ROWS = 4096
+
 # Default deflection gain — < 1.0, not 1.0: at gain=1.0 a fully-saturated sample
 # (amp clipped to ±vmax) deflects by EXACTLY one full inter-trace spacing,
 # landing precisely on the neighbouring trace's own anchor — zero margin. Near
@@ -800,8 +813,9 @@ def _draw_wiggle_overlay(ax, d: np.ndarray, x_lo: float, x_hi: float,
     """Overlay budgeted wiggle (+ optional variable-area fill) traces onto ``ax``.
 
     ``d`` is the (ns, n_traces) float window already time-cropped/margined. Trace
-    columns are decimated to ``max_traces`` so the vector overlay stays legible
-    and fast regardless of the native trace count (the raster base layer, if
+    columns are decimated to ``max_traces`` and vertex rows max-|amp|-pooled to
+    ``WIGGLE_MAX_ROWS`` so the vector overlay stays legible, light on RAM and
+    fast regardless of the native record size (the raster base layer, if
     drawn, still carries full detail). Each drawn trace is plotted as a horizontal
     deflection x = centre + (amp/vmax)·spacing·gain; positive lobes are filled
     (classic variable-area look) when ``va_fill``; the deflection line itself is
@@ -821,7 +835,18 @@ def _draw_wiggle_overlay(ax, d: np.ndarray, x_lo: float, x_hi: float,
     # all centres identical → global-average would collapse deflect to zero).
     spacing = float(np.median(np.diff(centres))) if n_draw > 1 else span / max(1, n_cols)
     deflect = max(abs(spacing), 1e-6) * float(wiggle_gain)
-    t = np.linspace(t0, t1, n_rows)
+
+    # Row-decimate the geometry to the display-resolution budget BEFORE any
+    # vertex arrays are built (native 30k-row records → ~1 GB of float64
+    # vertices otherwise). Max-|amp| pooling keeps thin reflectors; no-op when
+    # the record is already within budget. All vertex arrays below are float32
+    # — axis-space coordinates need far fewer than float32's ~7 significant
+    # digits, and it halves the geometry RAM again.
+    dw = d[:, cols]                                        # (n_rows, n_draw)
+    if dw.shape[0] > WIGGLE_MAX_ROWS:
+        dw = _maxabs_pool_1d(dw, WIGGLE_MAX_ROWS, axis=0)
+    n_verts = dw.shape[0]
+    t = np.linspace(t0, t1, n_verts).astype(np.float32)
 
     # #9: build ALL traces' geometry as vectorized NumPy arrays and hand them
     # to a single LineCollection / PolyCollection each, instead of calling
@@ -829,11 +854,13 @@ def _draw_wiggle_overlay(ax, d: np.ndarray, x_lo: float, x_hi: float,
     # calls pays Matplotlib's Artist-creation + transform-registration
     # overhead; on a 1200-trace wiggle overlay that overhead dominates the
     # actual draw time. Two collections == two Artists, regardless of n_draw.
-    amp_all = np.clip(d[:, cols] / vmax, -1.0, 1.0)        # (n_rows, n_draw)
-    x_all   = centres[None, :] + amp_all * deflect         # (n_rows, n_draw)
+    amp_all = np.clip(dw / vmax, -1.0, 1.0).astype(np.float32, copy=False)
+    centres32 = centres.astype(np.float32)
+    deflect32 = np.float32(deflect)
+    x_all = centres32[None, :] + amp_all * deflect32       # (n_verts, n_draw)
 
     if show_wiggle_line:
-        line_segs = np.empty((n_draw, n_rows, 2), dtype=float)
+        line_segs = np.empty((n_draw, n_verts, 2), dtype=np.float32)
         line_segs[:, :, 0] = x_all.T
         line_segs[:, :, 1] = t[None, :]
         lc = LineCollection(line_segs, colors=color, linewidths=lw,
@@ -847,13 +874,13 @@ def _draw_wiggle_overlay(ax, d: np.ndarray, x_lo: float, x_hi: float,
         # equivalent to the old where=(amp>0)+interpolate=True fill without
         # needing to hand-detect zero-crossings per sample.
         pos_all   = np.maximum(amp_all, 0.0)
-        xhull_all = centres[None, :] + pos_all * deflect   # (n_rows, n_draw)
+        xhull_all = centres32[None, :] + pos_all * deflect32   # (n_verts, n_draw)
         t_rev = t[::-1]
         polys = []
         for j in range(n_draw):
-            xc  = centres[j]
+            xc  = centres32[j]
             fwd  = np.column_stack((xhull_all[:, j], t))
-            back = np.column_stack((np.full(n_rows, xc), t_rev))
+            back = np.column_stack((np.full(n_verts, xc, dtype=np.float32), t_rev))
             polys.append(np.vstack((fwd, back)))
         pc = PolyCollection(polys, facecolors=color, edgecolors="none", zorder=6)
         ax.add_collection(pc)
