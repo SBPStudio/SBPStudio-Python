@@ -713,7 +713,7 @@ class MainWindow(QMainWindow):
         settings). ``is_chain`` selects the render/load path for the batch items
         explicitly — decoupled from the live view's current mode."""
         from .components import ExportDialog
-        dlg = ExportDialog(self)
+        dlg = ExportDialog(self, batch=True)
         try:
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return

@@ -103,19 +103,29 @@ class DockTitleBar(QWidget, DockDragMixin):
         super().mouseReleaseEvent(event)
 
 
-def _batch_output_path(src_path: str, fmt: str, used: set) -> "Path":
+def _batch_output_path(src_path: str, fmt: str, used: set,
+                       out_dir: "Optional[str]" = None) -> "Path":
     """Folder-named export path for a source SEG-Y file: ``<dir>/<dir>.<fmt>``.
 
-    e.g. ``Z:/data/Line_01/1.sgy`` → ``Z:/data/Line_01/Line_01.pdf``. If that path
-    was already chosen in this batch (two items share a folder) it is de-duped
-    with the file stem so nothing is silently overwritten. Returns a ``Path``; the
-    caller adds ``str(path)`` to ``used``.
+    e.g. ``Z:/data/Line_01/1.sgy`` → ``Z:/data/Line_01/Line_01.pdf``.
+
+    ``out_dir`` — optional single target folder for the whole batch. When given
+    (non-empty), the file is written THERE instead of the source folder, but the
+    NAME is unchanged: still the name of the folder that contains the source SEG-Y
+    (``<out_dir>/Line_01.pdf``) — the naming convention the user relies on. When
+    ``None``/empty, the historical per-source-folder behaviour is used.
+
+    If the chosen path was already produced in this batch (two lines whose source
+    folders share a name — far more likely when everything lands in one custom
+    folder) it is de-duped with the source file stem so nothing is silently
+    overwritten. Returns a ``Path``; the caller adds ``str(path)`` to ``used``.
     """
     from pathlib import Path
     src_dir = Path(src_path).parent
-    out = src_dir / f"{src_dir.name}.{fmt}"
+    dest_dir = Path(out_dir) if out_dir else src_dir
+    out = dest_dir / f"{src_dir.name}.{fmt}"
     if str(out) in used:
-        out = src_dir / f"{src_dir.name}_{Path(src_path).stem}.{fmt}"
+        out = dest_dir / f"{src_dir.name}_{Path(src_path).stem}.{fmt}"
     return out
 
 
@@ -291,6 +301,12 @@ class SubTabbedTab(QWidget):
         # export/HQ/batch paths can drive everything through the handler interface
         # without ever knowing the concrete source type.
         self._handler: "Optional[SourceHandler]" = None
+
+        # Session memory: the folder of the last INDIVIDUAL image export, so the
+        # next Save dialog reopens there instead of resetting to the CWD each
+        # time. Session-scoped only (not persisted to disk); empty until the
+        # first successful export.
+        self._last_export_dir: str = ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -713,12 +729,21 @@ class SubTabbedTab(QWidget):
         if not self._confirm_memory_budget(cfg.get("mem_budget_gb", 6.0)):
             return
         fmt = cfg["format"]
+        # Seed the Save dialog with the last-used export folder (session memory,
+        # Feature 3) so it doesn't reset to the CWD each time. The default file
+        # NAME is still the current line's basename; only the directory is
+        # remembered. Empty on the first export → Qt's own default location.
+        from pathlib import Path as _Path
+        default_name = f"{self._export_basename()}.{fmt}"
+        start = (str(_Path(self._last_export_dir) / default_name)
+                 if self._last_export_dir else default_name)
         out, _ = QFileDialog.getSaveFileName(
             self, QCoreApplication.translate("SubTabbedTab", "Export image"),
-            f"{self._export_basename()}.{fmt}",
-            f"{fmt.upper()} (*.{fmt})")
+            start, f"{fmt.upper()} (*.{fmt})")
         if not out:
             return
+        # Remember the directory the user actually chose for next time.
+        self._last_export_dir = str(_Path(out).parent)
 
         handler = self._handler
         scale_cfg = self.controls.scale_config()  # aspect / VE / hybrid mode + values
@@ -922,6 +947,10 @@ class SubTabbedTab(QWidget):
         knows the source kind here: this method itself is fully type-agnostic.
         """
         fmt = cfg["format"]
+        # Optional single output folder for the whole batch (empty = each item to
+        # its own source folder). The per-line naming convention is preserved by
+        # _batch_output_path — see its docstring.
+        out_dir = (cfg.get("out_dir") or "").strip()
         # Snapshot the side-panel DSP/presentation state on the GUI thread (Qt
         # widgets are not thread-safe) — applied uniformly to every batch item.
         scale_cfg = self.controls.scale_config()
@@ -954,9 +983,9 @@ class SubTabbedTab(QWidget):
                 progress(i / n, QCoreApplication.translate(
                     "SubTabbedTab", "Exporting {0}…").format(name))
 
-                # Source dir → folder-named output, de-duped so two items from the
-                # same folder never silently overwrite each other.
-                out = _batch_output_path(handler.source_path(obj), fmt, used)
+                # Folder-named output (in out_dir when set, else the source dir),
+                # de-duped so two items never silently overwrite each other.
+                out = _batch_output_path(handler.source_path(obj), fmt, used, out_dir)
                 used.add(str(out))
 
                 was_loaded = getattr(obj, "data", None) is not None

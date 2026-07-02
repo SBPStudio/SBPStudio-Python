@@ -18,8 +18,8 @@ from __future__ import annotations
 from typing import Optional
 
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QLabel, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
 # DPI choices offered in the dropdown (editable — any value can be typed).
@@ -40,7 +40,7 @@ class ExportDialog(QDialog):
 
     def __init__(self, parent: Optional[QWidget] = None, *,
                  source: object = None, scale_cfg: Optional[dict] = None,
-                 velocity: float = 1500.0) -> None:
+                 velocity: float = 1500.0, batch: bool = False) -> None:
         super().__init__(parent)
         # Optional live-estimate context: the active profile/chain + the selected
         # scale mode let the dialog show the real output size and the forced DPI
@@ -48,6 +48,11 @@ class ExportDialog(QDialog):
         self._source = source
         self._scale_cfg = scale_cfg
         self._velocity = float(velocity)
+        # ``batch`` mode adds the optional "custom output directory" row (only
+        # meaningful for a multi-item batch — a single export picks its path in
+        # the following Save dialog instead). Kept off for single export so that
+        # dialog stays unchanged.
+        self._batch = bool(batch)
         self.setMinimumWidth(360)
         root = QVBoxLayout(self)
         form = QFormLayout()
@@ -144,6 +149,34 @@ class ExportDialog(QDialog):
         self.cb_picks.setChecked(False)
         root.addWidget(self.cb_picks)
 
+        # ── Optional custom output directory (batch only) ────────────────────
+        # When enabled, EVERY file in the batch is written into this one folder
+        # instead of each item's own source directory. The per-line naming
+        # convention (file named after the folder containing that line's SEG-Y
+        # files) is preserved by the batch writer — see _batch_output_path. When
+        # the checkbox is off or the field is blank, config()['out_dir'] is ""
+        # and the batch falls back to the original per-source-folder behaviour.
+        if self._batch:
+            self.chk_out_dir = QCheckBox()
+            self.chk_out_dir.setChecked(False)
+            root.addWidget(self.chk_out_dir)
+            out_row = QHBoxLayout()
+            self.ed_out_dir = QLineEdit()
+            self.btn_out_dir = QPushButton()
+            self.btn_out_dir.setMaximumWidth(110)
+            self.btn_out_dir.clicked.connect(self._browse_out_dir)
+            out_row.addWidget(self.ed_out_dir, 1)
+            out_row.addWidget(self.btn_out_dir, 0)
+            root.addLayout(out_row)
+            # The field + Browse button only accept input once the checkbox is
+            # ticked. The handler reads isChecked() as the single source of
+            # truth and ignores the signal's own argument, so it behaves
+            # identically no matter what emits it (toggled's bool, stateChanged's
+            # int, or the direct call below for the initial state) — belt-and-
+            # suspenders against any signal-signature edge case.
+            self.chk_out_dir.toggled.connect(self._sync_out_dir_enabled)
+            self._sync_out_dir_enabled()
+
         # ── Dynamic info panel (Part 1): native DPI, quality %, RAM estimate ──
         # Recomputed live as DPI / memory budget change so the user sees exactly
         # what the engine will do BEFORE exporting.
@@ -175,6 +208,31 @@ class ExportDialog(QDialog):
         self.retranslate_ui()
 
     # ── Result ──────────────────────────────────────────────────────────────
+
+    def _sync_out_dir_enabled(self, *_args) -> None:
+        """Enable the custom-output path field + Browse button only while the
+        'custom folder' checkbox is ticked. ``*_args`` absorbs whatever the
+        signal passes (a bool from ``toggled``, an int from ``stateChanged``,
+        or nothing from the direct init call) — the checkbox's own
+        ``isChecked()`` is the single source of truth."""
+        on = self.chk_out_dir.isChecked()
+        self.ed_out_dir.setEnabled(on)
+        self.btn_out_dir.setEnabled(on)
+
+    def _browse_out_dir(self) -> None:
+        start = self.ed_out_dir.text().strip()
+        d = QFileDialog.getExistingDirectory(
+            self, self.tr("Select output directory for the batch"), start)
+        if d:
+            self.ed_out_dir.setText(d)
+
+    def _out_dir(self) -> str:
+        """The chosen batch output directory, or "" (fall back to each item's
+        own source folder). Only ever non-empty in batch mode with the box
+        ticked AND a non-blank path."""
+        if not self._batch or not self.chk_out_dir.isChecked():
+            return ""
+        return self.ed_out_dir.text().strip()
 
     def _dpi(self) -> int:
         try:
@@ -296,6 +354,10 @@ class ExportDialog(QDialog):
             mem_budget_gb=float(self.sp_membudget.value()),
             max_abs_pool=self.cb_maxabs.isChecked(),
             overlay_picks=self.cb_picks.isChecked(),
+            # Batch-only: single target folder for every exported file ("" =
+            # each item goes to its own source folder, the historical default).
+            # Ignored by the single export path (which picks its own Save path).
+            out_dir=self._out_dir(),
             # ── Baked defaults ──
             velocity=1500.0,
             pdf_page="auto",
@@ -338,6 +400,15 @@ class ExportDialog(QDialog):
             "Burn the active interpretation picks (markers + ID labels) into "
             "the exported image at full resolution, exactly where they sit on "
             "the live section."))
+        if self._batch:
+            self.chk_out_dir.setText(self.tr("Save all files to a custom folder"))
+            self.chk_out_dir.setToolTip(self.tr(
+                "When enabled, every file in the batch is written to this one "
+                "folder. Each file keeps its automatic name (the name of the "
+                "folder containing that line's SEG-Y files). When disabled, "
+                "each file goes to its own source folder."))
+            self.ed_out_dir.setPlaceholderText(self.tr("Custom output folder for the batch…"))
+            self.btn_out_dir.setText(self.tr("Browse…"))
         # Standard buttons render with no visible text under the dark QSS — set
         # explicit, translated text so they're always readable.
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(self.tr("Accept"))

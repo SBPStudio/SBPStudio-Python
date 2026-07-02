@@ -503,6 +503,31 @@
 </context><context>
     <name>ExportDialog</name>
     <message>
+        <location filename="..\components\export_dialog.py" line="1" />
+        <source>Browse…</source>
+        <translation>Examinar…</translation>
+    </message>
+    <message>
+        <location filename="..\components\export_dialog.py" line="1" />
+        <source>Select output directory for the batch</source>
+        <translation>Seleccionar directorio de salida para el lote</translation>
+    </message>
+    <message>
+        <location filename="..\components\export_dialog.py" line="1" />
+        <source>Save all files to a custom folder</source>
+        <translation>Guardar todos los archivos en una carpeta personalizada</translation>
+    </message>
+    <message>
+        <location filename="..\components\export_dialog.py" line="1" />
+        <source>When enabled, every file in the batch is written to this one folder. Each file keeps its automatic name (the name of the folder containing that line's SEG-Y files). When disabled, each file goes to its own source folder.</source>
+        <translation>Cuando está activado, cada archivo del lote se escribe en esta única carpeta. Cada archivo conserva su nombre automático (el nombre de la carpeta que contiene los ficheros SEG-Y de esa línea). Cuando está desactivado, cada archivo va a su propia carpeta de origen.</translation>
+    </message>
+    <message>
+        <location filename="..\components\export_dialog.py" line="1" />
+        <source>Custom output folder for the batch…</source>
+        <translation>Carpeta de salida personalizada para el lote…</translation>
+    </message>
+    <message>
         <location filename="..\components\export_dialog.py" line="70" />
         <location filename="..\components\export_dialog.py" line="66" />
         <source>auto</source>
