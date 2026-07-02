@@ -16,11 +16,14 @@ move; only the thick cyan segment tracks the visible window.
 
 A lightweight OFFLINE world basemap is drawn underneath for geographic context —
 100 % local, no tiles/network. It is loaded from a bundled GeoJSON coastline
-asset (``assets/coastlines_highres.geojson``) with the stdlib ``json`` module; if
-that file is missing it falls back to a plain lat/lon graticule (and warns on the
-console). It is shown only when the track looks like geographic degrees (bbox
-within ±180 lon / ±90 lat); projected/UTM metres hide it. GeoJSON parsing +
-rendering live here in the GUI — the core never deals with display assets.
+asset (``assets/coastlines_highres.geojson``) with the stdlib ``json`` module —
+parsed once into flat NumPy vertex arrays cached as a user-local ``.npz``
+(audit #5: later launches skip the JSON parse entirely, and the QPainterPath is
+built in one C-speed ``arrayToQPath`` call instead of a per-vertex loop). If
+the asset is missing it falls back to a plain lat/lon graticule (and warns on
+the console). It is shown only when the track looks like geographic degrees
+(bbox within ±180 lon / ±90 lat); projected/UTM metres hide it. GeoJSON parsing
++ rendering live here in the GUI — the core never deals with display assets.
 
 Bi-directional sync (by absolute TRACE INDEX). The seismic view resolves the
 visible indices by masking the real distance array, so it stays in lock-step
@@ -37,6 +40,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 from pathlib import Path
 from time import perf_counter
 from typing import Callable, Optional, Tuple
@@ -1093,18 +1097,22 @@ class MapView(QWidget):
         return candidates[0]
 
     def _load_basemap_path(self) -> Tuple[QPainterPath, bool]:
-        """Return (path, is_graticule). Loads the local GeoJSON with the stdlib
-        ``json`` module (no third-party GIS deps, no network). On any failure —
-        file missing, unreadable, or empty — warns once and returns a lat/lon
-        graticule instead."""
+        """Return (path, is_graticule). Audit #5: the 3 MB GeoJSON parse and —
+        far costlier — the per-vertex QPointF loop used to run synchronously
+        at construction, stalling the GUI thread. The coordinates now load as
+        flat NumPy arrays (from a user-local .npz cache after the first run)
+        and the QPainterPath is built in one C-speed ``arrayToQPath`` call.
+        On any failure — file missing, unreadable, or empty — warns once and
+        returns a lat/lon graticule instead."""
         asset = self._asset_path()
         if not asset.exists():
             _warn_missing_basemap(asset)
             return self._graticule_path(), True
         try:
-            with open(asset, "r", encoding="utf-8") as fh:
-                gj = json.load(fh)
-            path = self._geojson_to_path(gj)
+            xy, connect = self._load_basemap_arrays(asset)
+            if xy.shape[0] < 2:
+                raise ValueError("no renderable geometries")
+            path = pg.functions.arrayToQPath(xy[:, 0], xy[:, 1], connect=connect)
             if path.elementCount() == 0:
                 raise ValueError("no renderable geometries")
             return path, False
@@ -1113,20 +1121,73 @@ class MapView(QWidget):
             return self._graticule_path(), True
 
     @staticmethod
-    def _geojson_to_path(gj: dict) -> QPainterPath:
-        """Flatten a GeoJSON object into one QPainterPath (lon=x, lat=y).
-        Polygons/MultiPolygons → closed subpaths (filled land); LineStrings →
-        open subpaths (coastline strokes). Robust to Feature/FeatureCollection/
-        bare-geometry/GeometryCollection nesting."""
-        path = QPainterPath()
+    def _basemap_cache_path() -> Optional[Path]:
+        """Writable location for the pre-parsed basemap cache (audit #5) —
+        user-local app data, never beside the asset (a frozen install's
+        assets/ dir may be read-only). ``None`` disables caching."""
+        base = os.getenv("LOCALAPPDATA") or tempfile.gettempdir()
+        try:
+            d = Path(base) / "SBPStudio" / "cache"
+            d.mkdir(parents=True, exist_ok=True)
+            return d / "coastlines_highres.npz"
+        except OSError:
+            return None
+
+    def _load_basemap_arrays(self, asset: Path) -> Tuple[np.ndarray, np.ndarray]:
+        """(N, 2) float64 vertices + (N,) uint8 connect mask (0 = last point
+        of a ring) for the whole basemap. Served from the .npz cache when it
+        matches the asset's size + mtime; (re)built from the GeoJSON and
+        re-cached otherwise. A missing/corrupt/read-only cache never fails the
+        load — it just costs the one-time parse again."""
+        st = asset.stat()
+        cache = self._basemap_cache_path()
+        if cache is not None and cache.exists():
+            try:
+                with np.load(cache) as z:
+                    if (int(z["src_size"]) == st.st_size
+                            and int(z["src_mtime_ns"]) == st.st_mtime_ns):
+                        return z["xy"], z["connect"]
+            except Exception:
+                pass                    # stale/corrupt cache → rebuild below
+        with open(asset, "r", encoding="utf-8") as fh:
+            gj = json.load(fh)
+        xy, connect = self._geojson_to_arrays(gj)
+        if cache is not None:
+            try:
+                np.savez_compressed(
+                    cache, xy=xy, connect=connect,
+                    src_size=np.int64(st.st_size),
+                    src_mtime_ns=np.int64(st.st_mtime_ns))
+            except Exception:
+                pass                    # read-only/full disk → cache disabled
+        return xy, connect
+
+    @staticmethod
+    def _geojson_to_arrays(gj: dict) -> Tuple[np.ndarray, np.ndarray]:
+        """Flatten a GeoJSON object into flat vertex/connect arrays (lon=x,
+        lat=y) for ``arrayToQPath``. Polygon rings are explicitly closed
+        (GeoJSON guarantees first == last; enforced anyway) so the stroke
+        matches the old closeSubpath rendering; LineStrings stay open — Qt
+        fills open subpaths implicitly closed, same as before. Robust to
+        Feature/FeatureCollection/bare-geometry/GeometryCollection nesting."""
+        chunks: list = []
 
         def add_ring(coords, close: bool) -> None:
-            pts = [QPointF(float(c[0]), float(c[1])) for c in coords if len(c) >= 2]
-            if len(pts) < 2:
+            try:
+                arr = np.asarray(coords, dtype=np.float64)
+                pts = arr[:, :2] if arr.ndim == 2 and arr.shape[1] >= 2 else None
+            except (ValueError, TypeError):
+                pts = None
+            if pts is None:             # ragged/odd input — tolerant slow path
+                pts = np.asarray([c[:2] for c in coords if len(c) >= 2],
+                                 dtype=np.float64)
+                if pts.ndim != 2:
+                    return
+            if pts.shape[0] < 2:
                 return
-            path.addPolygon(QPolygonF(pts))
-            if close:
-                path.closeSubpath()
+            if close and not np.array_equal(pts[0], pts[-1]):
+                pts = np.vstack((pts, pts[:1]))
+            chunks.append(pts)
 
         def add_geom(geom) -> None:
             if not geom:
@@ -1156,7 +1217,22 @@ class MapView(QWidget):
             add_geom(gj.get("geometry"))
         elif gtype:
             add_geom(gj)            # bare geometry object
-        return path
+        if not chunks:
+            return np.empty((0, 2)), np.empty((0,), dtype=np.uint8)
+        xy = np.concatenate(chunks, axis=0)
+        connect = np.ones(xy.shape[0], dtype=np.uint8)
+        connect[np.cumsum([c.shape[0] for c in chunks]) - 1] = 0  # ring breaks
+        return xy, connect
+
+    @staticmethod
+    def _geojson_to_path(gj: dict) -> QPainterPath:
+        """Flatten a GeoJSON object into one QPainterPath (lon=x, lat=y) —
+        thin wrapper over :meth:`_geojson_to_arrays`, kept for direct
+        callers/tests."""
+        xy, connect = MapView._geojson_to_arrays(gj)
+        if xy.shape[0] < 2:
+            return QPainterPath()
+        return pg.functions.arrayToQPath(xy[:, 0], xy[:, 1], connect=connect)
 
     @staticmethod
     def _graticule_path() -> QPainterPath:

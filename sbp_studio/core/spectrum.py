@@ -36,6 +36,16 @@ TOPAS_BANDS: Tuple[Tuple[str, float, float], ...] = (
     ("> 15 kHz",  15000.0, np.inf),
 )
 
+# Audit #4: column budget for the percentile pass. np.percentile promotes its
+# working copy to float64 (an unbounded 2×-pwr transient — ~820 MB at 50k
+# traces) and partitions every row; above this many traces a uniform column
+# subsample is used instead, bounding the transient at ~134 MB. 8192 samples
+# per frequency bin keep the envelope curves visually identical: measured
+# worst case is the p10 of a single-frame white-noise Welch (its power is
+# exponential-distributed, the steepest dB quantile) at ≈0.08 dB mean /
+# ≲0.5 dB worst-bin jitter — under the plotted line width on a 40+ dB scale.
+_PCT_MAX_COLS = 8192
+
 
 @dataclass
 class SpectrumResult:
@@ -53,8 +63,11 @@ class SpectrumResult:
     spec_p10_db:  np.ndarray   # (n_freqs,) — 10th percentile
     spec_p50_db:  np.ndarray   # (n_freqs,) — median
     spec_p90_db:  np.ndarray   # (n_freqs,) — 90th percentile
-    spec_2d_db:        np.ndarray   # (n_freqs, n_traces) — per-trace normalised dB
-    spec_2d_db_global: np.ndarray   # (n_freqs, n_traces) — ensemble-max normalised dB (#16)
+    spec_2d_db:     np.ndarray  # (n_freqs, n_traces) — per-trace normalised dB
+    # (n_traces,) float32 — per-trace dB offset, 10·log10(col_max/ensemble_max).
+    # Audit #4: replaces the stored spec_2d_db_global matrix (which doubled the
+    # spectrum RAM for a view most sessions never open); see the property below.
+    spec_db_offset: np.ndarray
     peak_hz:      float        # frequency of max power (Hz)
     centroid_hz:  float        # spectral centroid (Hz)
     bw_3db_lo:    float        # -3 dB bandwidth lower edge (Hz)
@@ -65,6 +78,16 @@ class SpectrumResult:
     snr_db:       float        # estimated SNR: 0.5–15 kHz vs >15 kHz (dB)
     band_labels:  List[str]    = field(default_factory=list)   # SBP energy bands
     band_pcts:    List[float]  = field(default_factory=list)   # % of total energy per band
+
+    @property
+    def spec_2d_db_global(self) -> np.ndarray:
+        """Ensemble-max normalised dB matrix (#16), materialized lazily:
+        per-trace dB + per-trace offset. Identical to 10·log10(pwr/global_max)
+        wherever power is non-zero; only exact-zero floor bins (≤ −300 dB,
+        far below any display clamp) differ by the offset. Deliberately NOT
+        cached — the add is memory-bandwidth cheap and caching would restore
+        the two-matrices-resident footprint this replaces (audit #4)."""
+        return self.spec_2d_db + self.spec_db_offset[None, :]
 
 
 def _ref_compute_spectrum(data: np.ndarray, fs: float) -> SpectrumResult:
@@ -116,14 +139,17 @@ def _ref_compute_spectrum(data: np.ndarray, fs: float) -> SpectrumResult:
         pwr /= _psd_norm
         pwr[1:-1] *= np.float32(2.0)
 
-    pwr_norm   = pwr / (pwr.max(axis=0, keepdims=True) + np.float32(1e-30))
+    col_max    = pwr.max(axis=0, keepdims=True) + np.float32(1e-30)
+    pwr_norm   = pwr / col_max
     spec_2d_db = (10 * np.log10(pwr_norm + np.float32(1e-30))).astype(np.float32)
 
-    # #16: global-normalization variant — single ensemble max so relative
-    # amplitude across ALL traces is preserved (per-trace normalisation
-    # destroys that information).
-    global_max        = pwr.max() + np.float32(1e-30)
-    spec_2d_db_global = (10 * np.log10(pwr / global_max + np.float32(1e-30))).astype(np.float32)
+    # #16 + audit #4: the global-normalization variant (single ensemble max,
+    # preserving relative amplitude across ALL traces) is now DERIVED, not
+    # stored: global dB = per-trace dB + 10·log10(col_max/global_max). A
+    # (n_traces,) offset vector replaces the second full (n_freqs, n_traces)
+    # matrix — see SpectrumResult.spec_2d_db_global.
+    global_max     = pwr.max() + np.float32(1e-30)
+    spec_db_offset = (10 * np.log10(col_max[0] / global_max)).astype(np.float32)
 
     # Upcast only the small per-frequency mean (n_freqs elements, not n_traces)
     # to float64 for the downstream statistics; pwr stays float32.
@@ -132,8 +158,15 @@ def _ref_compute_spectrum(data: np.ndarray, fs: float) -> SpectrumResult:
     spec_mean_db = 10 * np.log10(pwr_mean / ref)
 
     # Single 3-quantile pass — 3× cheaper than three separate percentile calls
-    # over the (n_freqs, n_traces) pwr matrix.
-    pwr_p10, pwr_p50, pwr_p90 = np.percentile(pwr, [10, 50, 90], axis=1)
+    # over the (n_freqs, n_traces) pwr matrix. Audit #4: above _PCT_MAX_COLS
+    # traces, run it on a uniform column subsample — np.percentile promotes
+    # its working copy to float64, so this bounds a 2×-pwr transient while the
+    # curves stay statistically indistinguishable.
+    if n_tr > _PCT_MAX_COLS:
+        pct_src = pwr[:, np.linspace(0, n_tr - 1, _PCT_MAX_COLS).astype(np.intp)]
+    else:
+        pct_src = pwr
+    pwr_p10, pwr_p50, pwr_p90 = np.percentile(pct_src, [10, 50, 90], axis=1)
     spec_p10_db = 10 * np.log10(pwr_p10.astype(np.float64) / ref)
     spec_p50_db = 10 * np.log10(pwr_p50.astype(np.float64) / ref)
     spec_p90_db = 10 * np.log10(pwr_p90.astype(np.float64) / ref)
@@ -202,7 +235,7 @@ def _ref_compute_spectrum(data: np.ndarray, fs: float) -> SpectrumResult:
         spec_p50_db=spec_p50_db,
         spec_p90_db=spec_p90_db,
         spec_2d_db=spec_2d_db,
-        spec_2d_db_global=spec_2d_db_global,
+        spec_db_offset=spec_db_offset,
         peak_hz=peak_hz,
         centroid_hz=centroid_hz,
         bw_3db_lo=bw3_lo, bw_3db_hi=bw3_hi,

@@ -562,8 +562,8 @@ def _ref_apply_filter_preset(data: np.ndarray, key: str, dt_us: int) -> np.ndarr
     if key == "none" or not key:
         return data.copy()
 
-    from scipy.signal import hilbert, medfilt, wiener
-    from scipy.ndimage import gaussian_filter, laplace, sobel
+    from scipy.signal import hilbert, medfilt
+    from scipy.ndimage import gaussian_filter, laplace, sobel, uniform_filter1d
 
     fs  = 1e6 / dt_us
     out = data.astype(np.float32)
@@ -673,11 +673,27 @@ def _ref_apply_filter_preset(data: np.ndarray, key: str, dt_us: int) -> np.ndarr
             out = _parallel_apply(lambda b: medfilt(b, kernel_size=(5, 1)).astype(np.float32), out)
 
     elif key == "wiener7":
+        # Audit #6: vectorized over the whole block — the same math as the old
+        # per-column scipy.signal.wiener(col, mysize=7) loop (zero-padded
+        # 7-sample windowed mean/variance along axis 0 only, `noise` estimated
+        # PER TRACE), without the per-trace Python loop that serialized the
+        # worker pool on the GIL. Deliberately NOT wiener(block, (7, 1)): that
+        # would estimate `noise` as the mean local variance of the whole
+        # worker block, making output depend on how _parallel_apply happened
+        # to split the array (worker-count-dependent, non-reproducible).
         def _wiener_block(block: np.ndarray) -> np.ndarray:
-            res = np.empty_like(block)
-            for j in range(block.shape[1]):
-                res[:, j] = wiener(block[:, j].astype(np.float64), mysize=7)
-            return res.astype(np.float32)
+            im = block.astype(np.float64)
+            k = 7
+            l_mean = uniform_filter1d(im, k, axis=0, mode="constant", cval=0.0)
+            l_var  = (uniform_filter1d(im * im, k, axis=0, mode="constant",
+                                       cval=0.0) - l_mean * l_mean)
+            noise  = l_var.mean(axis=0, keepdims=True)         # per trace
+            with np.errstate(divide="ignore", invalid="ignore"):
+                res  = im - l_mean
+                res *= 1.0 - noise / l_var
+                res += l_mean
+                filt = np.where(l_var < noise, l_mean, res)
+            return filt.astype(np.float32)
         out = _parallel_apply(_wiener_block, out)
 
     elif key == "gauss1":
