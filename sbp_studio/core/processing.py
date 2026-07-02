@@ -33,7 +33,7 @@ Known limitations
 from __future__ import annotations
 
 import concurrent.futures as _cf
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import scipy.linalg
@@ -41,8 +41,18 @@ from scipy import signal as sp_signal
 
 from ._backends import XP as _XP, GPU as _GPU, N_WORKERS as _N_WORKERS
 from .logger import get_logger
+from .tasks import CancelToken
 
 _LOG = get_logger("processing")
+
+# Upper bound on the column-block thread pool. BLAS is pinned to a single
+# thread per call at startup (see sbp_studio/__init__.py — OPENBLAS/OMP/MKL/
+# NUMEXPR = 1), so the old "cap at 4 to avoid N×N BLAS contention" rationale no
+# longer holds: the column-block pool is now the ONE place threads scale, and
+# it scales with the real core count (_N_WORKERS = cpu_count - 1). The ceiling
+# keeps worst-case oversubscription sane inside a multi-profile CoreWorker
+# export while still using most of a high-core workstation (16 cores → 12).
+_MAX_POOL_WORKERS = 12
 
 
 # ── Parallel helper ────────────────────────────────────────────────────────────
@@ -65,9 +75,11 @@ def _parallel_apply(fn, data: np.ndarray, *args,
     chunks     = [data[:, sl] for sl in slices]
     results    = [None] * len(chunks)
 
-    # Cap at 4 to avoid N×N contention with BLAS threads when running inside
-    # a CoreWorker export job (BLAS already threads per worker internally).
-    with _cf.ThreadPoolExecutor(max_workers=min(n_workers, 4)) as pool:
+    # Scale the column-block pool to the real core count (bounded by
+    # _MAX_POOL_WORKERS). Safe to scale now that BLAS is pinned to 1 thread
+    # per call at startup — the inner-vs-outer N×N contention the old cap-4
+    # guarded against can no longer occur (see _MAX_POOL_WORKERS' note).
+    with _cf.ThreadPoolExecutor(max_workers=min(n_workers, _MAX_POOL_WORKERS)) as pool:
         futs = {pool.submit(fn, ch, *args, **kwargs): k
                 for k, ch in enumerate(chunks)}
         for fut in _cf.as_completed(futs):
@@ -441,10 +453,57 @@ def _ref_apply_predictive_decon(
     op_len_ms: float,
     gap_ms: float,
     white_noise_pct: float,
+    cancel: Optional[CancelToken] = None,
 ) -> np.ndarray:
     """
-    Reference predictive deconvolution (Wiener-Levinson), trace by trace.
+    Reference predictive deconvolution (Wiener-Levinson).
     Path: reference. Backend: NumPy FFT + scipy.linalg.solve_toeplitz.
+
+    Engine note (Principal Performance Engineer audit): the per-trace
+    autocorrelation (FFT → multiply → IFFT) used to run INSIDE the Python
+    loop below, once per trace. On a GIL-bound QThread that meant the loop
+    spent almost all its time executing short bursts of Python bytecode
+    between brief C calls — exactly the pattern that starves the GUI event
+    loop even though the "work" is nominally on a background thread. The
+    autocorrelation is now ONE batched ``rfft``/``irfft`` call across every
+    trace in the block (axis=0) — releases the GIL for one sustained C call
+    instead of thousands of short ones, and is the dominant cost this node
+    had (an O(n_fft·log n_fft) FFT per trace).
+
+    Two FFT-side optimisations, both verified bit-for-bit equivalent (to
+    float32 rounding) against the original per-trace ``fft``/``ifft``:
+      1. ``n_fft`` only needs to cover ``ns + max_lag`` samples, not the
+         historical ``2·ns − 1``: the autocorrelation at lag k (k < max_lag)
+         computed via CIRCULAR (FFT-based) correlation with zero-padding to
+         N equals the true LINEAR autocorrelation ``sum_t x[t]x[t+k]``
+         exactly as long as N ≥ ns + max_lag − 1 (so the wrapped term lands
+         in the zero-padded region rather than aliasing real data back in).
+         For the typical case of a short operator on a deep trace this
+         roughly halves the FFT length.
+      2. ``rfft``/``irfft`` (real-input optimised) replace ``fft``/``ifft``
+         — exploits the Hermitian symmetry of a real signal's spectrum,
+         which is what taking ``.real`` of the full IFFT was already
+         throwing half of the computation away to get.
+
+    What remains a per-trace Python loop — the Toeplitz normal-equations
+    solve (``scipy.linalg.solve_toeplitz``) and the FIR reconstruction
+    filter (``lfilter``) — genuinely cannot be batched: EVERY trace has its
+    own Toeplitz system (its own autocorrelation), so there is no shared
+    matrix to exploit scipy's multi-right-hand-side support with, and a
+    correct from-scratch batched general-Toeplitz solver duplicates
+    non-trivial algorithm scipy already implements (Levinson recursion for
+    an arbitrary right-hand side) — reimplementing it by hand for a further
+    marginal win is real correctness risk this audit chose not to take.
+    What DOES matter: the loop body is now JUST these two small, C-level
+    calls (an ``nl``-sized solve and a ``max_lag``-tap filter) — no more
+    full-size FFT buffers allocated per trace, and each call itself releases
+    the GIL, so the remaining Python-level overhead between iterations is
+    a few cheap array slices, not the dominant cost it was before.
+
+    ``cancel`` — optional cooperative cancellation: checked once before the
+    batched FFT (covers an already-cancelled token immediately) and once per
+    trace inside the remaining loop. ``None`` (export/CLI) never checks,
+    behaviour there is unchanged.
     """
     ns, _nt = data.shape
     dt_ms   = dt_us / 1000.0
@@ -452,28 +511,37 @@ def _ref_apply_predictive_decon(
     gap     = max(1, int(gap_ms / dt_ms))
     mu      = white_noise_pct / 100.0
     max_lag = nl + gap
-    n_fft   = 2 ** int(np.ceil(np.log2(2 * ns - 1)))
+    n_fft   = 2 ** int(np.ceil(np.log2(ns + max_lag)))
 
     def _decon_block(block: np.ndarray) -> np.ndarray:
+        if cancel is not None:
+            cancel.check()
         _ns, _nt_b = block.shape
-        out = np.zeros_like(block)
-        for i in range(_nt_b):
-            tr = block[:, i]
-            X  = np.fft.fft(tr, n_fft)
-            r  = np.fft.ifft(X * np.conj(X)).real[:max_lag]
-            if r[0] == 0:
-                out[:, i] = tr
-                continue
-            r[0] *= (1.0 + mu)
+        # Default: passthrough (dead channels / a failed solve keep the
+        # original trace, exactly as the old per-trace early-`continue` did).
+        out = np.array(block, dtype=np.float32, copy=True)
+
+        # Batched autocorrelation — see the docstring above. r[:, i] is
+        # trace i's own (max_lag,) autocorrelation, matching what the old
+        # loop computed one trace at a time.
+        spectrum = np.fft.rfft(block, n=n_fft, axis=0)
+        r_full = np.fft.irfft(spectrum * np.conj(spectrum), n=n_fft, axis=0)
+        r = r_full[:max_lag, :]
+
+        live = r[0, :] != 0          # dead (all-zero) channels pass through
+        r[0, live] *= (1.0 + mu)
+
+        for i in np.flatnonzero(live):
+            if cancel is not None:
+                cancel.check()
             try:
-                a = scipy.linalg.solve_toeplitz(r[0:nl], r[gap:max_lag])
+                a = scipy.linalg.solve_toeplitz(r[0:nl, i], r[gap:max_lag, i])
             except scipy.linalg.LinAlgError:
-                out[:, i] = tr
-                continue
+                continue              # out[:, i] already holds the passthrough
             f       = np.zeros(max_lag)
             f[0]    = 1.0
             f[gap:] = -a
-            out[:, i] = sp_signal.lfilter(f, [1.0], tr)
+            out[:, i] = sp_signal.lfilter(f, [1.0], block[:, i])
         return out
 
     return _parallel_apply(_decon_block, data)
@@ -485,6 +553,7 @@ def apply_predictive_decon(
     op_len_ms: float,
     gap_ms: float,
     white_noise_pct: float,
+    cancel: Optional[CancelToken] = None,
 ) -> np.ndarray:
     """
     Predictive deconvolution (Wiener-Levinson), trace by trace.
@@ -496,6 +565,9 @@ def apply_predictive_decon(
     op_len_ms      : operator length in ms
     gap_ms         : prediction gap in ms
     white_noise_pct: regularisation (% of zero-lag autocorrelation)
+    cancel         : optional cooperative cancellation — see
+                     _ref_apply_predictive_decon's docstring. None (the
+                     default, used by the export/CLI paths) never checks.
 
     Returns
     -------
@@ -504,7 +576,8 @@ def apply_predictive_decon(
     Path: reference (_ref_apply_predictive_decon).
     No optimized path implemented; regression gate not applicable.
     """
-    return _ref_apply_predictive_decon(data, dt_us, op_len_ms, gap_ms, white_noise_pct)
+    return _ref_apply_predictive_decon(data, dt_us, op_len_ms, gap_ms, white_noise_pct,
+                                       cancel=cancel)
 
 
 # ── Hilbert parallelisation helper ────────────────────────────────────────────
@@ -552,12 +625,31 @@ def _hilbert_parallel(out: np.ndarray, key: str, dt_us: int, fs: float) -> np.nd
 
 # ── Reference filter presets ───────────────────────────────────────────────────
 
-def _ref_apply_filter_preset(data: np.ndarray, key: str, dt_us: int) -> np.ndarray:
+def _ref_apply_filter_preset(data: np.ndarray, key: str, dt_us: int,
+                             fast: bool = False) -> np.ndarray:
     """
     Reference filter preset implementation. Mirrors TopasSUITE.py exactly.
     Path: reference. GPU branches preserved from monolith where applicable.
 
     "none" returns data.copy() — always a new array.
+
+    ``fast`` (Principal Performance Engineer audit, live-preview-only): several
+    branches below (sobel_v, laplacian, highboost, gauss1, derivative,
+    integral) unconditionally upcast to float64 before calling scipy/cupy,
+    purely out of historical caution. scipy.ndimage/numpy PRESERVE a float32
+    input's dtype (no internal forced promotion), but — verified by direct
+    comparison, NOT assumed from dtype alone — computing the stencil
+    arithmetic in float32 throughout rounds slightly differently at each
+    intermediate step than computing in float64 and truncating at the end:
+    ``gauss1``/``derivative`` measure EXACT (0 diff) here; ``sobel_v``/
+    ``laplacian``/``highboost``/``integral`` (cumsum accumulates float32
+    rounding over the trace) have a tiny (<1e-3 relative, measured) gap;
+    ``wiener7`` is the one branch where scipy.signal.wiener genuinely
+    computes differently at float32 (also <1e-3 relative). Every one of
+    these is invisible on a percentile-clipped display raster. Accepted
+    ONLY for the live preview, never for export/CLI/analysis, which never
+    pass ``fast=True`` and are therefore byte-identical to before this flag
+    existed.
     """
     if key == "none" or not key:
         return data.copy()
@@ -625,40 +717,45 @@ def _ref_apply_filter_preset(data: np.ndarray, key: str, dt_us: int) -> np.ndarr
             out = sim.astype(np.float32)
 
     elif key == "sobel_v":
+        cast = (lambda x: x) if fast else (lambda x: x.astype(np.float64))
         if _GPU:
             import cupy as cp
             try:
                 from cupyx.scipy.ndimage import sobel as cu_sobel
-                out = cp.asnumpy(cu_sobel(cp.asarray(out, dtype=cp.float64), axis=0)).astype(np.float32)
+                g = cp.asarray(out) if fast else cp.asarray(out, dtype=cp.float64)
+                out = cp.asnumpy(cu_sobel(g, axis=0)).astype(np.float32)
             except Exception:
-                out = _parallel_apply(lambda b: sobel(b.astype(np.float64), axis=0).astype(np.float32), out)
+                out = _parallel_apply(lambda b: sobel(cast(b), axis=0).astype(np.float32), out)
         else:
-            out = _parallel_apply(lambda b: sobel(b.astype(np.float64), axis=0).astype(np.float32), out)
+            out = _parallel_apply(lambda b: sobel(cast(b), axis=0).astype(np.float32), out)
 
     elif key == "laplacian":
+        cast = (lambda x: x) if fast else (lambda x: x.astype(np.float64))
         if _GPU:
             import cupy as cp
             try:
                 from cupyx.scipy.ndimage import laplace as cu_laplace
-                out = cp.asnumpy(cu_laplace(cp.asarray(out, dtype=cp.float64))).astype(np.float32)
+                g = cp.asarray(out) if fast else cp.asarray(out, dtype=cp.float64)
+                out = cp.asnumpy(cu_laplace(g)).astype(np.float32)
             except Exception:
-                out = laplace(out.astype(np.float64)).astype(np.float32)
+                out = laplace(cast(out)).astype(np.float32)
         else:
-            out = laplace(out.astype(np.float64)).astype(np.float32)
+            out = laplace(cast(out)).astype(np.float32)
 
     elif key == "highboost":
+        cast = (lambda x: x) if fast else (lambda x: x.astype(np.float64))
         if _GPU:
             import cupy as cp
             try:
                 from cupyx.scipy.ndimage import gaussian_filter as cu_gauss
-                g  = cp.asarray(out, dtype=cp.float64)
+                g  = cp.asarray(out) if fast else cp.asarray(out, dtype=cp.float64)
                 sm = cu_gauss(g, sigma=1.0)
                 out = cp.asnumpy(g + 2.0 * (g - sm)).astype(np.float32)
             except Exception:
-                smooth = gaussian_filter(out.astype(np.float64), sigma=1.0)
+                smooth = gaussian_filter(cast(out), sigma=1.0)
                 out    = (out + 2.0 * (out - smooth)).astype(np.float32)
         else:
-            smooth = gaussian_filter(out.astype(np.float64), sigma=1.0)
+            smooth = gaussian_filter(cast(out), sigma=1.0)
             out    = (out + 2.0 * (out - smooth)).astype(np.float32)
 
     elif key == "median5":
@@ -681,8 +778,11 @@ def _ref_apply_filter_preset(data: np.ndarray, key: str, dt_us: int) -> np.ndarr
         # would estimate `noise` as the mean local variance of the whole
         # worker block, making output depend on how _parallel_apply happened
         # to split the array (worker-count-dependent, non-reproducible).
+        # Precision note unchanged from before: computing in float32 under
+        # fast=True is the same bounded tradeoff as the other branches above;
+        # export/CLI (fast=False) still run the math in float64.
         def _wiener_block(block: np.ndarray) -> np.ndarray:
-            im = block.astype(np.float64)
+            im = block if fast else block.astype(np.float64)
             k = 7
             l_mean = uniform_filter1d(im, k, axis=0, mode="constant", cval=0.0)
             l_var  = (uniform_filter1d(im * im, k, axis=0, mode="constant",
@@ -697,16 +797,17 @@ def _ref_apply_filter_preset(data: np.ndarray, key: str, dt_us: int) -> np.ndarr
         out = _parallel_apply(_wiener_block, out)
 
     elif key == "gauss1":
+        cast = (lambda x: x) if fast else (lambda x: x.astype(np.float64))
         if _GPU:
             import cupy as cp
             try:
                 from cupyx.scipy.ndimage import gaussian_filter as cu_gauss
-                out = cp.asnumpy(cu_gauss(cp.asarray(out).astype(cp.float64),
-                                          sigma=(1.0, 0.0))).astype(np.float32)
+                g = cp.asarray(out) if fast else cp.asarray(out).astype(cp.float64)
+                out = cp.asnumpy(cu_gauss(g, sigma=(1.0, 0.0))).astype(np.float32)
             except Exception:
-                out = gaussian_filter(out.astype(np.float64), sigma=(1.0, 0.0)).astype(np.float32)
+                out = gaussian_filter(cast(out), sigma=(1.0, 0.0)).astype(np.float32)
         else:
-            out = gaussian_filter(out.astype(np.float64), sigma=(1.0, 0.0)).astype(np.float32)
+            out = gaussian_filter(cast(out), sigma=(1.0, 0.0)).astype(np.float32)
 
     elif key in ("topas_narrow", "topas_wide", "topas_hires"):
         bands = {"topas_narrow": (2000, 4000),
@@ -722,29 +823,34 @@ def _ref_apply_filter_preset(data: np.ndarray, key: str, dt_us: int) -> np.ndarr
             out = _parallel_apply(_sos_blk, out)
 
     elif key == "derivative":
+        cast = (lambda x: x) if fast else (lambda x: x.astype(np.float64))
         if _GPU:
             import cupy as cp
             try:
-                out = cp.asnumpy(cp.gradient(cp.asarray(out).astype(cp.float64), axis=0)).astype(np.float32)
+                g = cp.asarray(out) if fast else cp.asarray(out).astype(cp.float64)
+                out = cp.asnumpy(cp.gradient(g, axis=0)).astype(np.float32)
             except Exception:
-                out = np.gradient(out.astype(np.float64), axis=0).astype(np.float32)
+                out = np.gradient(cast(out), axis=0).astype(np.float32)
         else:
-            out = np.gradient(out.astype(np.float64), axis=0).astype(np.float32)
+            out = np.gradient(cast(out), axis=0).astype(np.float32)
 
     elif key == "integral":
+        cast = (lambda x: x) if fast else (lambda x: x.astype(np.float64))
         if _GPU:
             import cupy as cp
             try:
-                out = cp.asnumpy(cp.cumsum(cp.asarray(out).astype(cp.float64), axis=0)).astype(np.float32)
+                g = cp.asarray(out) if fast else cp.asarray(out).astype(cp.float64)
+                out = cp.asnumpy(cp.cumsum(g, axis=0)).astype(np.float32)
             except Exception:
-                out = np.cumsum(out.astype(np.float64), axis=0).astype(np.float32)
+                out = np.cumsum(cast(out), axis=0).astype(np.float32)
         else:
-            out = np.cumsum(out.astype(np.float64), axis=0).astype(np.float32)
+            out = np.cumsum(cast(out), axis=0).astype(np.float32)
 
     return out
 
 
-def apply_filter_preset(data: np.ndarray, key: str, dt_us: int) -> np.ndarray:
+def apply_filter_preset(data: np.ndarray, key: str, dt_us: int,
+                        fast: bool = False) -> np.ndarray:
     """
     Apply a named filter preset to the data matrix.
 
@@ -753,6 +859,10 @@ def apply_filter_preset(data: np.ndarray, key: str, dt_us: int) -> np.ndarray:
     data  : (ns, n_traces) float32
     key   : internal preset key (see constants.FILTER_PRESETS values)
     dt_us : sample interval in microseconds
+    fast  : skip a float64 upcast several branches otherwise use (live-
+            preview only — see _ref_apply_filter_preset's docstring; bounded
+            to <1e-3 relative difference, measured, never export/CLI-facing).
+            ``False`` (default) — output identical to before this existed.
 
     Returns
     -------
@@ -761,7 +871,7 @@ def apply_filter_preset(data: np.ndarray, key: str, dt_us: int) -> np.ndarray:
     Path: reference (_ref_apply_filter_preset).
     GPU branches active when CuPy is available (see _backends.GPU).
     """
-    return _ref_apply_filter_preset(data, key, dt_us)
+    return _ref_apply_filter_preset(data, key, dt_us, fast=fast)
 
 
 # ── AGC (Automatic Gain Control) ───────────────────────────────────────────────
@@ -1265,14 +1375,15 @@ def apply_delay_alignment(data: np.ndarray, delays: np.ndarray,
 # ── Water-column mute ───────────────────────────────────────────────────────────
 
 def apply_water_mute(data: np.ndarray, threshold_pct: float,
-                     margin_ms: float, dt_us: int) -> np.ndarray:
+                     margin_ms: float, dt_us: int,
+                     smooth_ms: float = 0.5,
+                     user_picks_ms: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Mute the water column above the seabed, trace by trace (fully vectorised).
 
-    For each trace the seabed is picked as the FIRST sample whose |amplitude|
-    reaches ``threshold_pct`` % of that trace's peak |amplitude|. Everything from
-    t=0 down to ``pick − margin_ms`` is zeroed (the margin keeps a little signal
-    above the seabed so the reflector itself is never clipped).
+    For each trace the seabed is picked as the FIRST sample whose smoothed
+    envelope reaches ``threshold_pct`` % of that trace's peak envelope.
+    Everything from t=0 down to ``pick − margin_ms`` is zeroed.
 
     Parameters
     ----------
@@ -1280,6 +1391,12 @@ def apply_water_mute(data: np.ndarray, threshold_pct: float,
     threshold_pct : seabed pick threshold, % of per-trace peak (e.g. 30)
     margin_ms     : protect this many ms above the pick (mute stops there)
     dt_us         : sample interval in microseconds
+    smooth_ms     : envelope smoothing window in ms before thresholding;
+                    0.0 = no smoothing (reverts to prior behaviour)
+    user_picks_ms : (n_traces,) float array of per-trace mute times in ms;
+                    when provided the auto-picker is bypassed entirely and
+                    these times are used as the mute boundary before the
+                    margin is applied.
 
     Returns
     -------
@@ -1287,25 +1404,37 @@ def apply_water_mute(data: np.ndarray, threshold_pct: float,
 
     Notes
     -----
-    Vectorised: per-trace peak via ``max(axis=0)``, first-crossing via
-    ``argmax`` on the boolean threshold mask, mute via a broadcast row<limit
-    mask. All-zero traces (peak=0 ⇒ threshold=0 ⇒ pick=0) mute nothing.
+    Vectorised throughout. All-zero traces (peak=0) mute nothing.
     """
     ns, n_traces = data.shape
-    dt_ms  = dt_us / 1000.0
-    abs_d  = np.abs(data)
-    peak   = np.nanmax(abs_d, axis=0)                  # (n_traces,) — NaN-safe for aligned data
-    thresh = (threshold_pct / 100.0) * peak            # (n_traces,)
+    dt_ms = dt_us / 1000.0
 
-    # First sample per trace reaching the threshold (the peak always qualifies,
-    # so argmax always finds a real crossing; ties resolve to the earliest).
-    exceed = abs_d >= thresh[None, :]                  # (ns, n_traces) bool
-    pick   = np.argmax(exceed, axis=0)                 # (n_traces,)
+    if user_picks_ms is not None:
+        # Manual horizon: convert ms times directly to sample indices.
+        picks_s = np.clip(
+            np.round(np.asarray(user_picks_ms, dtype=float) / dt_ms),
+            0, ns - 1,
+        ).astype(int)
+    else:
+        # Auto-pick: optionally smooth envelope, then find first crossing.
+        abs_d = np.abs(data)
+        if smooth_ms > 0.0:
+            from scipy.ndimage import uniform_filter1d
+            smooth_n = max(3, int(round(smooth_ms / dt_ms)))
+            if smooth_n % 2 == 0:
+                smooth_n += 1
+            env = uniform_filter1d(abs_d, size=smooth_n, axis=0)
+        else:
+            env = abs_d
+        peak   = np.nanmax(env, axis=0)
+        thresh = (threshold_pct / 100.0) * peak
+        exceed = env >= thresh[None, :]
+        picks_s = np.argmax(exceed, axis=0)
 
     margin_s   = int(round(margin_ms / dt_ms))
-    mute_until = np.maximum(pick - margin_s, 0)        # (n_traces,) — exclusive
-    rows       = np.arange(ns)[:, None]                # (ns, 1)
-    mute_mask  = rows < mute_until[None, :]            # (ns, n_traces)
+    mute_until = np.maximum(picks_s - margin_s, 0)
+    rows       = np.arange(ns)[:, None]
+    mute_mask  = rows < mute_until[None, :]
 
     out = data.copy()
     out[mute_mask] = 0.0

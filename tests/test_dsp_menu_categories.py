@@ -39,7 +39,12 @@ class TestAddModuleMenuCategories:
     def test_every_node_registry_key_is_categorized_exactly_once(self):
         from sbp_studio.gui.components.pipeline_panel import _MENU_CATEGORIES
         from sbp_studio.gui.dsp import NODE_REGISTRY
-        all_keys = [c.KEY for c in NODE_REGISTRY]
+        # MENU_HIDDEN nodes (e.g. AB_AnchorNode) live in the registry for
+        # make_node() deserialization but are inserted via a dedicated button,
+        # not the Add Module menu, so they are intentionally absent from
+        # _MENU_CATEGORIES.
+        all_keys = [c.KEY for c in NODE_REGISTRY
+                    if not getattr(c, "MENU_HIDDEN", False)]
         categorized: list = []
         for _header, keys in _MENU_CATEGORIES:
             categorized.extend(keys)
@@ -173,7 +178,9 @@ class TestAddModuleMenuCategories:
             for key in keys:
                 categorized.add(key)
                 pp._add_node_action(menu, by_key[key])
-        leftover = [cls for cls in registry if cls.KEY not in categorized]
+        leftover = [cls for cls in registry
+                    if cls.KEY not in categorized
+                    and not getattr(cls, "MENU_HIDDEN", False)]
         assert leftover == [_FakeExtraNode]
         pp._add_section_header(menu, _tr_section("Other"))
         for cls in leftover:
@@ -571,3 +578,65 @@ class TestFontScalingSafety:
             app.setStyleSheet(old_stylesheet)
         captured = capfd.readouterr()
         assert "Point size" not in captured.err
+
+
+class TestParamRowInteractionSignals:
+    """Interactive LOD (see PreviewController._on_interaction_started/_ended)
+    relies on _ParamRow's slider press/release reaching PipelinePanel's
+    forwarded interactionStarted/interactionEnded signals — verify the whole
+    chain, not just the slider in isolation, since _rebuild_editor's
+    per-row connect is what actually wires it up end to end."""
+
+    def _panel_with_agc(self):
+        from sbp_studio.gui.components.pipeline_panel import PipelinePanel
+        from sbp_studio.gui.dsp.nodes import AGCNode
+
+        pp = PipelinePanel()
+        pp.add_node(AGCNode())
+        pp.list.setCurrentRow(0)  # selects it -> _rebuild_editor populates the row
+        return pp
+
+    def test_param_row_slider_press_release_emit_interaction_signals(self):
+        from sbp_studio.gui.components.pipeline_panel import _ParamRow
+        from sbp_studio.gui.dsp.nodes import AGCNode
+
+        node = AGCNode()
+        row = _ParamRow(node, node.SPECS[0])
+        started = []
+        ended = []
+        row.interactionStarted.connect(lambda: started.append(True))
+        row.interactionEnded.connect(lambda: ended.append(True))
+
+        row.slider.sliderPressed.emit()
+        assert started == [True]
+        assert ended == []
+
+        row.slider.sliderReleased.emit()
+        assert ended == [True]
+
+    def test_pipeline_panel_forwards_param_row_interaction_signals(self):
+        pp = self._panel_with_agc()
+        assert pp._editor_rows, "expected AGC's win_ms row to be built"
+        row = pp._editor_rows[0]
+
+        started = []
+        ended = []
+        pp.interactionStarted.connect(lambda: started.append(True))
+        pp.interactionEnded.connect(lambda: ended.append(True))
+
+        row.slider.sliderPressed.emit()
+        assert started == [True]
+        row.slider.sliderReleased.emit()
+        assert ended == [True]
+
+    def test_spinbox_edits_do_not_emit_interaction_signals(self):
+        """Only the slider's own drag should toggle LOD — a discrete spinbox
+        edit (typed value or arrow-click) is a single committed change, not
+        a multi-frame drag worth masking compute cost for."""
+        pp = self._panel_with_agc()
+        row = pp._editor_rows[0]
+
+        started = []
+        pp.interactionStarted.connect(lambda: started.append(True))
+        row.spin.setValue(row.spin.value() + 1)
+        assert started == []

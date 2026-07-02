@@ -175,7 +175,8 @@ class AppState(QObject):
             self._evict_if_needed()
         self.profiles_changed.emit()
         if self._active_profile_key == profile.path:
-            self.active_profile_changed.emit(profile)
+            if self._active_chain_index is None:   # don't clobber an active chain view
+                self.active_profile_changed.emit(profile)
 
     def update_chain_data(self, chain: "ProfileChain") -> None:
         """Re-emit ``active_chain_changed`` after a chain's trace matrix has been

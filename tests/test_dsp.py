@@ -1853,7 +1853,8 @@ class TestNodeMigration:
         assert keys == {"swell", "fk", "water_mute", "demultiple", "decon",
                         "bandpass", "notch", "whiten", "preset", "trace_eq", "trace_mix",
                         "median_filter", "bilateral_filter", "svd_filter", "tvg", "agc",
-                        "spherical_divergence", "log_compress", "clahe", "despike"}
+                        "spherical_divergence", "log_compress", "clahe", "despike",
+                        "ab_anchor"}
         assert "align" not in keys
 
 
@@ -3017,7 +3018,7 @@ class TestColorPumpingFix:
             data=data, dist_km=dist_km, dt_us=dt_us, ns=ns, n_traces=n_traces,
             delay_ms=0.0, delays=None, min_delay=0.0, boundaries_km=(), error=None)
 
-    def _controller(self, obj, *, clip=99.6, ab_compare=False):
+    def _controller(self, obj, *, clip=99.6):
         from PyQt6.QtCore import QObject, pyqtSignal
         from sbp_studio.gui.dsp.preview import PreviewController
 
@@ -3053,6 +3054,7 @@ class TestColorPumpingFix:
             params_changed = pyqtSignal()
             interactionStarted = pyqtSignal()
             interactionEnded = pyqtSignal()
+            node_selection_changed = pyqtSignal(object)
 
             def __init__(self):
                 super().__init__()
@@ -3063,7 +3065,7 @@ class TestColorPumpingFix:
         view = _FakeView()
         panel = _FakePanel()
         disp = dict(clip=clip, cmap="Viridis", px_per_trace=20.0, align=False,
-                   ab_compare=ab_compare, amp_range="sequential")
+                    amp_range="sequential")
         pc = PreviewController(view, panel, get_source=lambda: obj,
                                get_display=lambda: dict(disp))
         return pc, view, panel, disp
@@ -3299,9 +3301,12 @@ class TestColorPumpingFix:
         assert len(view.shown) == shown_before + 2
 
     def test_ab_compare_vmax_also_locked_to_global(self):
+        from sbp_studio.gui.dsp.nodes import AB_AnchorNode
         app = self._qt()
         obj = self._profile()
-        pc, view, panel, disp = self._controller(obj, ab_compare=True)
+        pc, view, panel, disp = self._controller(obj)
+        # A/B mode is driven by node presence (anchor node), not a display flag.
+        panel.nodes = [AB_AnchorNode()]
         pc.set_source(obj)
         self._run_to_completion(app, pc)
 
@@ -4298,6 +4303,143 @@ class TestAttributeLabelingGui:
         assert mv.layer_list.count() == 0   # row removed; no crash on cleanup
 
 
+class TestOverviewLOD:
+    """Pillar A — the zoom-out Overview LOD (pipeline.py). Pure-numpy, no Qt:
+    RMS row pooling + extract_visible_window's overview_max_rows path."""
+
+    def test_pool_preserves_thin_reflector_striding_would_drop(self):
+        from sbp_studio.gui.dsp.pipeline import _pool_rows_rms
+        arr = np.zeros((100, 5), dtype=np.float32)
+        arr[37, :] = 9.0                      # bright, 1-sample, off any stride grid
+        pooled = _pool_rows_rms(arr, 10)
+        assert pooled.shape == (10, 5)
+        # RMS of one 9.0 in a block of 10 zeros: sqrt(9²/10) ≈ 2.846
+        expected = float(np.sqrt(81.0 / 10))
+        assert abs(float(pooled.max()) - expected) < 0.01, (
+            f"expected ≈{expected:.3f}, got {pooled.max():.3f}")
+        assert arr[::10].max() == 0.0         # plain striding would have lost it
+
+    def test_pool_output_row_count_is_ceil(self):
+        from sbp_studio.gui.dsp.pipeline import _pool_rows_rms
+        arr = np.random.RandomState(1).standard_normal((103, 4)).astype(np.float32)
+        pooled = _pool_rows_rms(arr, 10)
+        assert pooled.shape[0] == 11          # ceil(103/10): 10 head + 1 tail-fold
+
+    def test_pool_noop_when_stride_1(self):
+        from sbp_studio.gui.dsp.pipeline import _pool_rows_rms
+        arr = np.random.RandomState(2).standard_normal((20, 3)).astype(np.float32)
+        out = _pool_rows_rms(arr, 1)
+        assert out is arr                     # identity, zero copy
+
+    def test_pool_keeps_sign_of_peak_magnitude_sample(self):
+        from sbp_studio.gui.dsp.pipeline import _pool_rows_rms
+        arr = np.zeros((20, 1), dtype=np.float32)
+        arr[3, 0] = -7.0                      # negative peak is the largest |amp|
+        arr[5, 0] = 2.0
+        pooled = _pool_rows_rms(arr, 10)
+        # Sign comes from the max-|amp| sample (-7.0 > 2.0 in magnitude)
+        assert pooled[0, 0] < 0, "sign of peak-magnitude sample must be negative"
+        assert pooled[1, 0] == 0.0            # second block: all zeros → no signal
+
+    def test_pool_rms_noise_floor_lower_than_maxabs(self):
+        """RMS pooling gives ≈σ noise floor; max-abs inflates to ≈2.3σ at stride=15."""
+        from sbp_studio.gui.dsp.pipeline import _pool_rows_rms, _pool_rows_maxabs
+        rng = np.random.RandomState(42)
+        noise = rng.standard_normal((30000, 50)).astype(np.float32)   # σ = 1.0
+        rms_pooled    = _pool_rows_rms(noise, 15)
+        maxabs_pooled = _pool_rows_maxabs(noise, 15)
+        rms_floor    = float(np.abs(rms_pooled).mean())
+        maxabs_floor = float(np.abs(maxabs_pooled).mean())
+        assert rms_floor < maxabs_floor, (
+            f"RMS floor ({rms_floor:.3f}) should be < max-abs floor ({maxabs_floor:.3f})")
+        # RMS of a unit-variance Gaussian block → ≈ σ = 1.0
+        assert 0.7 < rms_floor < 1.3, f"RMS floor should be ≈ σ = 1.0, got {rms_floor:.3f}"
+
+    def _data(self, ns=30000, n_traces=200):
+        data = np.random.RandomState(0).standard_normal((ns, n_traces)).astype(np.float32)
+        dist = np.linspace(0.0, 10.0, n_traces)
+        return data, dist
+
+    def test_overview_decimates_rows_when_requested(self):
+        from sbp_studio.gui.dsp.pipeline import extract_visible_window
+        data, dist = self._data()
+        win = extract_visible_window(
+            data, dist, t0_ms=0.0, dt_us=500, x_range=(0, 10),
+            y_range=(0, 30000 * 0.5), max_cols=4000, full_depth=True,
+            overview_max_rows=2000)
+        assert win.sub.shape[0] <= 2000
+        assert win.row_stride > 1
+        assert win.sub.flags["C_CONTIGUOUS"]
+
+    def test_exact_path_unchanged_when_overview_is_none(self):
+        from sbp_studio.gui.dsp.pipeline import extract_visible_window
+        data, dist = self._data()
+        win = extract_visible_window(
+            data, dist, t0_ms=0.0, dt_us=500, x_range=(0, 10),
+            y_range=(0, 30000 * 0.5), max_cols=4000, full_depth=True)
+        assert win.row_stride == 1
+        assert win.sub.shape[0] == 30000      # every native sample, exactly
+
+    def test_overview_effective_dt_scales_with_row_stride(self):
+        from sbp_studio.gui.dsp.pipeline import extract_visible_window
+        data, dist = self._data()
+        win = extract_visible_window(
+            data, dist, t0_ms=0.0, dt_us=500, x_range=(0, 10),
+            y_range=(0, 30000 * 0.5), max_cols=4000, full_depth=True,
+            overview_max_rows=2000)
+        assert win.effective_dt_us == 500 * win.row_stride
+
+    def test_overview_crop_indices_stay_within_pooled_sub(self):
+        from sbp_studio.gui.dsp.pipeline import extract_visible_window
+        data, dist = self._data()
+        win = extract_visible_window(
+            data, dist, t0_ms=0.0, dt_us=500, x_range=(2, 6),
+            y_range=(5000 * 0.5, 25000 * 0.5), max_cols=4000, full_depth=True,
+            overview_max_rows=2000)
+        assert 0 <= win.r0 <= win.r1 <= win.sub.shape[0]
+        assert 0 <= win.cv0 <= win.cv1 <= win.sub.shape[1]
+        assert win.crop_visible(win.sub).size > 0   # non-degenerate visible region
+
+    def test_overview_ignored_for_non_full_depth(self):
+        """overview_max_rows is full_depth-only; a non-full_depth call must
+        ignore it and fall back to the legacy max_rows striding path."""
+        from sbp_studio.gui.dsp.pipeline import extract_visible_window
+        data, dist = self._data()
+        win = extract_visible_window(
+            data, dist, t0_ms=0.0, dt_us=500, x_range=(0, 10),
+            y_range=(0, 30000 * 0.5), max_rows=1000, max_cols=4000,
+            full_depth=False, overview_max_rows=2000)
+        # max_rows (1000), not overview_max_rows (2000), governs here.
+        assert win.sub.shape[0] <= 1000
+
+
+class TestThreadTuning:
+    """Pillar B — CPU thread tuning. The column-block pool ceiling and the
+    BLAS env-var pinning set at package import."""
+
+    def test_pool_cap_scales_past_the_old_four(self):
+        from sbp_studio.core.processing import _MAX_POOL_WORKERS
+        assert _MAX_POOL_WORKERS >= 8          # was hard-capped at 4
+
+    def test_blas_threads_pinned_to_one(self):
+        import os
+        import sbp_studio   # noqa: F401 — import sets the env defaults
+        for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                    "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            assert os.environ.get(var) == "1", f"{var} not pinned"
+
+    def test_parallel_apply_still_correct_under_new_cap(self):
+        """Raising the worker cap must not change results — column-block split
+        + concat is associative; verify against the single-threaded path."""
+        from sbp_studio.core.processing import _parallel_apply
+        data = np.random.RandomState(3).standard_normal((500, 300)).astype(np.float32)
+        fn = lambda b: b * 2.0 + 1.0
+        multi = _parallel_apply(fn, data)
+        single = _parallel_apply(fn, data, n_workers=1)
+        np.testing.assert_array_equal(multi, single)
+        np.testing.assert_array_equal(multi, data * 2.0 + 1.0)
+
+
 class TestBasePrepWorker:
     """PreviewController Phase 10 — off-GUI-thread disk I/O for evicted chain
     segments.
@@ -4390,6 +4532,7 @@ class TestBasePrepWorker:
             params_changed = pyqtSignal()
             interactionStarted = pyqtSignal()
             interactionEnded = pyqtSignal()
+            node_selection_changed = pyqtSignal(object)
 
             def __init__(self):
                 super().__init__()
@@ -4400,7 +4543,7 @@ class TestBasePrepWorker:
         view = _FakeView()
         panel = _FakePanel()
         disp = dict(clip=99.6, cmap="Viridis", px_per_trace=20.0,
-                    align=False, ab_compare=False, amp_range="sequential")
+                    align=False, amp_range="sequential")
         pc = PreviewController(view, panel, get_source=lambda: obj,
                                get_display=lambda: dict(disp))
         return pc, view, panel

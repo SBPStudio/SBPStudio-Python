@@ -119,3 +119,123 @@ class TestLoadProfile:
         md = sd.to_metadata()
         assert isinstance(md, SegyMetadata)
         assert md.n_traces == sd.n_traces
+
+    def test_active_ns_populated_when_traces_loaded(self, simple_segy):
+        """simple_segy's data is full-depth random noise (no real cutoff),
+        so active_ns should resolve near the full ns — proving the normal/
+        no-meaningful-cutoff case never wrongly truncates."""
+        sd = load_profile(simple_segy)
+        assert sd.active_ns is not None
+        assert 0 < sd.active_ns <= sd.ns
+
+    def test_active_ns_none_for_header_only_stub(self, simple_segy):
+        sd = load_profile(simple_segy, load_traces=False)
+        assert sd.active_ns is None
+        assert sd.active_ns_for_traces(0, sd.n_traces) is None
+
+    def test_active_lo_populated_when_traces_loaded(self, simple_segy):
+        """simple_segy's data is full-depth random noise (no real top
+        cutoff), so active_lo should resolve near 0 — same 'normal case
+        never wrongly truncates' guarantee as active_ns, just at the top."""
+        sd = load_profile(simple_segy)
+        assert sd.active_lo is not None
+        assert 0 <= sd.active_lo < sd.active_ns
+
+    def test_active_lo_none_for_header_only_stub(self, simple_segy):
+        sd = load_profile(simple_segy, load_traces=False)
+        assert sd.active_lo is None
+        assert sd.active_band_for_traces(0, sd.n_traces) is None
+
+    def test_active_band_for_traces_returns_lo_hi_pair(self, simple_segy):
+        sd = load_profile(simple_segy)
+        band = sd.active_band_for_traces(0, sd.n_traces)
+        assert band == (sd.active_lo, sd.active_ns)
+
+
+class TestDetectActiveNs:
+    """_detect_active_ns (io_segy.py): the real listening-window depth — the
+    last row with amplitude above a small fraction of clip_p99 — used to cap
+    full_depth=True row processing below a file's nominal ns when most of
+    that depth is recorded dead/padding (see SegyProfile.active_ns)."""
+
+    def test_detects_real_signal_cutoff(self):
+        from sbp_studio.core.io_segy import _detect_active_ns, ACTIVE_DEPTH_MARGIN_SAMPLES
+        ns, n_traces = 1000, 20
+        data = np.zeros((ns, n_traces), dtype=np.float32)
+        data[:300, :] = 5.0          # real signal in the first 300 rows
+        clip_p99 = float(np.percentile(np.abs(data), 99))
+        active_ns = _detect_active_ns(data, clip_p99)
+        assert active_ns == 300 + ACTIVE_DEPTH_MARGIN_SAMPLES
+
+    def test_falls_back_to_full_ns_when_entirely_blank(self):
+        from sbp_studio.core.io_segy import _detect_active_ns
+        data = np.zeros((500, 10), dtype=np.float32)
+        assert _detect_active_ns(data, clip_p99=0.0) == 500
+
+    def test_falls_back_to_full_ns_when_signal_fills_the_whole_depth(self):
+        from sbp_studio.core.io_segy import _detect_active_ns
+        rng = np.random.default_rng(0)
+        data = rng.standard_normal((400, 15)).astype(np.float32) * 5.0
+        clip_p99 = float(np.percentile(np.abs(data), 99))
+        assert _detect_active_ns(data, clip_p99) == 400
+
+    def test_margin_overflow_clamps_to_ns(self):
+        """A cutoff detected right near the bottom + margin must clamp at ns,
+        never return a value past the array's own row count."""
+        from sbp_studio.core.io_segy import _detect_active_ns
+        ns = 200
+        data = np.zeros((ns, 5), dtype=np.float32)
+        data[:ns - 5, :] = 5.0       # real signal almost to the very last row
+        clip_p99 = float(np.percentile(np.abs(data), 99))
+        assert _detect_active_ns(data, clip_p99) == ns
+
+
+class TestDetectActiveBand:
+    """_detect_active_band (io_segy.py): the symmetric extension of
+    _detect_active_ns — detects the TOP of the real signal band too, not
+    just the bottom. The classic SBP case: a deep-water travel-time delay
+    means every trace has DEAD leading samples before the sub-bottom
+    reflectors of interest arrive — see SegyProfile.active_lo."""
+
+    def test_detects_both_top_and_bottom_cutoff(self):
+        from sbp_studio.core.io_segy import _detect_active_band, ACTIVE_DEPTH_MARGIN_SAMPLES
+        ns, n_traces = 2000, 20
+        data = np.zeros((ns, n_traces), dtype=np.float32)
+        data[500:800, :] = 5.0       # real signal only in rows [500, 800)
+        clip_p99 = float(np.percentile(np.abs(data), 99))
+        lo, hi = _detect_active_band(data, clip_p99)
+        assert lo == 500 - ACTIVE_DEPTH_MARGIN_SAMPLES
+        assert hi == 800 + ACTIVE_DEPTH_MARGIN_SAMPLES
+
+    def test_detect_active_ns_matches_the_band_hi(self):
+        """Backward-compat: _detect_active_ns must be exactly the bottom
+        half of _detect_active_band — same detection, same margin."""
+        from sbp_studio.core.io_segy import _detect_active_band, _detect_active_ns
+        rng = np.random.default_rng(2)
+        data = np.zeros((1500, 12), dtype=np.float32)
+        data[200:900, :] = rng.normal(0.0, 5.0, size=(700, 12))
+        clip_p99 = float(np.percentile(np.abs(data), 99))
+        lo, hi = _detect_active_band(data, clip_p99)
+        assert _detect_active_ns(data, clip_p99) == hi
+
+    def test_top_cutoff_clamps_at_zero_when_margin_overflows(self):
+        """Real signal starting near row 0 must clamp lo at 0, never negative."""
+        from sbp_studio.core.io_segy import _detect_active_band
+        ns = 300
+        data = np.zeros((ns, 8), dtype=np.float32)
+        data[5:200, :] = 5.0          # signal starts almost at the very top
+        clip_p99 = float(np.percentile(np.abs(data), 99))
+        lo, hi = _detect_active_band(data, clip_p99)
+        assert lo == 0
+
+    def test_falls_back_to_full_band_when_entirely_blank(self):
+        from sbp_studio.core.io_segy import _detect_active_band
+        data = np.zeros((500, 10), dtype=np.float32)
+        assert _detect_active_band(data, clip_p99=0.0) == (0, 500)
+
+    def test_falls_back_to_full_band_when_signal_fills_the_whole_depth(self):
+        from sbp_studio.core.io_segy import _detect_active_band
+        rng = np.random.default_rng(0)
+        data = rng.standard_normal((400, 15)).astype(np.float32) * 5.0
+        clip_p99 = float(np.percentile(np.abs(data), 99))
+        assert _detect_active_band(data, clip_p99) == (0, 400)

@@ -1,6 +1,8 @@
 """
 export_filter.py — Apply the active DSP filter chain to a FULL trace matrix
-for filtered SEG-Y export (Reprojector tab's "Aplicar filtros" checkbox).
+for filtered SEG-Y export (Reprojector tab's "Aplicar filtros" checkbox), and
+the canonical chunked-block DSP runner reused by anything that needs to
+process a (possibly segmented, never-fully-materialised) source.
 
 Memory strategy
 ---------------
@@ -9,30 +11,38 @@ processed in ONE shot — every node sees the complete, continuous trace set,
 required for any 2-D / cross-trace filter (e.g. the F-K dip filter) to be
 mathematically correct. If it doesn't fit, the matrix is processed in
 column BLOCKS with a small overlap halo (derived from the active nodes' own
-``trace_halo()``), reusing ``extract_visible_window(..., full_depth=True)``
-— the SAME window+halo+full_depth machinery the live preview uses, with a
-synthetic "distance" axis (1 unit per trace) so a column-index range can be
-expressed directly as an ``x_range``. ``full_depth=True`` guarantees every
-block still keeps every time sample (the same "no Y-cropping" guarantee
-that fixed the live-preview's color-pumping/washout bug — see
-``PreviewController._refresh``), so a node's numerical output is identical
-regardless of which strategy ran; only the block boundary's edge handling
-differs from the in-memory chain (mitigated by ``trace_halo``).
+``trace_halo()``).
 
-Pure NumPy/DSP-node logic — no Qt, no file I/O. The Reprojector tab wraps
-this into a plain ``Callable[[np.ndarray], np.ndarray]`` that
+``apply_pipeline_to_source`` (Phase 7) is the generalised engine: it reads
+each block via ``source.read_columns(c0, c1)`` instead of slicing a
+pre-built ndarray — so it works identically over a plain in-memory matrix
+(via the ``_NdarraySource`` adapter, what ``apply_pipeline_to_matrix`` below
+still presents to existing callers) AND over a segmented
+``ProfileChain``/``SegyProfile`` (Phase 7's ``read_columns`` — see
+model.py), which NEVER builds the whole-chain monolithic array just to
+export-process it. Block reads are sequential, integer column ranges — no
+ViewBox/km mapping needed here (that machinery, ``extract_visible_window``,
+is for the live preview's distance-axis-driven viewport; this is plain
+block iteration over a known trace count), so this module no longer depends
+on it. ``full_depth`` is implicit: every block is read at the source's full
+row count, so a node's numerical output is identical regardless of which
+strategy ran; only the block boundary's edge handling differs from a single
+in-memory pass (mitigated by ``trace_halo``).
+
+Pure NumPy/DSP-node logic — no Qt, no file I/O beyond what ``read_columns``
+itself does. The Reprojector tab wraps ``apply_pipeline_to_matrix`` into a
+plain ``Callable[[np.ndarray], np.ndarray]`` that
 ``core.io_segy.reproject_one``/``reproject_chain`` calls when the user
 checks "Aplicar filtros"; the core layer never imports anything from here
 (core stays GUI-free — see CLAUDE.md/this repo's established contract).
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 import numpy as np
 
 from .nodes import DSPContext, make_node
-from .pipeline import extract_visible_window
 
 # Fraction of currently-available RAM a single full-matrix DSP pass may use.
 # Mirrors cli.commands._RAM_SAFE_FRACTION's philosophy: leave headroom for
@@ -45,6 +55,27 @@ _BYTES_PER_SAMPLE_WORKING_SET = 4 * 3   # float32 in + ~2 working copies, worst 
 # top of this per-block, sized to whatever spatial halo the active nodes
 # actually report (see trace_halo below) — never a fixed guess.
 _BLOCK_TRACES = 2000
+
+
+@runtime_checkable
+class MatrixSource(Protocol):
+    """Duck-typed contract for anything ``apply_pipeline_to_source`` can read
+    column-bounded, full-depth blocks from — a plain ndarray (wrapped by
+    ``_NdarraySource``), a ``SegyProfile``, or a ``ProfileChain`` (model.py)
+    all satisfy this without any inheritance."""
+    def read_columns(self, c0: int, c1: int) -> np.ndarray: ...
+
+
+class _NdarraySource:
+    """Adapts a plain in-memory ``(ns, n_traces)`` ndarray to the
+    ``MatrixSource`` contract — lets ``apply_pipeline_to_matrix`` keep its
+    existing plain-ndarray signature while sharing ``apply_pipeline_to_source``
+    with segmented (``ProfileChain``) callers."""
+    def __init__(self, data: np.ndarray) -> None:
+        self._data = data
+
+    def read_columns(self, c0: int, c1: int) -> np.ndarray:
+        return self._data[:, c0:c1]
 
 
 def _available_ram_bytes() -> float:
@@ -66,6 +97,58 @@ def fits_in_memory(ns: int, n_traces: int,
     return needed <= budget
 
 
+def apply_pipeline_to_source(source: MatrixSource, ns: int, n_traces: int,
+                             node_cfg: List[Tuple[str, Dict]],
+                             dt_us: int, cancel=None, *,
+                             mem_budget_gb: Optional[float] = None) -> np.ndarray:
+    """Run ``node_cfg`` over ``source`` (anything satisfying ``MatrixSource``
+    — see module docstring), reading only the column block(s) each pass
+    actually needs. Returns a NEW, fully-materialised ``(ns, n_traces)``
+    array (the DSP output always needs to exist somewhere; only the SOURCE
+    read is block-wise/never-monolithic).
+
+    ``cancel`` — optional ``CancelToken``-like object with a ``.check()``
+    method (raises to abort); checked between nodes/blocks so a long export
+    can still be cancelled promptly.
+    """
+    if not node_cfg:
+        return source.read_columns(0, n_traces)
+    nodes = [make_node(key, params) for key, params in node_cfg]
+    base_ctx = DSPContext(dt_us=dt_us, ns=ns, n_traces=n_traces)
+    trace_halo = max((n.trace_halo(base_ctx) for n in nodes), default=0)
+
+    if fits_in_memory(ns, n_traces, mem_budget_gb):
+        out = source.read_columns(0, n_traces)
+        for node in nodes:
+            if cancel is not None:
+                cancel.check()
+            out = node.apply(out, base_ctx)
+        return out
+
+    # ── Block-based fallback (matrix too large to process in one shot) ────
+    # Plain integer column-block iteration — no ViewBox/km mapping needed
+    # (that's extract_visible_window's job for the live preview's distance
+    # axis; here the "viewport" already IS a trace-index range).
+    out = np.empty((ns, n_traces), dtype=np.float32)
+    c_vis = 0
+    while c_vis < n_traces:
+        if cancel is not None:
+            cancel.check()
+        c_vis_end = min(c_vis + _BLOCK_TRACES, n_traces)
+        c0 = max(0, c_vis - trace_halo)
+        c1 = min(n_traces, c_vis_end + trace_halo)
+        block = source.read_columns(c0, c1)
+        ctx = DSPContext(dt_us=dt_us, ns=ns, n_traces=block.shape[1])
+        chunk = block
+        for node in nodes:
+            if cancel is not None:
+                cancel.check()
+            chunk = node.apply(chunk, ctx)
+        out[:, c_vis:c_vis_end] = chunk[:, (c_vis - c0):(c_vis_end - c0)]
+        c_vis = c_vis_end
+    return out
+
+
 def apply_pipeline_to_matrix(data: np.ndarray,
                              node_cfg: List[Tuple[str, Dict]],
                              dt_us: int, cancel=None, *,
@@ -78,45 +161,14 @@ def apply_pipeline_to_matrix(data: np.ndarray,
     unchanged (no delay-alignment or row-count change is applied here —
     that would break a 1:1 per-trace write into the source file's spec).
 
-    ``cancel`` — optional ``CancelToken``-like object with a ``.check()``
-    method (raises to abort); checked between nodes/blocks so a long export
-    can still be cancelled promptly.
+    Unchanged public contract — a thin wrapper over
+    ``apply_pipeline_to_source`` (Phase 7's generalised engine) via
+    ``_NdarraySource``, so every existing caller (the Reprojector tab) needs
+    no changes at all.
     """
     if not node_cfg:
         return data
     ns, n_traces = data.shape
-    nodes = [make_node(key, params) for key, params in node_cfg]
-    base_ctx = DSPContext(dt_us=dt_us, ns=ns, n_traces=n_traces)
-    trace_halo = max((n.trace_halo(base_ctx) for n in nodes), default=0)
-
-    if fits_in_memory(ns, n_traces, mem_budget_gb):
-        out = data
-        for node in nodes:
-            if cancel is not None:
-                cancel.check()
-            out = node.apply(out, base_ctx)
-        return out
-
-    # ── Block-based fallback (matrix too large to process in one shot) ────
-    idx_axis = np.arange(n_traces, dtype=np.float64)   # 1 unit == 1 trace
-    t_span_ms = ns * (dt_us / 1000.0)
-    out = np.empty_like(data)
-    c = 0
-    while c < n_traces:
-        if cancel is not None:
-            cancel.check()
-        c_end = min(c + _BLOCK_TRACES, n_traces)
-        win = extract_visible_window(
-            data, idx_axis, t0_ms=0.0, dt_us=dt_us,
-            x_range=(float(c), float(c_end - 1)), y_range=(0.0, t_span_ms),
-            trace_halo=trace_halo, full_depth=True)
-        ctx = DSPContext(dt_us=win.effective_dt_us, ns=win.sub.shape[0],
-                         n_traces=win.sub.shape[1])
-        chunk = win.sub
-        for node in nodes:
-            if cancel is not None:
-                cancel.check()
-            chunk = node.apply(chunk, ctx)
-        out[:, win.c_vis0:win.c_vis1] = win.crop_visible(chunk)
-        c = c_end
-    return out
+    return apply_pipeline_to_source(
+        _NdarraySource(data), ns, n_traces, node_cfg, dt_us, cancel,
+        mem_budget_gb=mem_budget_gb)

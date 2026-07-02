@@ -1041,3 +1041,29 @@ class TestViewportSettleDebounce:
         sv._on_range_changed(vb, [(0.0, 1.0), (0.0, 1.0)])
         assert sv._zoom_timer.isActive()
         assert not sv._settle_timer.isActive()
+
+
+class TestSetLevelsOnly:
+    """Phase 3: the Clip slider's instant path — SeismicView.set_levels_only
+    must update [vmin, vmax] (and the colorbar) WITHOUT touching the raster
+    array, its rect, or the LUT — the cheap, 60-fps-safe half of the fix."""
+
+    def test_updates_vmax_vmin_and_img_levels_without_touching_the_array(self):
+        sv = _make_view()
+        rect_before = sv._rect
+        levels_before = sv.img.image
+        sv.set_levels_only(42.0, vmin=-42.0)
+        assert sv._vmax == 42.0 and sv._vmin == -42.0
+        assert sv._img_levels == (-42.0, 42.0)
+        assert sv._rect == rect_before              # untouched
+        assert sv.img.image is levels_before         # the SAME array object — no resubmission
+
+    def test_dedups_identical_levels(self):
+        """setLevels() is skipped entirely when the new levels are
+        unchanged — the same dedup show_preview already relies on."""
+        sv = _make_view()
+        sv.set_levels_only(10.0, vmin=0.0)
+        key_after_first = sv._img_levels
+        # A second call with the SAME values must not change anything new.
+        sv.set_levels_only(10.0, vmin=0.0)
+        assert sv._img_levels == key_after_first == (0.0, 10.0)
