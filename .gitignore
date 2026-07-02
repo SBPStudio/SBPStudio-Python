@@ -9,15 +9,16 @@ __pycache__/
 examples/_demo_in/
 examples/_demo_out/
 examples/_real_out/
+EJECUTABLE/
 
 
 # Proprietary SEG-Y survey data — NEVER commit (provided by the authorised user)
 examples/_real_in/
-examples\_real_in\L073A
-examples\_real_in\MCS7
-examples\_real_in\L001A
-examples\_real_in\L013A
-examples\_real_in\L011A
+examples/_real_in/L073A/
+examples/_real_in/MCS7/
+examples/_real_in/L001A/
+examples/_real_in/L013A/
+examples/_real_in/L011A/
 # Generated SEG-Y and images
 *_REPROY*
 *_UNIDO_REPROY*
@@ -59,7 +60,6 @@ Thumbs.db
 *.qpj
 *.sbn
 *.sbx
-*.shx
 *.fbn
 *.fbx
 *.tps
