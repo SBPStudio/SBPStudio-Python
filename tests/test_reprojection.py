@@ -190,9 +190,14 @@ class TestAmplitudeTransform:
             self, simple_segy, tmp_path):
         """The core contract: every header field (coordinates included,
         since amplitude_transform doesn't touch the coordinate-overwrite
-        logic) is identical to a plain (unfiltered) reprojection; only the
-        trace samples differ, by exactly the transform applied."""
+        logic) is identical to a plain (unfiltered) reprojection. Two
+        deliberate exceptions on the FILTERED side (the WYSIWYG fixes):
+        the binary header's Format word becomes 5 (IEEE float32, so the
+        filtered float payload isn't quantised back into IBM/int), and the
+        transform's input is the DC-removed matrix — the same stage-0 input
+        the live preview filters — not the raw file bytes."""
         import shutil
+        from sbp_studio.core import apply_dc_removal
         src = str(tmp_path / "src.sgy")
         shutil.copy(simple_segy, src)
         sd = load_profile(src)
@@ -206,12 +211,17 @@ class TestAmplitudeTransform:
 
         with segyio.open(plain, ignore_geometry=True) as fp, \
              segyio.open(filtered, ignore_geometry=True) as ff:
-            assert fp.bin == ff.bin
+            bin_p, bin_f = dict(fp.bin), dict(ff.bin)
+            assert bin_f.pop(segyio.BinField.Format) == 5     # IEEE float32
+            bin_p.pop(segyio.BinField.Format)
+            assert bin_p == bin_f                             # rest identical
             assert fp.text[0] == ff.text[0]
             for i in range(fp.tracecount):
                 assert dict(fp.header[i]) == dict(ff.header[i])   # EVERY field
+            expected = apply_dc_removal(
+                fp.trace.raw[:].T.astype(np.float32)) * 2.0
             np.testing.assert_allclose(
-                ff.trace.raw[:], fp.trace.raw[:] * 2.0, rtol=1e-3, atol=1e-3)
+                ff.trace.raw[:].T, expected, rtol=1e-3, atol=1e-3)
 
     def test_shape_mismatch_raises_reprojection_error(self, simple_segy, tmp_path):
         import shutil
@@ -240,7 +250,83 @@ class TestAmplitudeTransform:
 
         with segyio.open(plain, ignore_geometry=True) as fp, \
              segyio.open(filtered, ignore_geometry=True) as ff:
+            from sbp_studio.core import apply_dc_removal
             for i in range(fp.tracecount):
                 assert dict(fp.header[i]) == dict(ff.header[i])
+            # Transform input is DC-removed per constituent file (WYSIWYG —
+            # same stage-0 input the preview filters); output is IEEE float32.
+            assert int(ff.bin[segyio.BinField.Format]) == 5
+            expected = apply_dc_removal(
+                fp.trace.raw[:].T.astype(np.float32)) * 3.0
             np.testing.assert_allclose(
-                ff.trace.raw[:], fp.trace.raw[:] * 3.0, rtol=1e-3, atol=1e-3)
+                ff.trace.raw[:].T, expected, rtol=1e-3, atol=1e-3)
+
+
+class TestWysiwygFilteredExport:
+    """Full WYSIWYG contract for filtered exports (the 'exported filtered
+    chain looks washed out on re-import' bug). Three coupled guarantees:
+    (1) filtered samples are written as IEEE float32 (format 5) — never
+    quantised back into the source's IBM/integer sample format; (2) the
+    transform filters the SAME stage-0 DC-removed input the live preview
+    shows; (3) the loader does NOT DC-remove single-signed (envelope-like)
+    data on re-import. Together: preview -> export -> re-import is
+    BIT-exact."""
+
+    @staticmethod
+    def _envelope_like(d):
+        a = np.abs(d)
+        return (a / (a.max() + 1e-30)).astype(np.float32)
+
+    def test_envelope_export_round_trips_bit_exact(self, simple_segy, tmp_path):
+        import shutil
+        src = str(tmp_path / "src.sgy")
+        shutil.copy(simple_segy, src)
+        sd = load_profile(src)
+        preview = self._envelope_like(sd.data)     # what the live preview shows
+
+        out = reproject_one(sd, "EPSG:4326", "EPSG:32630",
+                            amplitude_transform=self._envelope_like,
+                            out_path=str(tmp_path / "env.sgy"))
+        with segyio.open(out, ignore_geometry=True) as f:
+            assert int(f.bin[segyio.BinField.Format]) == 5   # IEEE float32
+
+        sd2 = load_profile(out)                    # the user's actual re-import
+        assert sd2.error is None
+        np.testing.assert_array_equal(sd2.data, preview)     # BIT-exact WYSIWYG
+
+    def test_loader_preserves_single_signed_offset(self, simple_segy, tmp_path):
+        """An all-positive file's per-trace mean is signal, not bias — the
+        loader must NOT zero-centre it (that warped [0,1] envelopes into
+        ±-swinging data no display range could fix)."""
+        import shutil
+        src = str(tmp_path / "src.sgy")
+        shutil.copy(simple_segy, src)
+        sd = load_profile(src)
+        out = reproject_one(sd, "EPSG:4326", "EPSG:32630",
+                            amplitude_transform=self._envelope_like,
+                            out_path=str(tmp_path / "env2.sgy"))
+        sd2 = load_profile(out)
+        assert float(sd2.data.min()) >= 0.0        # positivity preserved
+        assert float(sd2.data.mean()) > 0.01       # offset (the signal) intact
+
+    def test_loader_still_dc_removes_mixed_sign_raw(self, simple_segy):
+        """Genuine raw (mixed-sign) seismic keeps mandatory stage-0 DC
+        removal — every trace zero-centred exactly as before the guard."""
+        sd = load_profile(simple_segy)
+        assert float(sd.data.min()) < 0.0 < float(sd.data.max())
+        col_means = sd.data.mean(axis=0)
+        assert float(np.abs(col_means).max()) < 1e-4
+
+    def test_unfiltered_export_keeps_source_format(self, simple_segy, tmp_path):
+        """transform=None stays fully byte-faithful — including the source's
+        own sample format word (the IEEE forcing is filtered-path only)."""
+        import shutil
+        src = str(tmp_path / "src.sgy")
+        shutil.copy(simple_segy, src)
+        sd = load_profile(src)
+        out = reproject_one(sd, "EPSG:4326", "EPSG:32630",
+                            out_path=str(tmp_path / "plain2.sgy"))
+        with segyio.open(src, ignore_geometry=True) as fs, \
+             segyio.open(out, ignore_geometry=True) as fo:
+            assert int(fo.bin[segyio.BinField.Format]) == \
+                   int(fs.bin[segyio.BinField.Format])

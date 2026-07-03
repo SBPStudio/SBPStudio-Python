@@ -623,7 +623,25 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
         # .astype(...) or by np.ascontiguousarray's copy) and has no other
         # reference yet, so skipping the extra allocation is a real memory
         # win on the multi-GB matrices a deep MCS line can produce.
-        data = apply_dc_removal(data, inplace=True)
+        #
+        # WYSIWYG guard: DC removal assumes SIGNED, roughly zero-centred raw
+        # seismic, where the per-trace mean is instrumental bias. SINGLE-
+        # SIGNED data — a filtered export re-imported for QC (envelope,
+        # |amplitude|, energy: all ≥ 0 by construction) — violates that
+        # premise: its offset IS the signal, and subtracting each trace's
+        # mean silently warped a [0, 1] envelope into ±-swinging data that
+        # no display-range tweak could ever make match the preview that
+        # produced it. Data whose every finite sample shares one sign cannot
+        # be bias-afflicted raw seismic (that would need a bias exceeding
+        # the entire signal swing), so skipping is the correct call there.
+        _dmin = float(np.nanmin(data)) if data.size else 0.0
+        _dmax = float(np.nanmax(data)) if data.size else 0.0
+        if _dmin < 0.0 < _dmax:                  # mixed-sign ⇒ genuine raw seismic
+            data = apply_dc_removal(data, inplace=True)
+        else:
+            _LOG.info("Single-signed trace data in %s (min=%g, max=%g) — "
+                      "processed/envelope export detected, DC removal skipped.",
+                      prof.name, _dmin, _dmax)
         prof.data     = data
         prof.amp_max  = np.max(np.abs(prof.data), axis=0)
         prof.clip_p99 = float(np.percentile(np.abs(prof.data), 99))
@@ -1119,10 +1137,21 @@ def reproject_one(
     ``gui.dsp.export_filter.apply_pipeline_to_matrix``) applied to the FULL
     trace matrix BEFORE writing. Every trace header is still cloned exactly
     as above — ONLY the trace amplitude payload is replaced by this
-    function's output; everything else (EBCDIC text, binary header, every
-    header field, coordinates) is byte-identical to the source. ``None``
-    (the default) preserves the exact pre-existing byte-faithful behaviour
-    (``dst.trace[i] = src.trace[i]``, no full-matrix read at all).
+    function's output. ``None`` (the default) preserves the exact
+    pre-existing byte-faithful behaviour (``dst.trace[i] = src.trace[i]``,
+    no full-matrix read at all).
+
+    WYSIWYG guarantees of the FILTERED path (and its two deliberate
+    deviations from byte-faithfulness, both sample-payload-related):
+      * the transform's input is the stage-0 DC-REMOVED matrix — the same
+        input the live preview's filter chain sees (see
+        ``_populate_profile_from_file``) — not the raw file bytes;
+      * the output sample format is forced to IEEE float32 (format 5, with
+        the binary header's Format word patched to match) so the filtered
+        float payload round-trips bit-exactly instead of being quantised
+        back into the source's IBM-float/integer format.
+    EBCDIC text, every other binary-header word, every trace-header field
+    and all coordinates remain byte-identical to the source either way.
     """
     if cancel is None:
         cancel = CancelToken.never()
@@ -1166,15 +1195,36 @@ def reproject_one(
             if amplitude_transform is not None:
                 progress(0.05, "applying filters…")
                 full = src.trace.raw[:].T.astype(np.float32)   # (ns, n_traces)
+                # WYSIWYG: the live preview's filter chain runs on the LOADED
+                # matrix, which has mandatory stage-0 DC removal applied (see
+                # _populate_profile_from_file). Feed the transform the same
+                # input, or the exported amplitudes differ from the preview
+                # by each trace's DC bias propagated through every filter.
+                # Filtered path only — transform=None still copies raw bytes.
+                full = apply_dc_removal(full, inplace=True)
                 processed = amplitude_transform(full)
                 if processed.shape != full.shape:
                     raise ReprojectionError(
                         "amplitude_transform changed the array shape: "
                         f"{full.shape} -> {processed.shape}")
+                # WYSIWYG: filtered samples are float32 by contract; writing
+                # them back in the SOURCE's sample format (IBM float, or worse
+                # an integer format) quantises them — measured up to ~4e-2
+                # absolute error on a [0, 1] envelope via segyio's IBM
+                # conversion. Force IEEE float32 (format 5) so the filtered
+                # payload round-trips BIT-EXACTLY. Only the filtered path:
+                # transform=None keeps the source format for a byte-faithful
+                # copy, exactly as before.
+                spec.format = 5
 
             with segyio.create(outpath, spec) as dst:
                 dst.bin    = src.bin
                 dst.text[0] = src.text[0]
+                if processed is not None:
+                    # dst.bin was cloned from the source ABOVE, including its
+                    # Format word — re-patch it to match the actual IEEE
+                    # samples, or readers would misdecode the whole file.
+                    dst.bin.update({segyio.BinField.Format: 5})
 
                 cancel.check()
                 progress(0.15, "copying headers…")
@@ -1282,11 +1332,20 @@ def reproject_chain(
         with segyio.open(ch.profiles[0].path, ignore_geometry=True) as src0:
             spec = segyio.tools.metadata(src0)
             spec.tracecount = n_total
+        if amplitude_transform is not None:
+            # WYSIWYG: same rationale as reproject_one — filtered float32
+            # samples must be written as IEEE float32 (format 5), never
+            # quantised back into the source's IBM/integer sample format.
+            spec.format = 5
 
         with segyio.create(outpath, spec) as dst:
             with segyio.open(ch.profiles[0].path, ignore_geometry=True) as src0:
                 dst.bin    = src0.bin
                 dst.text[0] = src0.text[0]
+            if amplitude_transform is not None:
+                # Re-patch the Format word cloned from src0 above so the
+                # binary header matches the actual IEEE samples.
+                dst.bin.update({segyio.BinField.Format: 5})
 
             global_idx = 0
             for p_idx, sd in enumerate(ch.profiles):
@@ -1302,6 +1361,10 @@ def reproject_chain(
                     processed = None
                     if amplitude_transform is not None:
                         full = src.trace.raw[:].T.astype(np.float32)
+                        # WYSIWYG: mirror the loader's mandatory stage-0 DC
+                        # removal so the chain export filters the SAME input
+                        # the live preview showed — see reproject_one.
+                        full = apply_dc_removal(full, inplace=True)
                         processed = amplitude_transform(full)
                         if processed.shape != full.shape:
                             raise ReprojectionError(
