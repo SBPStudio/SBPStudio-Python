@@ -113,14 +113,55 @@ def load_picks_tps(path: str) -> List[PickPoint]:
 
 # ── GIS export dispatch (CSV / GeoJSON / SHP, by file extension) ───────────────
 
-def export_picks(path: str, picks: List[PickPoint]) -> str:
+def picks_to_wgs84(picks: List[PickPoint], source: Any = None) -> List[tuple]:
+    """Return ``(id, lon, lat, description)`` tuples with coordinates resolved
+    to WGS84 degrees — what every GIS writer below declares (.prj / GeoJSON
+    ``crs``), so it is what they must actually receive.
+
+    ``PickPoint.x_coord/y_coord`` hold the profile's NATIVE navigation units
+    (``obj.lons``/``obj.lats`` — see ``resolve_pick_coords``): degrees for
+    geographic files (CoordinateUnits 2 is already ``/3600``-converted by the
+    loader, 3 is native degrees), but raw UTM eastings/northings in METRES for
+    projected files (CoordinateUnits=1). Writing those metres under a WGS84
+    .prj put every mark thousands of "degrees" outside the map — the exact
+    bug this converter fixes. Same native-in-memory / WGS84-at-the-GIS-edge
+    contract as the navigation map (``spatial.safe_map_coords``).
+
+    ``source`` is the profile/chain the picks were made on. Conversion runs
+    only when it is a projected file WITH a resolved CRS
+    (``source.detected_crs`` — auto-detected or user-override); a projected
+    file whose CRS is still unknown exports raw values unchanged (there is
+    nothing correct to convert WITH — the GUI's CRS selector exists for
+    exactly that case). ``None`` (legacy callers/tests) keeps raw values."""
+    points = [(p.id, p.x_coord, p.y_coord, p.description) for p in picks]
+    if source is None or not points:
+        return points
+    if getattr(source, "coord_unit", None) != 1:
+        return points                    # geographic file — already degrees
+    src_crs = getattr(source, "detected_crs", None)
+    if not src_crs:
+        return points                    # projected, CRS unresolved — see docstring
+    import numpy as np
+    from .spatial import to_geographic
+    xs = np.array([pt[1] for pt in points], dtype=float)
+    ys = np.array([pt[2] for pt in points], dtype=float)
+    lon, lat = to_geographic(xs, ys, src_crs)
+    return [(pid, float(lo), float(la), descr)
+            for (pid, _x, _y, descr), lo, la in zip(points, lon, lat)]
+
+
+def export_picks(path: str, picks: List[PickPoint], source: Any = None) -> str:
     """Write ``picks`` in whichever GIS format ``path``'s extension implies
     (.csv / .geojson / .shp, default .shp) — mirrors the existing FIX-mark
     export's dispatch-by-extension convention. Returns the path actually
-    written (writers append their own extension if missing)."""
+    written (writers append their own extension if missing).
+
+    ``source`` — the profile/chain the picks belong to; when given, projected
+    native coordinates are converted to the WGS84 the output formats declare
+    (see :func:`picks_to_wgs84`)."""
     from .geometry_export import write_picks_csv, write_picks_geojson, write_picks_shp
 
-    points = [(p.id, p.x_coord, p.y_coord, p.description) for p in picks]
+    points = picks_to_wgs84(picks, source)
     low = path.lower()
     if low.endswith((".geojson", ".json")):
         write_picks_geojson(path, points)

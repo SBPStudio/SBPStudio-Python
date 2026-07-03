@@ -49,6 +49,7 @@ from .geometry_export import (
 )
 from .picking import (
     PickPoint, resolve_pick_coords, save_picks_tps, load_picks_tps, export_picks,
+    picks_to_wgs84,
 )
 
 __all__ = [
@@ -99,4 +100,5 @@ __all__ = [
     "write_navline_shp", "write_navline_geojson", "write_navline_csv",
     "write_picks_shp", "write_picks_geojson", "write_picks_csv",
     "PickPoint", "resolve_pick_coords", "save_picks_tps", "load_picks_tps", "export_picks",
+    "picks_to_wgs84",
 ]

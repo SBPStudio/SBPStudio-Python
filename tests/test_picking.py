@@ -150,6 +150,85 @@ class TestExportPicksDispatch:
         assert os.path.exists(out)
 
 
+class _FakeCrsSource(_FakeSource):
+    """_FakeSource + the CRS attribute surface picks_to_wgs84 reads."""
+    def __init__(self, lons, lats, coord_unit, detected_crs):
+        super().__init__(lons, lats)
+        self.coord_unit = coord_unit
+        self.detected_crs = detected_crs
+
+
+class TestPicksToWgs84:
+    """The GIS-boundary coordinate conversion (the '.shp marks land nowhere
+    near the track' bug): PickPoint.x/y hold the profile's NATIVE units —
+    UTM metres for a projected (CoordinateUnits=1) file — while every GIS
+    writer declares WGS84. picks_to_wgs84 converts exactly when a projected
+    source with a resolved CRS is supplied, and passes through otherwise."""
+
+    # Real WGS84 targets and their UTM 20S equivalents (pyproj forward).
+    TRUE_LON = (-60.51234, -60.49876)
+    TRUE_LAT = (-62.98765, -62.97654)
+    UTM_CRS = "EPSG:32720"
+
+    def _utm(self):
+        import numpy as np
+        from sbp_studio.core.spatial import reproject_points
+        return reproject_points(np.asarray(self.TRUE_LON), np.asarray(self.TRUE_LAT),
+                                "EPSG:4326", self.UTM_CRS)
+
+    def _utm_picks(self):
+        xs, ys = self._utm()
+        return [PickPoint(id=i + 1, trace_index=i, time_ms=0.0,
+                          x_coord=float(xs[i]), y_coord=float(ys[i]),
+                          description=f"m{i}") for i in range(len(xs))]
+
+    def test_projected_source_converts_to_wgs84(self):
+        from sbp_studio.core import picks_to_wgs84
+        xs, ys = self._utm()
+        src = _FakeCrsSource(xs, ys, coord_unit=1, detected_crs=self.UTM_CRS)
+        pts = picks_to_wgs84(self._utm_picks(), src)
+        for (pid, lon, lat, _d), tl, tt in zip(pts, self.TRUE_LON, self.TRUE_LAT):
+            assert abs(lon - tl) < 1e-8 and abs(lat - tt) < 1e-8
+
+    def test_geographic_source_passes_through(self):
+        from sbp_studio.core import picks_to_wgs84
+        picks = [PickPoint(id=1, trace_index=0, time_ms=0.0,
+                           x_coord=-8.5, y_coord=43.1, description="")]
+        src = _FakeCrsSource([-8.5], [43.1], coord_unit=3, detected_crs="EPSG:4326")
+        assert picks_to_wgs84(picks, src)[0][1:3] == (-8.5, 43.1)
+
+    def test_projected_but_unresolved_crs_passes_through_raw(self):
+        """Nothing correct to convert WITH — documented raw passthrough (the
+        GUI's CRS selector exists for this case)."""
+        from sbp_studio.core import picks_to_wgs84
+        xs, ys = self._utm()
+        src = _FakeCrsSource(xs, ys, coord_unit=1, detected_crs=None)
+        pts = picks_to_wgs84(self._utm_picks(), src)
+        assert pts[0][1] == float(xs[0])
+
+    def test_none_source_and_empty_picks(self):
+        from sbp_studio.core import picks_to_wgs84
+        picks = self._utm_picks()
+        assert picks_to_wgs84(picks, None)[0][1] == picks[0].x_coord
+        src = _FakeCrsSource([], [], coord_unit=1, detected_crs=self.UTM_CRS)
+        assert picks_to_wgs84([], src) == []
+
+    def test_export_picks_shp_with_source_writes_wgs84(self, tmp_path):
+        """End-to-end through the .shp writer: a projected profile's marks
+        must land at real lon/lat inside the WGS84 envelope the .prj claims
+        — this exact file re-imports onto the map at the track's position."""
+        xs, ys = self._utm()
+        src = _FakeCrsSource(xs, ys, coord_unit=1, detected_crs=self.UTM_CRS)
+        out = export_picks(str(tmp_path / "marks.shp"), self._utm_picks(),
+                           source=src)
+        gpd = pytest.importorskip("geopandas")
+        gdf = gpd.read_file(out)
+        assert len(gdf) == 2
+        assert abs(float(gdf.geometry.x.iloc[0]) - self.TRUE_LON[0]) < 1e-8
+        assert abs(float(gdf.geometry.y.iloc[0]) - self.TRUE_LAT[0]) < 1e-8
+        assert gdf.crs is not None and gdf.crs.to_epsg() == 4326
+
+
 class TestPickWritersDirect:
     """Direct coverage of the geometry_export writers export_picks dispatches to."""
 

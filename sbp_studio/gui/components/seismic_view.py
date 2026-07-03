@@ -940,6 +940,13 @@ class SeismicView(QWidget):
             self.clear_picks()
         self._pick_source = obj
 
+    def get_picking_source(self):
+        """The profile/chain the current picks were made on (see
+        set_picking_source) — the export path needs it to resolve the picks'
+        native coordinates to the WGS84 the GIS formats declare
+        (core.picking.picks_to_wgs84). None before any source was set."""
+        return self._pick_source
+
     def get_picks(self) -> List["PickPoint"]:
         """A shallow copy — callers (export) must not mutate the live list."""
         return list(self._picks)

@@ -1100,13 +1100,19 @@ class SubTabbedTab(QWidget):
         if not out:
             return
 
+        # Captured on the GUI thread: the profile/chain the picks were made on
+        # — export_picks uses its coord_unit/detected_crs to convert projected
+        # native coordinates to the WGS84 the .shp/.geojson formats declare
+        # (core.picking.picks_to_wgs84). Plain attribute reads, worker-safe.
+        source = self._seismic.get_picking_source()
+
         def job(progress, cancel) -> tuple:
             from sbp_studio.core import export_picks, save_picks_tps
             progress(float("nan"), "")
             if out.lower().endswith(".tps"):
                 save_picks_tps(out, picks)
                 return out, len(picks)
-            written = export_picks(out, picks)
+            written = export_picks(out, picks, source=source)
             return written, len(picks)
 
         self.tasks.run_task(
