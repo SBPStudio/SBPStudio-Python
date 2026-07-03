@@ -1697,6 +1697,61 @@ class TestExportFilter:
         assert calls and all(rows == 128 for rows in calls)
         assert len(calls) > 1   # actually went through multiple blocks
 
+    def test_global_stats_node_forces_full_matrix_despite_tiny_budget(self):
+        """Safety guard: LogCompression/CLAHE-style nodes (GLOBAL_STATS=True)
+        normalise by max(abs(data)) over whatever window they're given —
+        chunking would give each block its own scale, seaming the output.
+        A probe node proves the engine ignores mem_budget_gb entirely and
+        always hands such a node the FULL trace count in one call."""
+        from sbp_studio.gui.dsp.export_filter import apply_pipeline_to_matrix
+        from sbp_studio.gui.dsp.nodes import DSPNode, NODE_REGISTRY
+
+        calls = []
+
+        class _GlobalProbeNode(DSPNode):
+            KEY = "export_global_probe"
+            GLOBAL_STATS = True
+
+            def _apply(self, data, ctx):
+                calls.append(data.shape[1])
+                return data
+
+        NODE_REGISTRY.append(_GlobalProbeNode)
+        try:
+            data = self._matrix(ns=128, n_traces=4500)   # > 2 blocks at width 2000
+            apply_pipeline_to_matrix(data, [("export_global_probe", {})], self.DT_US,
+                                     mem_budget_gb=1e-9)   # would force chunking otherwise
+        finally:
+            NODE_REGISTRY.remove(_GlobalProbeNode)
+        assert calls == [4500]   # exactly one call, seeing every trace at once
+
+    def test_global_stats_guard_prevents_seamed_output(self):
+        """End-to-end proof: without the guard, a genuinely global
+        normalisation (divide by the array's own max) would seam at block
+        boundaries under a tiny budget; with the guard it matches the
+        full-memory result exactly regardless of mem_budget_gb."""
+        from sbp_studio.gui.dsp.export_filter import apply_pipeline_to_matrix
+        from sbp_studio.gui.dsp.nodes import DSPNode, NODE_REGISTRY
+
+        class _GlobalNormNode(DSPNode):
+            KEY = "export_global_norm"
+            GLOBAL_STATS = True
+
+            def _apply(self, data, ctx):
+                peak = np.abs(data).max()
+                return data / (peak + 1e-30)
+
+        NODE_REGISTRY.append(_GlobalNormNode)
+        try:
+            data = self._matrix(ns=128, n_traces=4500, seed=1)
+            full = apply_pipeline_to_matrix(data, [("export_global_norm", {})],
+                                            self.DT_US, mem_budget_gb=10.0)
+            guarded = apply_pipeline_to_matrix(data, [("export_global_norm", {})],
+                                               self.DT_US, mem_budget_gb=1e-9)
+        finally:
+            NODE_REGISTRY.remove(_GlobalNormNode)
+        np.testing.assert_array_equal(guarded, full)
+
 
 class TestApplyPipelineToSource:
     """Phase 7: apply_pipeline_to_source — the generalised engine behind

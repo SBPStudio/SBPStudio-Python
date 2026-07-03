@@ -110,6 +110,13 @@ def apply_pipeline_to_source(source: MatrixSource, ns: int, n_traces: int,
     ``cancel`` — optional ``CancelToken``-like object with a ``.check()``
     method (raises to abort); checked between nodes/blocks so a long export
     can still be cancelled promptly.
+
+    GLOBAL_STATS safety: when any active node sets ``DSPNode.GLOBAL_STATS``
+    (LogCompression, CLAHE), the single-shot full-matrix path is forced
+    regardless of ``mem_budget_gb``/``fits_in_memory`` — chunking would give
+    each block its own normalisation scale, writing a permanent amplitude
+    seam into the output. This trades RAM safety for correctness on purpose;
+    see the guard's own comment below.
     """
     if not node_cfg:
         return source.read_columns(0, n_traces)
@@ -117,7 +124,19 @@ def apply_pipeline_to_source(source: MatrixSource, ns: int, n_traces: int,
     base_ctx = DSPContext(dt_us=dt_us, ns=ns, n_traces=n_traces)
     trace_halo = max((n.trace_halo(base_ctx) for n in nodes), default=0)
 
-    if fits_in_memory(ns, n_traces, mem_budget_gb):
+    # GLOBAL_STATS guard (see DSPNode.GLOBAL_STATS's docstring): LogCompression/
+    # CLAHE normalise by max(abs(data)) over WHATEVER window they're given — a
+    # column-block pass would give each block its OWN normalisation scale,
+    # writing a permanent amplitude discontinuity into the export at every
+    # block boundary. No halo can fix a normalisation mismatch (halos only
+    # help spatial/windowed filters, not global ones). Correctness must win
+    # over the RAM budget here — exactly like the live preview's own
+    # full-Y-band override for these nodes (see preview.py's Strategy B) —
+    # so a GLOBAL_STATS node forces the single-shot path unconditionally,
+    # regardless of what fits_in_memory() says.
+    has_global_stats = any(getattr(n, "GLOBAL_STATS", False) for n in nodes)
+
+    if has_global_stats or fits_in_memory(ns, n_traces, mem_budget_gb):
         out = source.read_columns(0, n_traces)
         for node in nodes:
             if cancel is not None:
