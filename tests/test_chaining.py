@@ -346,3 +346,76 @@ class TestColumnsInCache:
         assert ch.columns_in_cache(ch.n_traces + 100, ch.n_traces + 200) is True
         # Identical endpoints → empty range → True.
         assert ch.columns_in_cache(5, 5) is True
+
+
+class TestHeterogeneousNsChain:
+    """Heterogeneous per-file record lengths (the field crash: 'array at
+    index 0 has size 6427 ... index 1 has size 32767'). The chain's vertical
+    extent must be the DEEPEST constituent file, with shorter segments
+    bottom-padded with zeros in BOTH assembly paths (load_chain_traces and
+    read_columns)."""
+
+    NS_SHORT, NS_DEEP = 96, 256
+
+    def _hetero_chain(self, base_dir):
+        """Two contiguous files (same dt, chain-linkable geometry/timestamps
+        — mirrors make_chain_pair) with DIFFERENT sample counts."""
+        from tests.make_synthetic_segy import make_synthetic_segy
+        from pathlib import Path
+        p1 = str(Path(base_dir) / "het_1.sgy")
+        p2 = str(Path(base_dir) / "het_2.sgy")
+        n_traces, lon_step = 40, 0.001
+        end_lon = -8.0 + n_traces * lon_step
+        gap_deg = 0.05 / 111.32
+        make_synthetic_segy(p1, n_traces=n_traces, ns=self.NS_SHORT, dt_us=500,
+                            base_lon=-8.0, doy_start=100, minute_start=0)
+        make_synthetic_segy(p2, n_traces=n_traces, ns=self.NS_DEEP, dt_us=500,
+                            base_lon=end_lon + gap_deg, doy_start=100,
+                            minute_start=n_traces)
+        profiles = [load_profile(p1), load_profile(p2)]
+        chains = detect_chains(profiles, gap_km=1.0)
+        assert len(chains) == 1 and len(chains[0].profiles) == 2
+        return chains[0], profiles
+
+    def test_chain_ns_is_deepest_file(self, tmp_path):
+        ch, _ = self._hetero_chain(tmp_path)
+        assert ch.ns == self.NS_DEEP
+        assert ch.dur_ms == pytest.approx(self.NS_DEEP * ch.dt_us / 1000.0)
+
+    def test_load_chain_traces_pads_instead_of_crashing(self, tmp_path):
+        """The exact reported crash path: np.concatenate over mismatched
+        row counts raised ValueError before the fix."""
+        ch, profiles = self._hetero_chain(tmp_path)
+        ch.load_chain_traces()
+        assert ch.data.shape == (self.NS_DEEP, ch.n_traces)
+        n1 = profiles[0].n_traces
+        # Segment 1 (short file): real samples on top, zero pad below.
+        np.testing.assert_array_equal(
+            ch.data[:self.NS_SHORT, :n1], profiles[0].data)
+        assert not ch.data[self.NS_SHORT:, :n1].any()      # pad is all zeros
+        # Segment 2 (deep file): full height, byte-identical.
+        np.testing.assert_array_equal(ch.data[:, n1:], profiles[1].data)
+
+    def test_read_columns_pads_across_the_seam(self, tmp_path):
+        """read_columns must agree with load_chain_traces column-for-column,
+        including a window straddling the short→deep seam."""
+        ch, profiles = self._hetero_chain(tmp_path)
+        n1 = profiles[0].n_traces
+        win = ch.read_columns(n1 - 5, n1 + 5)              # straddles the seam
+        assert win.shape == (self.NS_DEEP, 10)
+        ch.load_chain_traces()
+        np.testing.assert_array_equal(win, ch.data[:, n1 - 5:n1 + 5])
+        # Single-segment window inside the SHORT file must also be full height.
+        win_short = ch.read_columns(0, 5)
+        assert win_short.shape == (self.NS_DEEP, 5)
+        assert not win_short[self.NS_SHORT:, :].any()
+
+    def test_homogeneous_chain_unchanged(self, chain_pair):
+        """Equal-ns chains (the normal case) must behave exactly as before —
+        no padding rows, data equal to the plain concatenation."""
+        profiles = [load_profile(chain_pair[0]), load_profile(chain_pair[1])]
+        ch = detect_chains(profiles, gap_km=1.0)[0]
+        ch.load_chain_traces()
+        assert ch.ns == profiles[0].ns
+        expected = np.concatenate([p.data for p in profiles], axis=1)
+        np.testing.assert_array_equal(ch.data, expected)

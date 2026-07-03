@@ -382,11 +382,17 @@ class ProfileChain:
         self.dist_km  = np.concatenate(segments)
         self.total_km = float(self.dist_km[-1])
 
-        # Metadata from first profile (dt/ns must be equal across profiles)
+        # Metadata from first profile. dt_us must be equal across profiles —
+        # the chain detector enforces it. ns may NOT be: heterogeneous record
+        # lengths within one survey are real in the field (e.g. 6427 vs 32767
+        # samples when the operator changed the recording window mid-line).
+        # The chain's vertical extent is the DEEPEST constituent file; every
+        # trace-matrix assembly bottom-pads shorter segments with zeros to
+        # this height (see load_chain_traces / read_columns).
         p0             = self.profiles[0]
         self.dt_us     = p0.dt_us
-        self.ns        = p0.ns
-        self.dur_ms    = p0.dur_ms
+        self.ns        = int(max(p.ns for p in self.profiles))
+        self.dur_ms    = self.ns * self.dt_us / 1000.0
         self.delay_ms  = p0.delay_ms
         # Total trace count summed from the stubs (NOT data.shape — data is lazy).
         self.n_traces  = int(sum(p.n_traces for p in self.profiles))
@@ -465,10 +471,19 @@ class ProfileChain:
             mats.append(data[:, lo:hi])
         if not mats:
             return np.zeros((self.ns, 0), dtype=np.float32)
-        if len(mats) == 1:
+        # Zero-copy fast path: one segment already at full chain height (the
+        # overwhelmingly common case — most reads fall inside one file).
+        if len(mats) == 1 and mats[0].shape[0] == self.ns:
             return mats[0]
-        out = np.empty((self.ns, sum(m.shape[1] for m in mats)), dtype=np.float32)
-        np.concatenate(mats, axis=1, out=out)
+        # Heterogeneous record lengths: chain ns is the DEEPEST file, so any
+        # shorter segment is bottom-padded with zeros by writing it into the
+        # top of a zero-filled destination — same strategy and same 0.0-vs-NaN
+        # rationale as load_chain_traces.
+        out = np.zeros((self.ns, sum(m.shape[1] for m in mats)), dtype=np.float32)
+        col = 0
+        for m in mats:
+            out[:m.shape[0], col:col + m.shape[1]] = m
+            col += m.shape[1]
         return out
 
     def columns_in_cache(self, c0: int, c1: int) -> bool:
@@ -512,13 +527,23 @@ class ProfileChain:
             if cancel is not None:
                 cancel.check()
             mats.append(self._ensure_profile_loaded(p))
-        # Write directly into one pre-allocated contiguous destination —
-        # np.concatenate's own buffer is not guaranteed C-contiguous for this
-        # axis, so the historical code paid a SECOND full-size copy via a
-        # separate np.ascontiguousarray pass; out= does the gather once.
-        out = np.empty((self.profiles[0].ns if self.profiles else 0,
-                       sum(m.shape[1] for m in mats)), dtype=np.float32)
-        np.concatenate(mats, axis=1, out=out)
+        # Write directly into one pre-allocated contiguous destination (a
+        # np.concatenate would need every segment's row count to match — the
+        # exact ValueError crash heterogeneous-ns chains used to hit). The
+        # destination is self.ns tall (the DEEPEST file) and ZERO-filled, so
+        # copying each segment into the TOP of its column slot bottom-pads
+        # the shorter ones implicitly — one copy per segment, no per-segment
+        # np.pad allocations. 0.0 (not NaN) is the padding by design: zeros
+        # pass neutrally through every stats reduction (amp_max, clip_p99
+        # percentile, the preview's global levels) and the DSP boundary,
+        # whereas NaN would poison plain max/percentile math and force
+        # nan-aware variants through the whole downstream pipeline.
+        out = np.zeros((self.ns, sum(m.shape[1] for m in mats)),
+                       dtype=np.float32)
+        col = 0
+        for m in mats:
+            out[:m.shape[0], col:col + m.shape[1]] = m
+            col += m.shape[1]
         self.data = out
         # Chain-wide clip_p99 used to be a true 99th percentile over every
         # sample of the stitched array — an O(ns × total_traces) full-array
