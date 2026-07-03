@@ -21,9 +21,9 @@ from typing import List, Optional
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QProgressBar, QPushButton, QRadioButton, QScrollArea,
-    QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
+    QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
+    QHBoxLayout, QLabel, QLineEdit, QProgressBar, QPushButton, QRadioButton,
+    QScrollArea, QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from ...core import CRS_CATALOG, CRS_PRESETS, resolve_crs, validate_crs
@@ -94,7 +94,8 @@ class ReprojectorTab(QWidget):
     def _build_selection(self) -> None:
         self._section("_sec_sel")
         panel = QFrame(); panel.setObjectName("panel")
-        v = QVBoxLayout(panel); v.setContentsMargins(8, 6, 8, 6)
+        h = QHBoxLayout(panel); h.setContentsMargins(8, 6, 8, 6); h.setSpacing(24)
+        v = QVBoxLayout(); v.setSpacing(4)
         self.sel_group = QButtonGroup(self)
         self.rb_all = QRadioButton()
         self.rb_active = QRadioButton()
@@ -111,6 +112,17 @@ class ReprojectorTab(QWidget):
             lambda _id, on: self._update_sel_label() if on else None)
         self.lbl_sel = QLabel(); self.lbl_sel.setObjectName("sub")
         v.addWidget(self.lbl_sel)
+        h.addLayout(v)
+        # "Aplicar filtros" — moved up beside the scope pills for visibility:
+        # when checked, the SAME active DSP node chain the user is editing on
+        # the Visualizer tab's pipeline panel is run over the trace amplitudes
+        # before they're written to the reprojected file (see _active_node_cfg
+        # / _run_reprojection). Headers (text/binary/per-trace, coordinates
+        # included) are always cloned exactly regardless of this checkbox —
+        # only the amplitude payload is ever touched.
+        self.chk_filters = QCheckBox()
+        h.addWidget(self.chk_filters, 0, Qt.AlignmentFlag.AlignVCenter)
+        h.addStretch(1)
         self.root.addWidget(panel)
 
     def _crs_block(self, which: str) -> QFrame:
@@ -148,13 +160,19 @@ class ReprojectorTab(QWidget):
         row.addWidget(self._crs_block("src"))
         row.addWidget(self._crs_block("dst"))
         self.root.addLayout(row)
-        self._fill_crs_combo(self.src_preset)
-        self._fill_crs_combo(self.dst_preset)
+        self._fill_crs_combo(self.src_preset, other=True)
+        self._fill_crs_combo(self.dst_preset, other=True)
         # Defaults via the stored EPSG code (BEFORE wiring signals).
         self._select_crs_code(self.src_preset, "EPSG:4326")
         self._select_crs_code(self.dst_preset, "EPSG:32630")
         self.src_entry.setText("EPSG:4326")
         self.dst_entry.setText("EPSG:32630")
+        # Last KNOWN-GOOD index per combo, so cancelling the "Other…" search
+        # dialog can restore the previous selection instead of stranding the
+        # combo on the sentinel row (index 0 is a disabled category separator,
+        # so a hardcoded fallback of 0 would be wrong).
+        self._preset_last_idx = {"src": self.src_preset.currentIndex(),
+                                 "dst": self.dst_preset.currentIndex()}
         self.src_preset.currentIndexChanged.connect(lambda *_: self._on_preset_changed("src"))
         self.dst_preset.currentIndexChanged.connect(lambda *_: self._on_preset_changed("dst"))
         self._verify_src(); self._verify_dst()
@@ -170,10 +188,13 @@ class ReprojectorTab(QWidget):
             "UTM South (WGS 84)":   self.tr("UTM South (WGS 84)"),
         }.get(key, key)
 
-    def _fill_crs_combo(self, combo: QComboBox, prefix=()) -> None:
+    def _fill_crs_combo(self, combo: QComboBox, prefix=(), other: bool = False) -> None:
         """Populate a CRS combo from CRS_CATALOG with BOLD, non-selectable
         category separator rows. ``prefix`` = optional leading selectable
-        (label, data) specials. Each real item stores its EPSG code in UserRole."""
+        (label, data) specials. Each real item stores its EPSG code in UserRole.
+        ``other=True`` appends a trailing "Other…" sentinel (UserRole
+        ``"__OTHER__"``) that opens the full-EPSG-registry search dialog —
+        see _on_preset_changed / _on_preset_other."""
         model = QStandardItemModel(combo)
         for label, data in prefix:
             it = QStandardItem(label)
@@ -188,6 +209,10 @@ class ReprojectorTab(QWidget):
                 it = QStandardItem(label)
                 it.setData(code, Qt.ItemDataRole.UserRole)
                 model.appendRow(it)
+        if other:
+            it = QStandardItem(self.tr("Other…"))
+            it.setData("__OTHER__", Qt.ItemDataRole.UserRole)
+            model.appendRow(it)
         combo.setModel(model)
 
     def _select_crs_code(self, combo: QComboBox, code: str) -> None:
@@ -200,9 +225,48 @@ class ReprojectorTab(QWidget):
         combo = self.src_preset if which == "src" else self.dst_preset
         entry = self.src_entry if which == "src" else self.dst_entry
         code = combo.currentData(Qt.ItemDataRole.UserRole)
+        if code == "__OTHER__":
+            self._on_preset_other(which, combo)
+            return
         if code:
+            self._preset_last_idx[which] = combo.currentIndex()
             entry.setText(code)
             (self._verify_src if which == "src" else self._verify_dst)()
+
+    def _on_preset_other(self, which: str, combo: QComboBox) -> None:
+        """'Other…' chosen in a CRS preset combo: open the full-EPSG-registry
+        search dialog (the SAME CRSAdvancedSearchDialog the per-line CRS
+        selector uses — see components/crs_selector.py). An accepted pick is
+        inserted as a real item just before 'Other…' (so searching again
+        later stays available, mirroring CRSSelectorDialog's convention) and
+        selected — which re-enters _on_preset_changed through the normal
+        path and fills/verifies the EPSG entry. Cancel restores the previous
+        selection instead of stranding the combo on the sentinel.
+
+        Signals are blocked around the row insertion: inserting above the
+        current ("Other…") row shifts the current index, and Qt re-emits
+        currentIndexChanged for that shift while currentData is STILL the
+        sentinel — un-blocked, that re-entered this handler and reopened the
+        dialog forever. The re-entrancy flag is belt-and-braces for the same
+        loop arriving via any other path."""
+        if getattr(self, "_in_preset_other", False):
+            return
+        self._in_preset_other = True
+        try:
+            from ..components.crs_selector import CRSAdvancedSearchDialog
+            dlg = CRSAdvancedSearchDialog(self)
+            if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_crs():
+                chosen = dlg.selected_crs()
+                it = QStandardItem(chosen)
+                it.setData(chosen, Qt.ItemDataRole.UserRole)
+                combo.blockSignals(True)
+                combo.model().insertRow(combo.count() - 1, it)
+                combo.blockSignals(False)
+                combo.setCurrentIndex(combo.count() - 2)   # → normal path
+            else:
+                combo.setCurrentIndex(self._preset_last_idx[which])
+        finally:
+            self._in_preset_other = False
 
     def _build_reproject_row(self) -> None:
         row = QHBoxLayout()
@@ -212,16 +276,8 @@ class ReprojectorTab(QWidget):
         self.unit_cb.addItems(["1", "2", "3"])     # filled in retranslate
         self.unit_cb.setCurrentIndex(1)
         row.addWidget(self.unit_cb)
-        row.addSpacing(12)
-        # "Aplicar filtros": when checked, the SAME active DSP node chain
-        # the user is editing on the Visualizer tab's pipeline panel is run
-        # over the trace amplitudes before they're written to the
-        # reprojected file (see _active_node_cfg / _run_reprojection).
-        # Headers (text/binary/per-trace, coordinates included) are always
-        # cloned exactly regardless of this checkbox — only the amplitude
-        # payload is ever touched.
-        self.chk_filters = QCheckBox()
-        row.addWidget(self.chk_filters)
+        # (the "Aplicar filtros" checkbox lives in the scope-selection panel
+        # above — see _build_selection)
         row.addStretch(1)
         self.btn_reproject = QPushButton()
         self.btn_reproject.clicked.connect(self._run_reprojection)
@@ -515,6 +571,12 @@ class ReprojectorTab(QWidget):
             lbl.setText(self.tr("EPSG or WKT:"))
         for b in (self.src_verify, self.dst_verify):
             b.setText(self.tr("Verify"))
+        # The trailing "Other…" sentinel is a model item, not a widget — its
+        # text must be re-set in place on a language switch.
+        for combo in (self.src_preset, self.dst_preset):
+            for i in range(combo.count()):
+                if combo.itemData(i, Qt.ItemDataRole.UserRole) == "__OTHER__":
+                    combo.setItemText(i, self.tr("Other…"))
         self.lbl_unit.setText(self.tr("Unit interpretation if undetected:"))
         units = (self.tr("1 – Metres/feet"), self.tr("2 – Arc-seconds (TOPAS)"),
                  self.tr("3 – Decimal degrees"))

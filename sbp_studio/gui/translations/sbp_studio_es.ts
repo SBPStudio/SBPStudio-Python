@@ -2111,6 +2111,11 @@ Perímetro: {2}</translation>
         <translation>Geográficos</translation>
     </message>
     <message>
+        <location filename="..\tabs\reprojector_tab.py" line="1" />
+        <source>Other…</source>
+        <translation>Otro…</translation>
+    </message>
+    <message>
         <location filename="..\tabs\reprojector_tab.py" line="158" />
         <source>Polar Stereographic</source>
         <translation>Estereográficas polares</translation>
