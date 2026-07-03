@@ -330,3 +330,110 @@ class TestWysiwygFilteredExport:
              segyio.open(out, ignore_geometry=True) as fo:
             assert int(fo.bin[segyio.BinField.Format]) == \
                    int(fs.bin[segyio.BinField.Format])
+
+
+class TestHeterogeneousChainExport:
+    """Chain export with heterogeneous per-file record lengths (the second
+    half of the field crash fix — model.py's viewer-side padding landed
+    separately). A single SEG-Y has ONE trace length, so the output is sized
+    by the DEEPEST constituent file; shorter segments are bottom-padded with
+    zeros, their per-trace sample-count word updated, and the binary header's
+    Samples word re-patched. Homogeneous chains stay byte-identical."""
+
+    NS_SHORT, NS_DEEP = 96, 256
+
+    def _hetero_chain(self, base_dir):
+        from tests.make_synthetic_segy import make_synthetic_segy
+        from pathlib import Path
+        p1 = str(Path(base_dir) / "hx_1.sgy")
+        p2 = str(Path(base_dir) / "hx_2.sgy")
+        n_traces, lon_step = 40, 0.001
+        end_lon = -8.0 + n_traces * lon_step
+        gap_deg = 0.05 / 111.32
+        make_synthetic_segy(p1, n_traces=n_traces, ns=self.NS_SHORT, dt_us=500,
+                            base_lon=-8.0, doy_start=100, minute_start=0)
+        make_synthetic_segy(p2, n_traces=n_traces, ns=self.NS_DEEP, dt_us=500,
+                            base_lon=end_lon + gap_deg, doy_start=100,
+                            minute_start=n_traces)
+        profiles = [load_profile(p1), load_profile(p2)]
+        chains = detect_chains(profiles, gap_km=1.0)
+        assert len(chains) == 1 and len(chains[0].profiles) == 2
+        return chains[0], p1, p2
+
+    def _assert_padded_output(self, out, p1, p2, n1):
+        """Shared contract: deepest-ns output, byte-faithful payload on top,
+        provably-zero pad below, headers consistent with the written size."""
+        with segyio.open(out, ignore_geometry=True) as f, \
+             segyio.open(p1, ignore_geometry=True) as f1, \
+             segyio.open(p2, ignore_geometry=True) as f2:
+            assert len(f.samples) == self.NS_DEEP
+            assert int(f.bin[segyio.BinField.Samples]) == self.NS_DEEP
+            raw = f.trace.raw[:]
+            # Short segment: source bytes on top, zeros below.
+            np.testing.assert_array_equal(raw[:n1, :self.NS_SHORT],
+                                          f1.trace.raw[:])
+            assert not raw[:n1, self.NS_SHORT:].any()
+            # Deep segment: byte-identical, full height.
+            np.testing.assert_array_equal(raw[n1:], f2.trace.raw[:])
+            # Per-trace sample-count word: PATCHED to the written length for
+            # the padded segment; byte-faithfully UNCHANGED from the source
+            # for the native-height segment (the fixture leaves it 0 there —
+            # the clone must preserve whatever the source had, not invent it).
+            counts = np.asarray(
+                f.attributes(segyio.TraceField.TRACE_SAMPLE_COUNT)[:])
+            src_counts = np.asarray(
+                f2.attributes(segyio.TraceField.TRACE_SAMPLE_COUNT)[:])
+            assert (counts[:n1] == self.NS_DEEP).all()      # patched (padded)
+            np.testing.assert_array_equal(counts[n1:], src_counts)
+
+    def test_reproject_chain_pads_short_segment(self, tmp_path):
+        ch, p1, p2 = self._hetero_chain(tmp_path)
+        n1 = ch.profiles[0].n_traces
+        out = reproject_chain(ch, "EPSG:4326", "EPSG:32630",
+                              out_path=str(tmp_path / "hx_reproy.sgy"))
+        self._assert_padded_output(out, p1, p2, n1)
+
+    def test_join_profiles_pads_short_segment(self, tmp_path):
+        from sbp_studio.core import join_profiles
+        ch, p1, p2 = self._hetero_chain(tmp_path)
+        n1 = ch.profiles[0].n_traces
+        out = join_profiles(ch, out_path=str(tmp_path / "hx_joined.sgy"))
+        self._assert_padded_output(out, p1, p2, n1)
+
+    def test_filtered_hetero_export_and_reimport(self, tmp_path):
+        """Filtered path over a heterogeneous chain: per-file transform, then
+        padding, then IEEE float32 — and the result re-imports through the
+        real loader at the full (deepest) height, matching the viewer."""
+        ch, p1, p2 = self._hetero_chain(tmp_path)
+        n1 = ch.profiles[0].n_traces
+        out = reproject_chain(ch, "EPSG:4326", "EPSG:32630",
+                              amplitude_transform=lambda d: d * 2.0,
+                              out_path=str(tmp_path / "hx_filt.sgy"))
+        with segyio.open(out, ignore_geometry=True) as f:
+            assert int(f.bin[segyio.BinField.Format]) == 5
+            assert len(f.samples) == self.NS_DEEP
+            raw = f.trace.raw[:]
+            assert not raw[:n1, self.NS_SHORT:].any()       # pad survived filter
+        sd2 = load_profile(out)                              # user's re-import
+        assert sd2.error is None
+        assert sd2.ns == self.NS_DEEP
+        assert sd2.data.shape[0] == self.NS_DEEP
+
+    def test_homogeneous_chain_export_unchanged(self, chain_pair, tmp_path):
+        """Equal-ns chains must produce byte-identical trace payloads and an
+        untouched sample-count word — the padding machinery is a strict no-op."""
+        import shutil
+        path1, path2 = chain_pair
+        src1, src2 = str(tmp_path / "h1.sgy"), str(tmp_path / "h2.sgy")
+        shutil.copy(path1, src1); shutil.copy(path2, src2)
+        profiles = [load_profile(src1), load_profile(src2)]
+        ch = detect_chains(profiles, gap_km=1.0)[0]
+        out = reproject_chain(ch, "EPSG:4326", "EPSG:32630",
+                              out_path=str(tmp_path / "h_reproy.sgy"))
+        with segyio.open(out, ignore_geometry=True) as f, \
+             segyio.open(src1, ignore_geometry=True) as f1, \
+             segyio.open(src2, ignore_geometry=True) as f2:
+            n1 = f1.tracecount
+            assert len(f.samples) == len(f1.samples)
+            np.testing.assert_array_equal(f.trace.raw[:n1], f1.trace.raw[:])
+            np.testing.assert_array_equal(f.trace.raw[n1:], f2.trace.raw[:])

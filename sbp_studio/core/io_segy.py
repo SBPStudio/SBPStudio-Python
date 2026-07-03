@@ -1303,6 +1303,12 @@ def reproject_chain(
     full cross-trace continuity WITHIN one file, but not across the join
     seam between two chained files (no different from how the live preview
     only ever sees one profile's own matrix at a time).
+
+    Heterogeneous record lengths: the output trace length is the DEEPEST
+    constituent file's; shorter segments are bottom-padded with zeros and
+    their per-trace sample-count header word updated to match — the same
+    padding the viewer's chain assembly shows (WYSIWYG). Homogeneous chains
+    are byte-identical to before this existed.
     """
     if cancel is None:
         cancel = CancelToken.never()
@@ -1329,8 +1335,19 @@ def reproject_chain(
         # in-memory total after duplicate-timestamp purging.
         n_total = int(sum(getattr(p, "original_n_traces", 0) or p.n_traces
                           for p in ch.profiles))
-        with segyio.open(ch.profiles[0].path, ignore_geometry=True) as src0:
-            spec = segyio.tools.metadata(src0)
+        # Heterogeneous record lengths: a single SEG-Y has ONE trace length, so
+        # the output's is the DEEPEST constituent file's — shorter segments are
+        # bottom-padded with zeros on write, mirroring the viewer's chain
+        # assembly (model.ProfileChain.load_chain_traces: same 0.0 fill, same
+        # WYSIWYG rationale). The spec comes from that deepest file so
+        # spec.samples has the right length; bin/text still come from
+        # profiles[0] (established chain convention), with the Samples word
+        # re-patched below whenever padding is in play.
+        ns_out  = int(max(p.ns for p in ch.profiles))
+        hetero  = any(int(p.ns) != ns_out for p in ch.profiles)
+        deepest = max(ch.profiles, key=lambda p: int(p.ns))
+        with segyio.open(deepest.path, ignore_geometry=True) as src_deep:
+            spec = segyio.tools.metadata(src_deep)
             spec.tracecount = n_total
         if amplitude_transform is not None:
             # WYSIWYG: same rationale as reproject_one — filtered float32
@@ -1342,6 +1359,11 @@ def reproject_chain(
             with segyio.open(ch.profiles[0].path, ignore_geometry=True) as src0:
                 dst.bin    = src0.bin
                 dst.text[0] = src0.text[0]
+            if hetero:
+                # The bin header cloned from profiles[0] carries ITS trace
+                # length — re-patch to the padded output length so readers
+                # decode every trace at the true written size.
+                dst.bin.update({segyio.BinField.Samples: ns_out})
             if amplitude_transform is not None:
                 # Re-patch the Format word cloned from src0 above so the
                 # binary header matches the actual IEEE samples.
@@ -1384,8 +1406,16 @@ def reproject_chain(
                     dst.header[seg_start:seg_end] = src.header[:]
 
                     # Phase 2: bulk overwrite coord + TraceNumber (7-key dicts).
+                    # Padded (shorter-than-ns_out) segments additionally get
+                    # their per-trace sample-count word updated to the padded
+                    # length, so trace headers stay consistent with the data
+                    # actually written; homogeneous chains add nothing (their
+                    # header overwrite stays byte-identical to before).
                     scaled_x = _safe_coords_bulk(nxs, div)
                     scaled_y = _safe_coords_bulk(nys, div)
+                    ns_seg  = len(src.samples)
+                    pad_hdr = ({segyio.TraceField.TRACE_SAMPLE_COUNT: ns_out}
+                              if ns_seg != ns_out else {})
                     dst.header[seg_start:seg_end] = [
                         {
                             segyio.TraceField.SourceX:           int(scaled_x[i]),
@@ -1395,16 +1425,28 @@ def reproject_chain(
                             segyio.TraceField.SourceGroupScalar: out_sc,
                             segyio.TraceField.CoordinateUnits:   new_uc,
                             segyio.TraceField.TraceNumber:       seg_start + i + 1,
+                            **pad_hdr,
                         }
                         for i in range(n_src_i)
                     ]
 
-                    # Phase 3: bulk trace data for this segment.
+                    # Phase 3: bulk trace data for this segment — bottom-pad a
+                    # shorter segment to ns_out with zeros (same neutral fill
+                    # and rationale as the viewer's chain assembly).
                     if processed is None:
-                        dst.trace.raw[seg_start:seg_end] = src.trace.raw[:]
+                        raw = src.trace.raw[:]
+                        if raw.shape[1] != ns_out:
+                            padded = np.zeros((n_src_i, ns_out), dtype=np.float32)
+                            padded[:, :raw.shape[1]] = raw
+                            raw = padded
+                        dst.trace.raw[seg_start:seg_end] = raw
                     else:
-                        dst.trace[seg_start:seg_end] = np.ascontiguousarray(
-                            processed.T, dtype=np.float32)
+                        out_seg = np.ascontiguousarray(processed.T, dtype=np.float32)
+                        if out_seg.shape[1] != ns_out:
+                            padded = np.zeros((n_src_i, ns_out), dtype=np.float32)
+                            padded[:, :out_seg.shape[1]] = out_seg
+                            out_seg = padded
+                        dst.trace[seg_start:seg_end] = out_seg
 
                     global_idx = seg_end
 
@@ -1436,7 +1478,10 @@ def join_profiles(
 
     All trace headers are copied verbatim (SourceX/Y, SourceGroupScalar,
     CoordinateUnits, DelayRecordingTime, etc. all preserved unchanged).
-    Only TraceNumber is updated to the global sequential index (1-based).
+    Only TraceNumber is updated to the global sequential index (1-based) —
+    plus, for a chain with heterogeneous record lengths, the per-trace
+    sample-count word of bottom-padded (shorter) segments, whose traces are
+    zero-padded to the deepest file's length (see reproject_chain).
 
     This is the fast path for join-chain --no-reproject or when src == dst.
     ~3× faster than reproject_chain with an identity transform because it
@@ -1478,14 +1523,25 @@ def join_profiles(
         # (original_n_traces), independent of in-memory duplicate-timestamp purging.
         n_total = int(sum(getattr(p, "original_n_traces", 0) or p.n_traces
                           for p in ch.profiles))
-        with segyio.open(ch.profiles[0].path, ignore_geometry=True) as src0:
-            spec = segyio.tools.metadata(src0)
+        # Heterogeneous record lengths: output trace length = the DEEPEST
+        # file's; shorter segments are bottom-padded with zeros on write —
+        # same strategy and rationale as reproject_chain / the viewer's
+        # chain assembly (model.ProfileChain.load_chain_traces).
+        ns_out  = int(max(p.ns for p in ch.profiles))
+        hetero  = any(int(p.ns) != ns_out for p in ch.profiles)
+        deepest = max(ch.profiles, key=lambda p: int(p.ns))
+        with segyio.open(deepest.path, ignore_geometry=True) as src_deep:
+            spec = segyio.tools.metadata(src_deep)
             spec.tracecount = n_total
 
         with segyio.create(outpath, spec) as dst:
             with segyio.open(ch.profiles[0].path, ignore_geometry=True) as src0:
                 dst.bin    = src0.bin
                 dst.text[0] = src0.text[0]
+            if hetero:
+                # bin cloned from profiles[0] carries ITS trace length —
+                # re-patch to the padded output length (see reproject_chain).
+                dst.bin.update({segyio.BinField.Samples: ns_out})
 
             global_idx = 0
             for p_idx, sd in enumerate(ch.profiles):
@@ -1502,14 +1558,26 @@ def join_profiles(
                     # Phase 1: C-level bulk header clone for this segment.
                     dst.header[seg_start:seg_end] = src.header[:]
 
-                    # Phase 2: overwrite TraceNumber only (1-key dicts).
+                    # Phase 2: overwrite TraceNumber (plus, for a padded
+                    # segment only, the per-trace sample-count word so the
+                    # headers match the data actually written).
+                    ns_seg  = len(src.samples)
+                    pad_hdr = ({segyio.TraceField.TRACE_SAMPLE_COUNT: ns_out}
+                              if ns_seg != ns_out else {})
                     dst.header[seg_start:seg_end] = [
-                        {segyio.TraceField.TraceNumber: seg_start + i + 1}
+                        {segyio.TraceField.TraceNumber: seg_start + i + 1,
+                         **pad_hdr}
                         for i in range(n_src_i)
                     ]
 
-                    # Phase 3: bulk trace data (byte-faithful raw copy).
-                    dst.trace.raw[seg_start:seg_end] = src.trace.raw[:]
+                    # Phase 3: bulk trace data (byte-faithful raw copy; a
+                    # shorter segment is bottom-padded with zeros to ns_out).
+                    raw = src.trace.raw[:]
+                    if raw.shape[1] != ns_out:
+                        padded = np.zeros((n_src_i, ns_out), dtype=np.float32)
+                        padded[:, :raw.shape[1]] = raw
+                        raw = padded
+                    dst.trace.raw[seg_start:seg_end] = raw
 
                     global_idx = seg_end
 
