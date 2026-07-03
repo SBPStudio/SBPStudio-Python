@@ -115,3 +115,74 @@ class TestNavlineWriters:
         assert len(rows) == 20
         assert "trace_idx" in rows[0]
         assert "water_depth_m" in rows[0]
+
+
+class TestFixesToWgs84:
+    """GIS-boundary coordinate conversion for FIX marks (same class of bug as
+    the interpretation-marks fix, tests/test_picking.py::TestPicksToWgs84):
+    compute_fix_positions reads the profile's NATIVE navigation — raw UTM
+    metres for a projected (CoordinateUnits=1) file — while the FIX writers
+    declare WGS84 (.prj / CRS84 / lon,lat CSV headers). fixes_to_wgs84
+    converts exactly when a projected source with a resolved CRS is supplied,
+    and passes through otherwise."""
+
+    TRUE_LON = (-60.51234, -60.49876)
+    TRUE_LAT = (-62.98765, -62.97654)
+    UTM_CRS = "EPSG:32720"
+
+    class _Src:
+        def __init__(self, coord_unit, detected_crs):
+            self.coord_unit = coord_unit
+            self.detected_crs = detected_crs
+
+    def _utm_fixes(self):
+        from sbp_studio.core.spatial import reproject_points
+        ux, uy = reproject_points(np.asarray(self.TRUE_LON),
+                                  np.asarray(self.TRUE_LAT),
+                                  "EPSG:4326", self.UTM_CRS)
+        return [(i + 1, 0.5 * i, f"10:0{i}", float(ux[i]), float(uy[i]))
+                for i in range(len(ux))]
+
+    def test_projected_source_converts_to_wgs84(self):
+        from sbp_studio.core import fixes_to_wgs84
+        out = fixes_to_wgs84(self._utm_fixes(), self._Src(1, self.UTM_CRS))
+        for (num, dist, hora, lon, lat), tl, tt in zip(out, self.TRUE_LON, self.TRUE_LAT):
+            assert abs(lon - tl) < 1e-8 and abs(lat - tt) < 1e-8
+
+    def test_figure_fields_never_touched(self):
+        from sbp_studio.core import fixes_to_wgs84
+        fixes = self._utm_fixes()
+        out = fixes_to_wgs84(fixes, self._Src(1, self.UTM_CRS))
+        assert [f[:3] for f in out] == [f[:3] for f in fixes]
+
+    def test_geographic_source_passes_through(self):
+        from sbp_studio.core import fixes_to_wgs84
+        fixes = [(1, 0.0, "10:00", -8.5, 43.1)]
+        assert fixes_to_wgs84(fixes, self._Src(3, "EPSG:4326")) == fixes
+
+    def test_projected_unresolved_crs_passes_through_raw(self):
+        from sbp_studio.core import fixes_to_wgs84
+        fixes = self._utm_fixes()
+        assert fixes_to_wgs84(fixes, self._Src(1, None)) == fixes
+
+    def test_none_source_and_empty(self):
+        from sbp_studio.core import fixes_to_wgs84
+        fixes = self._utm_fixes()
+        assert fixes_to_wgs84(fixes, None) is fixes
+        assert fixes_to_wgs84([], self._Src(1, self.UTM_CRS)) == []
+
+    def test_end_to_end_shp_readable_at_true_position(self, tmp_path):
+        """Converted fixes -> stdlib .shp writer -> geopandas reads real
+        WGS84 lon/lat, matching the declared .prj — the file lands on the
+        map at the track's position instead of millions of degrees away."""
+        from sbp_studio.core import fixes_to_wgs84
+        out_base = str(tmp_path / "fix_utm")
+        write_fix_points_shp(out_base,
+                             fixes_to_wgs84(self._utm_fixes(),
+                                            self._Src(1, self.UTM_CRS)))
+        gpd = pytest.importorskip("geopandas")
+        gdf = gpd.read_file(out_base + ".shp")
+        assert len(gdf) == 2
+        assert abs(float(gdf.geometry.x.iloc[0]) - self.TRUE_LON[0]) < 1e-8
+        assert abs(float(gdf.geometry.y.iloc[0]) - self.TRUE_LAT[0]) < 1e-8
+        assert gdf.crs is not None and gdf.crs.to_epsg() == 4326

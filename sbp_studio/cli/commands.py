@@ -24,7 +24,7 @@ from ..core import (
     detect_chains, reproject_one, reproject_chain, join_profiles,
     process_profile_data, process_chain_data, time_window,
     compute_spectrum, colormapped_rgba,
-    compute_fix_positions,
+    compute_fix_positions, fixes_to_wgs84,
     write_fix_points_shp, write_fix_points_geojson, write_fix_points_csv,
     write_navline_shp, write_navline_geojson, write_navline_csv,
     patch_segy_headers,
@@ -1337,7 +1337,9 @@ def cmd_fix(args) -> None:
                   file=sys.stderr)
             return
 
-        pts = [(num, dist, hora, lon, lat) for num, dist, hora, lon, lat in fixes]
+        # GIS boundary: projected native metres → the WGS84 every FIX writer
+        # declares (see core.geometry_export.fixes_to_wgs84).
+        pts = fixes_to_wgs84(fixes, source)
 
         if fmt == "shp":
             write_fix_points_shp(out_base, pts)

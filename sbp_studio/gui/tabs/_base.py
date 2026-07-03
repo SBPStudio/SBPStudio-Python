@@ -1047,11 +1047,16 @@ class SubTabbedTab(QWidget):
 
         def job(progress, cancel) -> tuple:
             from sbp_studio.core import (
-                compute_fix_positions, write_fix_points_csv,
+                compute_fix_positions, fixes_to_wgs84, write_fix_points_csv,
                 write_fix_points_geojson, write_fix_points_shp,
             )
             progress(float("nan"), "")
             pts = compute_fix_positions(ts, dist, lons, lats, interval)
+            # GIS boundary: projected native metres → the WGS84 every FIX
+            # writer declares (same fix as the interpretation-marks export —
+            # see core.geometry_export.fixes_to_wgs84). Plain attribute
+            # reads on obj, worker-safe.
+            pts = fixes_to_wgs84(pts, obj)
             low = out.lower()
             if low.endswith((".geojson", ".json")):
                 write_fix_points_geojson(out, pts)

@@ -42,7 +42,7 @@ from .gis_io import (read_gis_layer, read_vector, read_geotiff,
 from .chaining import detect_chains, import_chains_from_directory
 from .coloring import colormapped_rgba
 from .geometry_export import (
-    parse_timestamp, compute_fix_positions,
+    parse_timestamp, compute_fix_positions, fixes_to_wgs84,
     write_fix_points_shp, write_fix_points_geojson, write_fix_points_csv,
     write_navline_shp, write_navline_geojson, write_navline_csv,
     write_picks_shp, write_picks_geojson, write_picks_csv,
@@ -95,7 +95,7 @@ __all__ = [
     # Coloring
     "colormapped_rgba",
     # Geometry export
-    "parse_timestamp", "compute_fix_positions",
+    "parse_timestamp", "compute_fix_positions", "fixes_to_wgs84",
     "write_fix_points_shp", "write_fix_points_geojson", "write_fix_points_csv",
     "write_navline_shp", "write_navline_geojson", "write_navline_csv",
     "write_picks_shp", "write_picks_geojson", "write_picks_csv",

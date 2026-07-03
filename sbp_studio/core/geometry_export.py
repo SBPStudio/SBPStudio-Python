@@ -110,6 +110,36 @@ def compute_fix_positions(
     return fixes
 
 
+def fixes_to_wgs84(fixes: list, source=None) -> list:
+    """Return ``fixes`` (see :func:`compute_fix_positions`) with lon/lat
+    resolved to WGS84 degrees — what ``write_fix_points_shp``/``geojson``
+    declare (.prj / CRS84) and what the CSV's lon/lat column headers claim.
+
+    Same GIS-boundary contract as ``core.picking.picks_to_wgs84`` (the
+    interpretation-marks fix): ``compute_fix_positions`` reads the profile's
+    NATIVE navigation (``obj.lons``/``obj.lats`` — raw UTM eastings/northings
+    in METRES for a projected CoordinateUnits=1 file), so writing them under
+    a WGS84 declaration put every FIX mark thousands of "degrees" outside the
+    map. Conversion runs only when ``source`` is a projected file WITH a
+    resolved CRS (``source.detected_crs``); geographic files, an unresolved
+    CRS, or ``source=None`` (legacy callers, and the render/preview figure
+    overlays, which never use the lon/lat fields) pass through unchanged.
+    The on-figure fields (fix_num, dist_km, HH:MM) are never touched."""
+    if source is None or not fixes:
+        return fixes
+    if getattr(source, "coord_unit", None) != 1:
+        return fixes                     # geographic file — already degrees
+    src_crs = getattr(source, "detected_crs", None)
+    if not src_crs:
+        return fixes                     # projected, CRS unresolved — see docstring
+    from .spatial import to_geographic
+    xs = np.array([f[3] for f in fixes], dtype=float)
+    ys = np.array([f[4] for f in fixes], dtype=float)
+    lon, lat = to_geographic(xs, ys, src_crs)
+    return [(num, dist, hora, float(lo), float(la))
+            for (num, dist, hora, _x, _y), lo, la in zip(fixes, lon, lat)]
+
+
 # ── FIX-point writers (points: list of (fix_num, dist_km, fix_hora, lon, lat)) ─
 
 def write_fix_points_shp(path: str, points: list) -> None:
