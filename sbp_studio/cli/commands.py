@@ -723,6 +723,61 @@ def _expand_segy_inputs(paths: List[str]) -> List[str]:
     return uniq
 
 
+# Per-worker export RAM multiplier over the on-disk file size. A single-file
+# export transiently holds several buffers derived from the trace matrix: the
+# float32 input, the DSP-processed copy, the 4-channel uint8 RGBA raster, the
+# resized canvas image, and Matplotlib's own render buffer. 8× the raw file
+# size is a deliberately generous estimate so plan_workers errs toward FEWER
+# workers on big files (the safe direction on a low-RAM box).
+_BATCH_EXPORT_BYTES_PER_FILE = 8.0
+
+
+def _estimate_batch_worker_bytes(files: list) -> float:
+    """Peak per-worker export footprint, from the LARGEST input file's on-disk
+    size (any worker may draw any file). Uses os.path.getsize — no SEG-Y parse,
+    so budgeting the pool costs no extra header I/O."""
+    biggest = 0
+    for f in files:
+        try:
+            biggest = max(biggest, os.path.getsize(f))
+        except OSError:
+            pass
+    return max(1.0, biggest) * _BATCH_EXPORT_BYTES_PER_FILE
+
+
+def _batch_export_worker(payload: dict) -> tuple:
+    """Top-level, picklable ProcessPoolExecutor target: render ONE file by
+    reconstructing the args Namespace and calling ``cmd_export_image`` — the
+    exact same code path as a single export, so output is byte-identical to the
+    sequential path. Returns ``(out_path, ok: bool, error: str)``. Never raises
+    (a worker exception would otherwise poison the whole pool); a per-file
+    failure is reported back as ``ok=False``.
+
+    This function is GUI-free by construction (it lives in cli.commands, which
+    imports nothing from ``gui``/PyQt6) — so a spawned worker in the frozen exe
+    imports only the headless core+viz render stack, never the Qt UI."""
+    import argparse
+    import contextlib
+    import io
+
+    out_path = payload.get("out", "")
+    args = argparse.Namespace(**payload)
+    try:
+        # N workers writing the single-file progress bar to stderr would garble
+        # it; silence per-file chatter and let the parent print clean
+        # completion lines via as_completed.
+        with contextlib.redirect_stderr(io.StringIO()):
+            cmd_export_image(args)
+        return (out_path, True, "")
+    except SystemExit as exc:                     # cmd_export_image's per-file _err/exit
+        code = exc.code
+        if code in (0, None):
+            return (out_path, True, "")
+        return (out_path, False, f"export failed (exit {code})")
+    except BaseException as exc:                  # noqa: BLE001 — never poison the pool
+        return (out_path, False, f"{type(exc).__name__}: {exc}")
+
+
 def cmd_batch_export(args) -> None:
     """
     batch-export DIR_OR_FILES… --out DIR [--format pdf] [--cmap …] [--ve …] …
@@ -731,7 +786,17 @@ def cmd_batch_export(args) -> None:
     SEG-Y files and renders each one into --out using the SAME vectorised
     max-abs-pooling renderer (custom colormaps, fixed VE, RAM safety, vector
     interpolation). One file's failure is reported but does not abort the batch.
+
+    Parallelism: each file's export is independent (own load → DSP → render →
+    encode) and Matplotlib rendering is GIL-bound, so this is the one batch
+    path where true multiprocessing pays off. ``plan_workers`` sizes the pool
+    from the per-file RAM footprint AND the live free RAM: a workstation runs
+    several files at once; a low-RAM laptop resolves to 1 worker and takes the
+    byte-identical sequential path (zero-regression floor). See
+    ``core._backends.plan_workers``.
     """
+    from ..core._backends import plan_workers
+
     files = _expand_segy_inputs(args.inputs)
     if not files:
         _err("No SEG-Y files found in the given path(s).")
@@ -740,30 +805,67 @@ def cmd_batch_export(args) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     fmt = args.format or "pdf"
 
+    # Per-file payloads: a plain-dict copy of args (picklable — parsed CLI
+    # values are only str/num/bool/None/list), one output path each.
+    payloads = []
+    for f in files:
+        d = dict(vars(args))
+        d["files"] = [f]
+        d["out"]   = str(out_dir / f"{Path(f).stem}.{fmt}")
+        d["chain"] = False
+        payloads.append(d)
+
+    n_workers = plan_workers(_estimate_batch_worker_bytes(files))
+    parallel  = n_workers >= 2 and len(payloads) >= 2
+
     print(f"\nBatch export: {len(files)} file(s) → {out_dir}  "
-          f"[format={fmt}, cmap={args.cmap or 'Viridis'}]", file=sys.stderr)
+          f"[format={fmt}, cmap={args.cmap or 'Viridis'}, "
+          f"{'workers=' + str(n_workers) if parallel else 'sequential'}]",
+          file=sys.stderr)
 
     ok = fail = 0
-    for idx, f in enumerate(files, 1):
-        stem = Path(f).stem
-        out_path = out_dir / f"{stem}.{fmt}"
-        print(f"\n[{idx}/{len(files)}] {Path(f).name}", file=sys.stderr)
 
-        # Drive the existing single-file engine: one file, explicit output path.
-        args.files = [f]
-        args.out   = str(out_path)
-        args.chain = False
-        try:
-            cmd_export_image(args)
-            ok += 1
-        except SystemExit as exc:               # per-file _err()/exit → keep going
-            if exc.code not in (0, None):
-                print(f"  SKIP {Path(f).name}: export failed (exit {exc.code})",
-                      file=sys.stderr)
+    if parallel:
+        import concurrent.futures as _cf
+        # Each worker loads its own file from disk, so I/O overlaps compute
+        # across the pool automatically — no separate prefetch needed here.
+        with _cf.ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futs = {pool.submit(_batch_export_worker, p): p["out"] for p in payloads}
+            try:
+                for done, fut in enumerate(_cf.as_completed(futs), 1):
+                    out_path, good, err = fut.result()
+                    if good:
+                        ok += 1
+                        print(f"[{done}/{len(files)}] ✔ {Path(out_path).name}",
+                              file=sys.stderr)
+                    else:
+                        fail += 1
+                        print(f"[{done}/{len(files)}] ✘ {Path(out_path).name}: {err}",
+                              file=sys.stderr)
+            except KeyboardInterrupt:
+                print("\nInterrupted — cancelling remaining exports…", file=sys.stderr)
+                pool.shutdown(cancel_futures=True)
+                raise
+    else:
+        # Sequential fallback (1 worker budgeted, or a single file) — the exact
+        # pre-existing in-process path, byte-for-byte unchanged.
+        for idx, p in enumerate(payloads, 1):
+            f = p["files"][0]
+            print(f"\n[{idx}/{len(files)}] {Path(f).name}", file=sys.stderr)
+            args.files = [f]
+            args.out   = p["out"]
+            args.chain = False
+            try:
+                cmd_export_image(args)
+                ok += 1
+            except SystemExit as exc:
+                if exc.code not in (0, None):
+                    print(f"  SKIP {Path(f).name}: export failed (exit {exc.code})",
+                          file=sys.stderr)
+                    fail += 1
+            except Exception as exc:
+                print(f"  SKIP {Path(f).name}: {exc}", file=sys.stderr)
                 fail += 1
-        except Exception as exc:
-            print(f"  SKIP {Path(f).name}: {exc}", file=sys.stderr)
-            fail += 1
 
     print(f"\nBatch complete: {ok} ok, {fail} failed → {out_dir}", file=sys.stderr)
     if fail and not ok:

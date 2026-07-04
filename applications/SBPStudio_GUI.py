@@ -20,4 +20,12 @@ if str(_REPO_ROOT) not in sys.path:
 from sbp_studio.gui.app import main  # noqa: E402
 
 if __name__ == "__main__":
+    # PyInstaller frozen-exe worker guard — MUST run before main(). When a
+    # ProcessPoolExecutor (e.g. the parallel batch export) spawns a worker on
+    # Windows, the child re-executes THIS .exe; freeze_support() detects the
+    # multiprocessing bootstrap and runs the worker target instead of falling
+    # through to main() — the difference between a worker rendering a file and
+    # an infinite cascade of GUI windows. No-op in an unfrozen dev checkout.
+    import multiprocessing
+    multiprocessing.freeze_support()
     sys.exit(main())

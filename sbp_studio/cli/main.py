@@ -492,4 +492,9 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
+    # Frozen-exe worker guard (see applications/SBPStudio_GUI.py) — must precede
+    # any real work so a spawned ProcessPoolExecutor worker runs its target and
+    # exits instead of re-parsing argv and recursing. No-op unfrozen.
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

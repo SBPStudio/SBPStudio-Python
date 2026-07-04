@@ -41,4 +41,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    # Frozen-exe worker guard (see applications/SBPStudio_GUI.py) — also here
+    # because ``python -m sbp_studio.gui`` routes through this __main__.
+    import multiprocessing
+    multiprocessing.freeze_support()
     sys.exit(main())
