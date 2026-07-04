@@ -79,12 +79,11 @@ class _NdarraySource:
 
 
 def _available_ram_bytes() -> float:
-    """Best-effort free-RAM probe — see cli.commands._available_ram_bytes."""
-    try:
-        import psutil
-        return float(psutil.virtual_memory().available)
-    except Exception:
-        return 4.0 * 1024 ** 3
+    """Live free-RAM probe — delegates to the shared capacity-planning
+    authority (core._backends.available_ram_bytes), same psutil-else-4GB
+    semantics this module always had."""
+    from ...core._backends import available_ram_bytes
+    return available_ram_bytes()
 
 
 def fits_in_memory(ns: int, n_traces: int,

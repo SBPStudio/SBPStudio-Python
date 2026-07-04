@@ -23,6 +23,8 @@ Public API
 gpu_available()          -> bool
 worker_count()           -> int
 fftw_available()         -> bool
+available_ram_bytes()    -> float  (LIVE free-RAM probe, psutil-backed)
+plan_workers(bytes)      -> int    (CPU+RAM capacity planner — see below)
 accel_info()             -> dict   (for CLI 'accel' subcommand)
 XP                       : cupy or numpy
 GPU, FFTW, N_WORKERS     : module-level constants
@@ -89,6 +91,86 @@ FFTW, _FFTW_MSG = _setup_fftw()
 # ── CPU workers ───────────────────────────────────────────────────────────────
 
 N_WORKERS: int = max(1, (os.cpu_count() or 2) - 1)
+
+
+# ── Capacity planner — the single shared CPU + RAM budgeting authority ────────
+#
+# Every parallel feature (column-block DSP pools, batch export workers, load
+# prefetching, …) must derive its worker count from plan_workers() instead of
+# hand-rolling its own heuristic. The contract that makes "scale up on a
+# workstation, never choke a field laptop" hold everywhere at once:
+#
+#   workers = max(1, min(cpu_limit, hard_cap, ram_budget // bytes_per_worker))
+#
+# The floor of 1 IS the zero-regression guarantee: on constrained hardware the
+# degraded case is not a slower new code path — it is exactly today's
+# sequential behaviour.
+
+# Fraction of CURRENTLY-available RAM one parallel task may claim. Deliberately
+# 0.5: leaves the other half for the OS, already-resident trace matrices, and
+# whatever else the user is running. Callers with historically tighter budgets
+# (e.g. export_filter's 0.30 for a single full-matrix DSP pass) pass their own.
+RAM_BUDGET_FRACTION: float = 0.5
+
+# Ceiling on any single pool regardless of core count — same rationale as
+# processing._MAX_POOL_WORKERS: keeps worst-case oversubscription sane when
+# several pooled features overlap (e.g. a batch export inside a busy session)
+# while still using most of a high-core workstation.
+HARD_WORKER_CAP: int = 12
+
+
+def available_ram_bytes() -> float:
+    """Best-effort probe of the RAM available RIGHT NOW (bytes).
+
+    psutil when present (accurate, cross-OS); a conservative 4 GB estimate
+    otherwise, so every budget derived from this stays protective rather
+    than optimistic on an unmeasurable box. Probed LIVE on every call — free
+    RAM an hour into a session is nothing like it was at import time, so
+    callers must NOT cache this."""
+    try:
+        import psutil
+        return float(psutil.virtual_memory().available)
+    except Exception:
+        return 4.0 * 1024 ** 3
+
+
+def _effective_cores() -> int:
+    """Core count the OS actually lets this process use — respects a user- or
+    admin-restricted CPU affinity mask when psutil can read it, so a deliberately
+    confined process never oversubscribes its allowance. Falls back to the
+    plain logical core count."""
+    try:
+        import psutil
+        aff = psutil.Process().cpu_affinity()
+        if aff:
+            return len(aff)
+    except Exception:
+        pass
+    return os.cpu_count() or 2
+
+
+def plan_workers(bytes_per_worker: float, *,
+                 hard_cap: int = HARD_WORKER_CAP,
+                 ram_fraction: float = RAM_BUDGET_FRACTION) -> int:
+    """Worker count for a parallel task whose EACH worker holds about
+    ``bytes_per_worker`` of peak memory (estimate it from headers/shape
+    BEFORE loading anything: e.g. ns × n_traces × 4 bytes × working-copies).
+
+    Returns ``max(1, min(cpu_limit, hard_cap, ram_budget // bytes_per_worker))``
+    where ``cpu_limit`` is cores−1 (affinity-aware, live) and ``ram_budget``
+    is ``ram_fraction`` of the RAM available AT CALL TIME. Always ≥ 1 — a
+    task that fits sequentially today still runs sequentially on the same
+    hardware tomorrow (never a new failure mode, possibly just no speedup).
+
+    ``bytes_per_worker <= 0`` means "no meaningful per-worker footprint"
+    (pure-CPU work): the result is CPU/cap-limited only."""
+    cpu_limit = max(1, min(N_WORKERS, _effective_cores() - 1))
+    n = min(cpu_limit, max(1, int(hard_cap)))
+    if bytes_per_worker > 0:
+        budget  = available_ram_bytes() * ram_fraction
+        by_ram  = int(budget // float(bytes_per_worker))
+        n = min(n, by_ram)
+    return max(1, n)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

@@ -75,16 +75,11 @@ _RAM_SAFE_FRACTION = 0.55
 
 
 def _available_ram_bytes() -> float:
-    """Best-effort free-RAM probe. Uses psutil when present (accurate, cross-OS),
-    else falls back to a conservative fixed estimate so the guard still engages on
-    machines without psutil."""
-    try:
-        import psutil
-        return float(psutil.virtual_memory().available)
-    except Exception:
-        # Conservative: assume ~4 GB free if we cannot measure (keeps the guard
-        # protective rather than optimistic on an unknown box).
-        return 4.0 * 1024 ** 3
+    """Live free-RAM probe — delegates to the shared capacity-planning
+    authority (core._backends.available_ram_bytes), same psutil-else-4GB
+    semantics this module always had."""
+    from ..core._backends import available_ram_bytes
+    return available_ram_bytes()
 
 
 def _safe_pixel_budget(mem_budget_gb: Optional[float]) -> tuple:
