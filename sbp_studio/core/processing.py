@@ -33,6 +33,7 @@ Known limitations
 from __future__ import annotations
 
 import concurrent.futures as _cf
+import threading as _threading
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -1642,6 +1643,45 @@ def apply_spectral_whitening(
 
 # ── F-K (frequency–wavenumber) dip filter ───────────────────────────────────────
 
+# Single-entry F-K mask cache — see apply_fk_filter. Lock because the filter
+# can run concurrently from the preview worker and an export job; the cached
+# mask itself is only ever READ after insertion (spec *= mask), never mutated.
+_FK_MASK_CACHE: Dict[tuple, np.ndarray] = {}
+_FK_MASK_LOCK = _threading.Lock()
+
+
+def _build_fk_mask(ns: int, nt: int, dt_us: int, dip_ms: float,
+                   width_ms: float, mode: str) -> np.ndarray:
+    """Build the (ns, nt) float32 F-K fan mask — the exact math previously
+    inline in apply_fk_filter, extracted unchanged so it can be cached."""
+    from scipy.ndimage import gaussian_filter
+
+    dt_ms = (dt_us or 1) / 1000.0
+    # float32 throughout the mask build: at the 4096² cap a float64 (f, k, p,
+    # mask) intermediate would double the memory of the complex64 spectrum
+    # itself for no precision benefit (the mask is a soft 0..1 gate, not a
+    # value that accumulates error).
+    f = np.fft.fftfreq(ns).astype(np.float32)[:, None]   # cycles/sample (ns, 1)
+    k = np.fft.fftfreq(nt).astype(np.float32)[None, :]   # cycles/trace  (1, nt)
+    p_c = dip_ms / dt_ms                                  # centre dip, samples/trace
+    p_w = max(abs(width_ms), 1e-6) / dt_ms               # half-width, samples/trace
+    p_lo, p_hi = p_c - p_w, p_c + p_w
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p = -k / f                                       # (ns, nt); ±inf on the f=0 row
+    fan = (p >= p_lo) & (p <= p_hi)
+    if mode == "reject_both":
+        fan = fan | ((p >= -p_hi) & (p <= -p_lo))
+
+    if mode == "pass":
+        keep = fan.copy()
+        keep[0, :] = True       # always keep the f=0 (time-DC) row …
+        keep[:, 0] = True       # … and the k=0 (zero-dip) column → preserve flat events
+        mask = keep.astype(np.float32)
+    else:
+        mask = (~fan).astype(np.float32)
+    return gaussian_filter(mask, sigma=1.5, mode="wrap")  # soften the cut (anti-ring)
+
+
 def apply_fk_filter(data: np.ndarray, dt_us: int, dip_ms: float,
                     width_ms: float, mode: str = "reject_both") -> np.ndarray:
     """2-D frequency–wavenumber (F-K) dip filter — rejects (or isolates) a fan
@@ -1675,37 +1715,40 @@ def apply_fk_filter(data: np.ndarray, dt_us: int, dip_ms: float,
     if ns < 4 or nt < 4:
         return data.copy()
     from scipy.fft import fft2, ifft2
-    from scipy.ndimage import gaussian_filter
 
-    dt_ms = (dt_us or 1) / 1000.0
-    # float32 throughout the mask build: at the 4096² cap a float64 (f, k, p,
-    # mask) intermediate would double the memory of the complex64 spectrum
-    # itself for no precision benefit (the mask is a soft 0..1 gate, not a
-    # value that accumulates error).
-    f = np.fft.fftfreq(ns).astype(np.float32)[:, None]   # cycles/sample (ns, 1)
-    k = np.fft.fftfreq(nt).astype(np.float32)[None, :]   # cycles/trace  (1, nt)
-    p_c = dip_ms / dt_ms                                  # centre dip, samples/trace
-    p_w = max(abs(width_ms), 1e-6) / dt_ms               # half-width, samples/trace
-    p_lo, p_hi = p_c - p_w, p_c + p_w
-    with np.errstate(divide="ignore", invalid="ignore"):
-        p = -k / f                                       # (ns, nt); ±inf on the f=0 row
-    fan = (p >= p_lo) & (p <= p_hi)
-    if mode == "reject_both":
-        fan = fan | ((p >= -p_hi) & (p <= -p_lo))
+    # The mask is a pure function of (shape, dt, dip, width, mode) — and,
+    # profiled at the 4096×2048 preview scale, BUILDING it (the fan
+    # comparisons + the wrap-mode gaussian smooth) costs MORE than both FFTs
+    # combined (~280 ms vs ~220 ms). A single-entry cache makes every
+    # same-parameters refresh (pan at fixed zoom, another node's slider,
+    # A/B toggles) skip that entirely — bit-identical output, bounded RAM
+    # (ONE float32 mask, ≤ 64 MB at the 4096² cap, replaced on any change).
+    key = (ns, nt, int(dt_us or 1), float(dip_ms), float(width_ms), str(mode))
+    with _FK_MASK_LOCK:
+        mask = _FK_MASK_CACHE.get(key)
+    if mask is None:
+        mask = _build_fk_mask(ns, nt, dt_us, dip_ms, width_ms, mode)
+        with _FK_MASK_LOCK:
+            _FK_MASK_CACHE.clear()            # single entry — bounded RAM
+            _FK_MASK_CACHE[key] = mask
 
-    if mode == "pass":
-        keep = fan.copy()
-        keep[0, :] = True       # always keep the f=0 (time-DC) row …
-        keep[:, 0] = True       # … and the k=0 (zero-dip) column → preserve flat events
-        mask = keep.astype(np.float32)
-    else:
-        mask = (~fan).astype(np.float32)
-    mask = gaussian_filter(mask, sigma=1.5, mode="wrap")  # soften the cut (anti-ring)
-
-    spec = fft2(data.astype(np.float32))                  # complex64 (scipy preserves dtype)
-    spec *= mask                                          # in-place: no extra complex64 buffer
-    del mask
-    out = ifft2(spec).real
+    # Multithreaded single-shot FFTs (audit roadmap #3): unlike every other
+    # node, this 2-D transform CANNOT be split into _parallel_apply column
+    # blocks (the wavenumber axis needs the whole matrix), so without
+    # ``workers=`` it ran on ONE core — and it is the heaviest node in the
+    # live preview. scipy.fft's ``workers`` multithreads the transform
+    # internally with ZERO extra allocation (same buffers, more threads in
+    # one C call). plan_workers(0) = the CPU/cap-limited count from the
+    # shared capacity planner; bytes_per_worker=0 because threading a
+    # transform adds no per-worker memory. NOTE: the decon/Hilbert FFTs must
+    # NOT get workers — they already run inside _parallel_apply block
+    # threads, where scipy.fft is deliberately pinned to 1 thread each
+    # (N workers × M fft-threads would oversubscribe; see _hilbert_parallel).
+    from ._backends import plan_workers
+    _fft_workers = plan_workers(0)
+    spec = fft2(data.astype(np.float32), workers=_fft_workers)  # complex64
+    spec *= mask       # in-place; mask is read-only here (it stays cached)
+    out = ifft2(spec, workers=_fft_workers).real
     del spec                                              # release before the final copy below
     return np.ascontiguousarray(out, dtype=np.float32)
 

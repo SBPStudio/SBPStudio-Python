@@ -286,3 +286,56 @@ class TestTimeWindow:
         sd = load_profile(delay_segy)
         _  , __, t0, ___ = time_window(sd, sd.ns, align=True)
         assert t0 == sd.min_delay
+
+
+class TestFkMaskCache:
+    """apply_fk_filter's single-entry mask cache (perf roadmap #3): the mask
+    is a pure function of (shape, dt, dip, width, mode) and — profiled at
+    preview scale — costs more to build than both FFTs combined. Caching it
+    must be output-invisible: warm calls bit-identical, any parameter change
+    a rebuild."""
+
+    def _data(self, ns=256, nt=128):
+        rng = np.random.RandomState(7)
+        return rng.standard_normal((ns, nt)).astype(np.float32)
+
+    def test_warm_call_bit_identical_to_cold(self):
+        import sbp_studio.core.processing as P
+        d = self._data()
+        P._FK_MASK_CACHE.clear()
+        cold = P.apply_fk_filter(d, 50, 5.0, 2.0)
+        assert len(P._FK_MASK_CACHE) == 1
+        warm = P.apply_fk_filter(d, 50, 5.0, 2.0)
+        np.testing.assert_array_equal(cold, warm)
+
+    def test_param_change_replaces_entry_and_changes_output(self):
+        import sbp_studio.core.processing as P
+        d = self._data()
+        P._FK_MASK_CACHE.clear()
+        a = P.apply_fk_filter(d, 50, 5.0, 2.0)
+        b = P.apply_fk_filter(d, 50, 9.0, 2.0)      # different dip
+        assert len(P._FK_MASK_CACHE) == 1           # single entry, replaced
+        assert not np.array_equal(a, b)
+
+    def test_mode_and_shape_are_part_of_the_key(self):
+        import sbp_studio.core.processing as P
+        d = self._data()
+        P._FK_MASK_CACHE.clear()
+        P.apply_fk_filter(d, 50, 5.0, 2.0, mode="reject_both")
+        (key1,) = P._FK_MASK_CACHE.keys()
+        P.apply_fk_filter(d, 50, 5.0, 2.0, mode="pass")
+        (key2,) = P._FK_MASK_CACHE.keys()
+        assert key1 != key2
+        P.apply_fk_filter(self._data(ns=128, nt=64), 50, 5.0, 2.0, mode="pass")
+        (key3,) = P._FK_MASK_CACHE.keys()
+        assert key3 != key2
+
+    def test_cached_mask_not_mutated_by_apply(self):
+        """spec *= mask must never write into the cached array — three warm
+        calls in a row must keep producing the same result."""
+        import sbp_studio.core.processing as P
+        d = self._data()
+        P._FK_MASK_CACHE.clear()
+        ref = P.apply_fk_filter(d, 50, 5.0, 2.0)
+        for _ in range(3):
+            np.testing.assert_array_equal(P.apply_fk_filter(d, 50, 5.0, 2.0), ref)
