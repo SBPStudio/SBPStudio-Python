@@ -3080,6 +3080,10 @@ class TestColorPumpingFix:
         class _FakeView(QObject):
             view_range_changed = pyqtSignal()
             ab_split_changed = pyqtSignal(float)
+            # Surgical Mute: PreviewController.__init__ connects this view
+            # signal unconditionally — the double must expose it (same list
+            # payload as SeismicView.mute_horizon_edited).
+            mute_horizon_edited = pyqtSignal(list)
 
             def __init__(self):
                 super().__init__()
@@ -3096,6 +3100,16 @@ class TestColorPumpingFix:
             def set_raster_visible(self, *_a, **_k): pass
             def set_wiggle_line_visible(self, *_a, **_k): pass
             def set_overlays(self, **_k): pass
+            # Surgical Mute members the controller calls unconditionally.
+            def hide_mute_horizon(self): pass
+            def show_mute_horizon(self, *_a, **_k): pass
+            def update_wiggle(self, *_a, **_k): pass
+
+            @property
+            def plot(self):
+                from types import SimpleNamespace
+                return SimpleNamespace(
+                    getViewBox=lambda: SimpleNamespace(height=lambda: 600))
 
             def show_preview(self, arr, dist0, dist1, t0, t1, *, vmax,
                              vmin=0.0, fit=False, c0=None, c1=None):
@@ -3116,6 +3130,7 @@ class TestColorPumpingFix:
                 self.nodes: list = []
 
             def active_nodes(self): return self.nodes
+            def selected_node(self): return None   # Surgical Mute selection probe
 
         view = _FakeView()
         panel = _FakePanel()
@@ -3127,11 +3142,16 @@ class TestColorPumpingFix:
 
     def _run_to_completion(self, app, pc) -> None:
         """Pump the Qt event loop until the in-flight worker's queued
-        succeeded/failed signal has been delivered and processed."""
+        succeeded/failed signal has been delivered and processed. The tiny
+        sleep per iteration gives the WORKER THREAD real wall-clock time to
+        run — a sleepless processEvents loop spins through all its
+        iterations in milliseconds, faster than any thread can finish."""
+        import time
         for _ in range(2000):
             if pc._worker is None:
                 return
             app.processEvents()
+            time.sleep(0.002)
         raise AssertionError("preview worker never completed")
 
     def test_vmax_unchanged_across_quiet_and_loud_viewport_windows(self):
@@ -4562,6 +4582,10 @@ class TestBasePrepWorker:
         class _FakeView(QObject):
             view_range_changed = pyqtSignal()
             ab_split_changed = pyqtSignal(float)
+            # Surgical Mute: PreviewController.__init__ connects this view
+            # signal unconditionally — the double must expose it (same list
+            # payload as SeismicView.mute_horizon_edited).
+            mute_horizon_edited = pyqtSignal(list)
 
             def __init__(self):
                 super().__init__()
@@ -4577,6 +4601,16 @@ class TestBasePrepWorker:
             def set_raster_visible(self, *_a, **_k): pass
             def set_wiggle_line_visible(self, *_a, **_k): pass
             def set_overlays(self, **_k): pass
+            # Surgical Mute members the controller calls unconditionally.
+            def hide_mute_horizon(self): pass
+            def show_mute_horizon(self, *_a, **_k): pass
+            def update_wiggle(self, *_a, **_k): pass
+
+            @property
+            def plot(self):
+                from types import SimpleNamespace
+                return SimpleNamespace(
+                    getViewBox=lambda: SimpleNamespace(height=lambda: 600))
             def set_levels_only(self, *_a, **_k): pass
 
             def show_preview(self, *_a, **_k):
@@ -4594,6 +4628,7 @@ class TestBasePrepWorker:
                 self.nodes: list = []
 
             def active_nodes(self): return self.nodes
+            def selected_node(self): return None   # Surgical Mute selection probe
 
         view = _FakeView()
         panel = _FakePanel()
@@ -4604,11 +4639,15 @@ class TestBasePrepWorker:
         return pc, view, panel
 
     def _run_to_completion(self, app, pc, timeout=2000):
-        """Pump the Qt event loop until both workers are done."""
+        """Pump the Qt event loop until both workers are done. The sleep
+        per iteration gives the worker THREADS wall-clock time to actually
+        run (see TestColorPumpingFix._run_to_completion)."""
+        import time
         for _ in range(timeout):
             if (pc._base_worker is None and pc._worker is None):
                 return
             app.processEvents()
+            time.sleep(0.002)
         raise AssertionError("workers never completed")
 
     def test_cache_hit_path_never_dispatches_base_worker(self):
