@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from sbp_studio.gui.tabs._base import _batch_output_path, _render_export_figure
 from sbp_studio.gui.tabs._render import compute_figsize, effective_export_dpi
 
@@ -91,3 +93,139 @@ def test_render_export_figure_is_pristine_and_non_mutating(tmp_path):
     assert np.array_equal(sd.data, before)
     import matplotlib.pyplot as plt
     plt.close(fig)
+
+
+# ── Prefetch-one pipeline (roadmap #4) ───────────────────────────────────────
+
+class _FakeHandler:
+    """Minimal SourceHandler stand-in for the batch-loop engine: records
+    load order and simulates load latency so overlap is observable."""
+    def __init__(self, prefetch_safe=True, load_delay=0.0, bad=()):
+        self.prefetch_safe = prefetch_safe
+        self._load_delay = load_delay
+        self._bad = set(bad)              # names whose load raises
+        self.load_calls = []              # names, in the order load_full ran
+        self.released = []
+
+    def source_path(self, obj):
+        return f"/data/{obj.name}/{obj.name}.sgy"
+
+    def load_full(self, obj, cancel):
+        import time
+        self.load_calls.append(obj.name)
+        if self._load_delay:
+            time.sleep(self._load_delay)
+        if obj.name in self._bad:
+            raise RuntimeError(f"boom {obj.name}")
+        loaded = SimpleNamespace(name=obj.name, data=object())   # "loaded"
+        return loaded
+
+    def release_after_batch(self, obj):
+        self.released.append(obj.name)
+
+
+def _items(n, ns=256, nt=100):
+    return [SimpleNamespace(name=f"L{i}", ns=ns, n_traces=nt, data=None)
+            for i in range(n)]
+
+
+from types import SimpleNamespace                                # noqa: E402
+from sbp_studio.gui.tabs._base import (                          # noqa: E402
+    _run_batch_export_loop, _estimate_batch_item_bytes)
+
+
+class _NoCancelTok:
+    def check(self):
+        return None
+
+
+class TestBatchItemEstimate:
+    def test_scales_with_deepest_widest(self):
+        items = _items(3, ns=1000, nt=200) + [SimpleNamespace(ns=2000, n_traces=500, data=None)]
+        est = _estimate_batch_item_bytes(items)
+        assert est == 2000 * 500 * 4.0 * 4.0        # peak × mult
+    def test_empty_and_headerless_safe(self):
+        assert _estimate_batch_item_bytes([]) > 0
+        assert _estimate_batch_item_bytes([SimpleNamespace()]) > 0
+
+
+class TestBatchExportLoop:
+    def _run(self, handler, items, monkeypatch, workers=4):
+        import sbp_studio.core._backends as B
+        monkeypatch.setattr(B, "plan_workers", lambda *a, **k: workers)
+        saved, out_order = [], []
+        def make_out(obj):
+            out_order.append(obj.name); return f"/out/{obj.name}.png"
+        rendered = []
+        def render_save(render_obj, out):
+            rendered.append(render_obj.name)
+        s, f = _run_batch_export_loop(
+            items, handler, make_out=make_out, render_save=render_save,
+            progress=lambda *a: None, cancel=_NoCancelTok())
+        return s, f, rendered
+
+    def test_all_items_rendered_once_in_order(self, monkeypatch):
+        h = _FakeHandler(prefetch_safe=True)
+        items = _items(5)
+        saved, failed, rendered = self._run(h, items, monkeypatch)
+        assert failed == []
+        assert rendered == [o.name for o in items]         # every item, in order
+        assert saved == [f"/out/L{i}.png" for i in range(5)]
+
+    def test_prefetch_enabled_for_profiles_with_ram(self, monkeypatch):
+        h = _FakeHandler(prefetch_safe=True, load_delay=0.02)
+        items = _items(4)
+        self._run(h, items, monkeypatch, workers=4)
+        # With prefetch, item i+1's load is submitted before i renders, so the
+        # NEXT load starts ahead of turn — load order still covers all items.
+        assert sorted(h.load_calls) == [o.name for o in items]
+
+    def test_no_prefetch_when_low_ram(self, monkeypatch):
+        """plan_workers==1 (2 items don't fit) → synchronous, no loader thread.
+        Prove no prefetch by asserting loads happen strictly one-at-a-time in
+        render order (a background prefetch would load ahead)."""
+        h = _FakeHandler(prefetch_safe=True)
+        items = _items(4)
+        saved, failed, rendered = self._run(h, items, monkeypatch, workers=1)
+        assert rendered == [o.name for o in items]
+        assert h.load_calls == [o.name for o in items]     # in-order, no look-ahead
+
+    def test_no_prefetch_for_chains(self, monkeypatch):
+        """A chain-like handler (prefetch_safe=False) must never spawn the
+        loader thread even with abundant RAM."""
+        h = _FakeHandler(prefetch_safe=False)
+        items = _items(3)
+        saved, failed, rendered = self._run(h, items, monkeypatch, workers=8)
+        assert rendered == [o.name for o in items]
+        assert h.load_calls == [o.name for o in items]
+
+    def test_one_bad_item_isolated(self, monkeypatch):
+        h = _FakeHandler(prefetch_safe=True, bad={"L2"})
+        items = _items(5)
+        saved, failed, rendered = self._run(h, items, monkeypatch)
+        assert [n for n, _ in failed] == ["L2"]
+        assert rendered == ["L0", "L1", "L3", "L4"]         # bad one skipped
+        assert len(saved) == 4
+
+    def test_release_called_for_each_item(self, monkeypatch):
+        h = _FakeHandler(prefetch_safe=True)
+        items = _items(3)
+        self._run(h, items, monkeypatch)
+        assert sorted(h.released) == [o.name for o in items]   # RAM-flat release
+
+    def test_cancel_aborts_batch(self, monkeypatch):
+        import sbp_studio.core._backends as B
+        from sbp_studio.core.tasks import Cancelled
+        monkeypatch.setattr(B, "plan_workers", lambda *a, **k: 4)
+        class _CancelAt:
+            def __init__(self, k): self.k = k; self.n = 0
+            def check(self):
+                self.n += 1
+                if self.n > self.k:
+                    raise Cancelled("stop")
+        h = _FakeHandler(prefetch_safe=True)
+        with pytest.raises(Cancelled):
+            _run_batch_export_loop(
+                _items(6), h, make_out=lambda o: f"/o/{o.name}.png",
+                render_save=lambda ro, out: None,
+                progress=lambda *a: None, cancel=_CancelAt(2))

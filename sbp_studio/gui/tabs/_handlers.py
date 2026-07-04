@@ -104,9 +104,20 @@ class SourceHandler(ABC):
         (profiles render from a transient copy that is simply GC'd)."""
         return None
 
+    # Whether ``load_full`` may be run on a BACKGROUND THREAD for the batch
+    # prefetch-one pipeline (roadmap #4). True only when load_full returns a
+    # FRESH, self-contained object without mutating any shared state — the
+    # profile case. A chain loads its stitched matrix IN PLACE (mutating the
+    # shared object the main thread also reads), so it must stay synchronous.
+    prefetch_safe: bool = False
+
 
 class ProfileHandler(SourceHandler):
     """Strategy for an individual :class:`SegyProfile`."""
+
+    # load_full returns a fresh loaded profile (never mutates the stub) — safe
+    # to run on the batch prefetch thread. See SourceHandler.prefetch_safe.
+    prefetch_safe = True
 
     def active_object(self):
         return self._state.active_profile

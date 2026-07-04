@@ -129,6 +129,98 @@ def _batch_output_path(src_path: str, fmt: str, used: set,
     return out
 
 
+# Per-item batch-export RAM estimate multiplier over the raw trace matrix: the
+# float32 input + the DSP-processed copy + transient node working buffers. 4× is
+# a conservative peak used only to decide whether TWO items (current render +
+# one prefetched) fit — the prefetch is skipped otherwise (see export_batch).
+_BATCH_ITEM_BYTES_MULT = 4.0
+
+
+def _estimate_batch_item_bytes(items: list) -> float:
+    """Peak per-item resident footprint across ``items``, from the DEEPEST ×
+    WIDEST header geometry (any item could be the one resident). Header-only —
+    reads ns/n_traces already on the stubs, no trace load."""
+    peak = 0.0
+    for o in items:
+        ns = int(getattr(o, "ns", 0) or 0)
+        nt = int(getattr(o, "n_traces", 0) or 0)
+        peak = max(peak, ns * nt * 4.0)
+    return max(1.0, peak) * _BATCH_ITEM_BYTES_MULT
+
+
+def _run_batch_export_loop(items, handler, *, make_out, render_save,
+                           progress, cancel):
+    """GUI-free batch export engine with the prefetch-one pipeline (roadmap #4).
+
+    Drives every item through: resolve output path (``make_out(obj)``) → ensure
+    its trace matrix is loaded → ``render_save(render_obj, out)`` → release. One
+    bad item is recorded and skipped; a ``Cancelled`` aborts the whole batch.
+    Returns ``(saved: list[str], failed: list[(name, error)])``.
+
+    Prefetch-one: while item i renders (GIL-bound), a single background thread
+    pre-loads item i+1 (segyio releases the GIL during I/O, so the load truly
+    overlaps). Enabled ONLY when ``handler.prefetch_safe`` (profiles — load_full
+    returns a fresh object; chains mutate in place and stay synchronous) AND the
+    RAM budget fits TWO items at once (``plan_workers(per_item) >= 2``). On a
+    low-RAM box it degrades to exactly the synchronous path — at most one extra
+    item is ever resident (single loader thread).
+
+    Extracted from the Qt method so this orchestration (gating, ordering,
+    failure isolation, release, RAM-flatness) is unit-testable with fakes.
+    ``make_out`` / ``render_save`` are injected callables; the Qt method binds
+    them to the real ``_batch_output_path`` + ``_render_export_figure`` path.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from sbp_studio.core.tasks import Cancelled
+    from sbp_studio.core._backends import plan_workers
+
+    n = len(items)
+    saved: list = []
+    failed: list = []
+
+    per_item = _estimate_batch_item_bytes(items)
+    do_prefetch = (getattr(handler, "prefetch_safe", False)
+                  and plan_workers(per_item) >= 2)
+    pool = ThreadPoolExecutor(max_workers=1) if do_prefetch else None
+    pending: dict = {}      # index → Future(loaded_obj)
+
+    def _submit(idx: int) -> None:
+        if pool is not None and 0 <= idx < n:
+            pending[idx] = pool.submit(handler.load_full, items[idx], cancel)
+
+    try:
+        _submit(0)
+        for i, obj in enumerate(items):
+            cancel.check()
+            name = getattr(obj, "label", None) or getattr(obj, "name", "item")
+            progress(i / n, name)
+            out = make_out(obj)
+            was_loaded = getattr(obj, "data", None) is not None
+            # Kick the NEXT load off BEFORE this item's long render so disk I/O
+            # overlaps the render.
+            _submit(i + 1)
+            try:
+                fut = pending.pop(i, None)
+                render_obj = (fut.result() if fut is not None
+                              else handler.load_full(obj, cancel))
+                render_save(render_obj, out)
+                saved.append(str(out))
+            except Cancelled:
+                raise                                    # abort the whole batch
+            except Exception as exc:                     # one bad item ≠ kill batch
+                failed.append((name, str(exc)))
+            finally:
+                # RAM-flat: release the JIT-loaded matrix (chains revert in
+                # place; profiles GC the transient copy) only when WE loaded it.
+                if not was_loaded:
+                    handler.release_after_batch(obj)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+    progress(1.0, "")
+    return saved, failed
+
+
 def _process_full_array(obj, params, node_cfg, align_enabled, cancel):
     """Run static delay-alignment + the dynamic DSP nodes on the FULL native
     matrix. Returns ``(processed, t0_ms)`` where ``t0_ms`` is the time of the
@@ -970,51 +1062,38 @@ class SubTabbedTab(QWidget):
             return
 
         def job(progress, cancel) -> tuple:
-            from sbp_studio.core.tasks import Cancelled
             from sbp_studio.viz.render import save_figure
 
-            n = len(valid)
-            saved: list = []
-            failed: list = []
             used: set = set()
-            for i, obj in enumerate(valid):
-                cancel.check()
-                name = getattr(obj, "label", None) or getattr(obj, "name", "item")
-                progress(i / n, QCoreApplication.translate(
-                    "SubTabbedTab", "Exporting {0}…").format(name))
 
-                # Folder-named output (in out_dir when set, else the source dir),
-                # de-duped so two items never silently overwrite each other.
+            def make_out(obj):
+                # Folder-named output (in out_dir when set, else the source
+                # dir), de-duped so two items never silently overwrite.
                 out = _batch_output_path(handler.source_path(obj), fmt, used, out_dir)
                 used.add(str(out))
+                return out
 
-                was_loaded = getattr(obj, "data", None) is not None
+            def render_save(render_obj, out):
                 fig = None
                 try:
-                    # JIT lazy-load via the handler (idempotent; returns the object
-                    # carrying .data — a fresh copy for profiles, in-place for
-                    # chains). A failed load raises → caught below as a failed item.
-                    render_obj = handler.load_full(obj, cancel)
                     fig, render_dpi = _render_export_figure(
                         render_obj, cfg, params, node_cfg, scale_cfg,
                         align_enabled, handler, cancel)
                     save_figure(fig, str(out), dpi=render_dpi, fmt=fmt,
                                 pdf_page=cfg["pdf_page"])
-                    saved.append(str(out))
-                except Cancelled:
-                    raise                                    # abort the whole batch
-                except Exception as exc:                     # one bad item ≠ kill batch
-                    failed.append((name, str(exc)))
                 finally:
                     if fig is not None:
-                        fig.clear()  # releases imshow raster; Figure() is unmanaged by pyplot
-                    # Release JIT-loaded heavy data → batch stays RAM-flat. The
-                    # handler knows how (chains revert in place; profiles GC the
-                    # transient copy). Only when WE loaded it this iteration.
-                    if not was_loaded:
-                        handler.release_after_batch(obj)
-            progress(1.0, "")
-            return saved, failed
+                        fig.clear()  # releases imshow raster; Figure() unmanaged by pyplot
+
+            def _report(frac, name):
+                progress(frac, QCoreApplication.translate(
+                    "SubTabbedTab", "Exporting {0}…").format(name) if name else "")
+
+            # Prefetch-one pipeline + RAM-flat release live in the shared,
+            # unit-tested engine (see _run_batch_export_loop).
+            return _run_batch_export_loop(
+                valid, handler, make_out=make_out, render_save=render_save,
+                progress=_report, cancel=cancel)
 
         self.tasks.run_task(
             job, self._on_batch_exported,
