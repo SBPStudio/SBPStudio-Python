@@ -222,24 +222,12 @@ def _run_batch_export_loop(items, handler, *, make_out, render_save,
 
 
 def _process_full_array(obj, params, node_cfg, align_enabled, cancel):
-    """Run static delay-alignment + the dynamic DSP nodes on the FULL native
-    matrix. Returns ``(processed, t0_ms)`` where ``t0_ms`` is the time of the
-    processed array's row 0 (min_delay when aligned, else delay_ms)."""
-    from sbp_studio.core import apply_delay_alignment
-    from sbp_studio.gui.dsp import DSPContext, make_node
-    data = obj.data.copy()
-    t0 = float(getattr(obj, "delay_ms", 0.0) or 0.0)
-    if align_enabled and getattr(obj, "delays", None) is not None:
-        data = apply_delay_alignment(
-            data, obj.delays, obj.min_delay, obj.dt_us,
-            fill_value=params["fill_value"])
-        t0 = float(getattr(obj, "min_delay", 0.0) or 0.0)
-    ctx = DSPContext.from_source(obj)
-    for key, npar in node_cfg:
-        cancel.check()
-        data = make_node(key, npar).apply(data, ctx)
-    cancel.check()
-    return data, t0
+    """Delegates to the extracted Qt-free engine — see
+    ``gui.export_headless.process_full_array`` (moved verbatim so the single
+    export, the sequential batch and the process-pool batch all run literally
+    the same code)."""
+    from sbp_studio.gui.export_headless import process_full_array
+    return process_full_array(obj, params, node_cfg, align_enabled, cancel)
 
 
 def _crop_for_viewport(obj, proc, t0_full, x_range, y_range):
@@ -287,97 +275,16 @@ def _crop_for_viewport(obj, proc, t0_full, x_range, y_range):
 
 def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
                           handler, cancel, picks=None):
-    """Shared per-item export render — used by BOTH the single export and every
-    batch item so their quality can never drift.
-
-    Runs the FULL-resolution DSP pipeline (static delay-alignment + dynamic nodes)
-    on ``obj.data`` (the 100 % native matrix — never the live view's decimated
-    ``_arr``), then renders to a Matplotlib Figure at a DPI floored by
-    ``effective_export_dpi`` so the embedded raster is never decimated, then
-    applies the WYSIWYG aspect fit. Returns ``(fig, render_dpi)``; the caller
-    saves and closes the figure.
-
-    ``picks`` — interpretation markers to burn into the raster at full export
-    resolution (see ExportDialog's "Overlay interpretation markers" checkbox);
-    ``None``/empty draws nothing (the default — batch exports never pass it).
-    """
-    from sbp_studio.viz.render import build_theme
-    from sbp_studio.gui.tabs._render import PAPER_SIZES
-    # Full-resolution DSP pipeline (alignment + nodes) — shared with the viewport
-    # HQ export so the crop is processed identically.
-    data, _t0_full = _process_full_array(
-        obj, params, node_cfg, align_enabled, cancel)
-    # figsize: paper size (fixed landscape inches) when the user selected one,
-    # otherwise the view-scale-derived figsize (aspect / VE / hybrid mode).
-    # Paper size exports skip the post-render WYSIWYG aspect loop since the
-    # page dimensions are fixed by the chosen standard size.
-    paper_key = cfg.get("paper_size", "")
-    if paper_key in PAPER_SIZES:
-        figsize = PAPER_SIZES[paper_key]
-    else:
-        figsize = figsize_for_scale(obj, scale_cfg, int(cfg["dpi"]), cfg["velocity"])
-    render_dpi = effective_export_dpi(figsize, data.shape, int(cfg["dpi"]))
-    # RAM cap (parity with the CLI): never let the raster exceed the memory
-    # budget. effective_export_dpi can raise the DPI toward 2400 to hit the native
-    # grid; for a long/deep line that is gigapixels → the GUI export hangs. Cap the
-    # DPI to what the budget allows. figsize (the aspect/VE proportions) is kept
-    # exact — only pixel density drops, exactly like the CLI's coupled down-scale.
-    dpi_cap = dpi_for_budget(figsize, cfg.get("mem_budget_gb"))
-    if dpi_cap is not None and render_dpi > dpi_cap:
-        render_dpi = max(50, dpi_cap)
-    eff_aspect = figsize[0] / figsize[1] if figsize[1] > 0 else None
-    render_opts = dict(
-        x_tick_km=cfg["x_tick"], t_tick_ms=cfg["t_tick"], show_grid=cfg["grid"],
-        title_override=None, clip_lo=0.0, time_tick_min=cfg["time_ticks"],
-        margin_top_ms=cfg["margin_top"], margin_bottom_ms=cfg["margin_bottom"],
-        time_fmt=cfg["time_fmt"], time_font_size=cfg["time_font_size"],
-        time_align=cfg["time_align"], fix_font_size=5.0,
-        fix_bbox_alpha=cfg["fix_bbox_alpha"], fix_color=cfg["fix_color"],
-        axis_font_size=cfg.get("axis_font_size", 7.0),
-        grid_alpha=cfg.get("grid_alpha", 0.18), grid_lw=cfg.get("grid_lw", 0.5),
-        colors=build_theme(theme=cfg["theme"]),
-        # Layered render style from the live controls (display_params / scale_cfg),
-        # so the export honours Density vs Wiggle + raster underlay regardless of
-        # whether wiggles are currently on screen. These bind to render_figure's
-        # explicit show_raster / style / layout_mode kwargs (not **kwargs).
-        show_raster=bool(params.get("show_raster", True)),
-        style=params.get("style", "density"),
-        layout_mode=scale_cfg.get("layout_mode", "aspect"),
-        # Variable-area fill / wiggle-line visibility, mirrored from the live
-        # PyQtGraph view's checkboxes (display_params) so exports never silently
-        # diverge from what's on screen.
-        va_fill=bool(params.get("va_fill", True)),
-        show_wiggle_line=bool(params.get("show_wiggle_line", True)),
-        # Reflector-safe downscale: when the export must shrink below native
-        # (RAM-capped DPI), pool by max-|amplitude| instead of bilinear so thin
-        # high-amplitude reflectors are preserved. Default on.
-        max_abs_pool=bool(cfg.get("max_abs_pool", True)),
-        picks=picks)
-    fig = handler.render_figure(obj, data, params, figsize=figsize, dpi=render_dpi,
-                                **render_opts)
-    # WYSIWYG aspect fit: grow the figure so the DATA box hits the mode's effective
-    # aspect at full size (decorations take a fixed inch margin) — restores pixels.
-    # Skipped when a paper size is set: the page dimensions are fixed by the chosen
-    # standard size; the two-pass RGBA sizing inside render_*_figure already ensures
-    # the raster fills the exact axes box without a secondary Matplotlib resample.
-    aspect = None if paper_key in PAPER_SIZES else eff_aspect
-    if aspect:
-        seis = next((a for a in fig.axes if a.get_images()), None)
-        if seis is not None:
-            for _ in range(4):
-                fig.canvas.draw()
-                pos = seis.get_position()
-                fw, fh = fig.get_size_inches()
-                if pos.width <= 0 or pos.height <= 0:
-                    break
-                data_w = pos.width * fw
-                margin_v = fh - pos.height * fh   # absolute non-data height
-                fig.set_size_inches(fw, data_w / aspect + margin_v)
-                try:
-                    fig.tight_layout(pad=1.2)
-                except Exception:
-                    pass
-    return fig, render_dpi
+    """Delegates to the extracted Qt-free engine — see
+    ``gui.export_headless.render_export_figure`` (the former body of this
+    function, moved VERBATIM: same DSP pass, same RAM-capped DPI, same WYSIWYG
+    aspect-fit loop). The live SourceHandler maps to a plain ``kind`` string
+    ("profile" | "chain" — see SourceHandler.render_kind); everything else is
+    passed through unchanged, so single/batch/pool exports cannot drift."""
+    from sbp_studio.gui.export_headless import render_export_figure
+    kind = getattr(handler, "render_kind", "profile")
+    return render_export_figure(obj, cfg, params, node_cfg, scale_cfg,
+                                align_enabled, kind, cancel, picks=picks)
 
 
 class SubTabbedTab(QWidget):

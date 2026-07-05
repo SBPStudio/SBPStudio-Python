@@ -111,6 +111,18 @@ class SourceHandler(ABC):
     # shared object the main thread also reads), so it must stay synchronous.
     prefetch_safe: bool = False
 
+    # Which headless renderer this kind dispatches to — the plain, picklable
+    # stand-in for the strategy object itself (see
+    # gui.export_headless.render_export_figure's ``kind`` parameter).
+    render_kind: str = "profile"
+
+    # Whether batch items of this kind may be exported in WORKER PROCESSES
+    # (gui.export_headless.render_batch_item): True only when one item is
+    # fully reconstructable from a single file path — the profile case. A
+    # chain assembles multi-file in-place state the worker can't rebuild
+    # cheaply, so it stays on the in-process (prefetch/sequential) path.
+    parallel_export_safe: bool = False
+
 
 class ProfileHandler(SourceHandler):
     """Strategy for an individual :class:`SegyProfile`."""
@@ -118,6 +130,10 @@ class ProfileHandler(SourceHandler):
     # load_full returns a fresh loaded profile (never mutates the stub) — safe
     # to run on the batch prefetch thread. See SourceHandler.prefetch_safe.
     prefetch_safe = True
+    render_kind = "profile"
+    # One profile == one file path → a worker process can rebuild the item
+    # from scratch. See SourceHandler.parallel_export_safe.
+    parallel_export_safe = True
 
     def active_object(self):
         return self._state.active_profile
@@ -182,6 +198,8 @@ class ProfileHandler(SourceHandler):
 
 class ChainHandler(SourceHandler):
     """Strategy for a merged :class:`ProfileChain`."""
+
+    render_kind = "chain"
 
     def active_object(self):
         return self._state.active_chain
