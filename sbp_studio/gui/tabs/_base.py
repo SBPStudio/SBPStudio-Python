@@ -996,8 +996,39 @@ class SubTabbedTab(QWidget):
                 progress(frac, QCoreApplication.translate(
                     "SubTabbedTab", "Exporting {0}…").format(name) if name else "")
 
-            # Prefetch-one pipeline + RAM-flat release live in the shared,
-            # unit-tested engine (see _run_batch_export_loop).
+            # ── Process-pool branch (roadmap #1, GUI side) ────────────────────
+            # Profiles only (parallel_export_safe: one item == one file path a
+            # worker can rebuild from scratch), ≥2 items, and only when the
+            # RAM budget affords ≥2 workers EACH holding a full item — a
+            # worker keeps both the trace matrix and the render raster
+            # resident, hence 2× the in-process per-item estimate. Every
+            # worker runs the exact same render_export_figure the sequential
+            # path delegates to (gui.export_headless — Qt-free by contract),
+            # so pool output is pixel-identical. On a low-RAM machine
+            # plan_workers resolves to 1 → the prefetch/sequential path below,
+            # i.e. prior behaviour unchanged.
+            if getattr(handler, "parallel_export_safe", False) and len(valid) >= 2:
+                from sbp_studio.core._backends import plan_workers
+                from sbp_studio.gui.export_headless import (
+                    divide_mem_budget, run_batch_export_pool)
+                n_workers = plan_workers(_estimate_batch_item_bytes(valid) * 2.0)
+                if n_workers >= 2:
+                    per_worker_cfg = divide_mem_budget(cfg, n_workers)
+                    payloads = [dict(
+                        path=handler.source_path(obj),
+                        out=str(make_out(obj)),
+                        name=(getattr(obj, "label", None)
+                              or getattr(obj, "name", "item")),
+                        fmt=fmt, pdf_page=cfg["pdf_page"],
+                        cfg=per_worker_cfg, params=params, node_cfg=node_cfg,
+                        scale_cfg=scale_cfg, align_enabled=align_enabled,
+                    ) for obj in valid]
+                    return run_batch_export_pool(
+                        payloads, n_workers, progress=_report, cancel=cancel)
+
+            # In-process fallback (chains, a single item, or a 1-worker RAM
+            # budget): the prefetch-one pipeline + RAM-flat release in the
+            # shared, unit-tested engine (see _run_batch_export_loop).
             return _run_batch_export_loop(
                 valid, handler, make_out=make_out, render_save=render_save,
                 progress=_report, cancel=cancel)
