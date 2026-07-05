@@ -178,6 +178,52 @@ def smooth_track(lons: np.ndarray, lats: np.ndarray,
             median_filter(lats, size=k, mode="nearest"))
 
 
+def _repair_gps_dropouts(lons: np.ndarray, lats: np.ndarray) -> tuple:
+    """Replace GPS-dropout navigation fixes with values linearly interpolated
+    from the neighbouring GOOD fixes. Returns ``(lons, lats, n_repaired)``.
+
+    A dropout fix is a coordinate pair that is non-finite OR exactly (0, 0) —
+    the established no-navigation signature in this codebase (see
+    ``picking.resolve_pick_coords``): no real recorded fix is ever exactly
+    (0, 0) in ANY unit system this app meets (not degrees — equator×prime-
+    meridian open ocean; not arc-seconds; not UTM metres — (0,0) easting/
+    northing lies far outside every zone's used envelope).
+
+    Why interpolation (and why here): a marine GPS outage writes zero
+    coordinates for seconds-to-minutes — tens to hundreds of consecutive
+    traces, far beyond what ``smooth_track``'s median kernel (11 → rejects
+    runs ≤ 5) can absorb. Un-repaired, those zeros are VALID WGS84 values, so
+    they sail through ``safe_map_coords``' range check and the display track
+    literally dives from the survey to Null Island and back: erratic map
+    lines, a bounding box stretched across half the planet (the real survey
+    shrinks to an unreadable dot), and thousands of phantom kilometres
+    injected into the along-track distance axis (corrupting the seismic
+    X-axis and the map↔profile sync). Bridging the outage with a straight
+    line between the surrounding good fixes is the closest defensible
+    estimate of the vessel's actual path and keeps every per-trace array
+    aligned. Leading/trailing dropout runs hold the first/last good fix
+    (``np.interp`` end behaviour).
+
+    Display/geometry ONLY: callers must keep the RAW recorded ``lons/lats``
+    untouched for FIX/navline/pick exports (the authoritative navigation,
+    where (0,0) conventions are handled per-consumer). An ALL-dropout file
+    (no navigation at all) is returned unchanged — there is nothing to
+    interpolate from, and downstream already treats it as no-nav."""
+    lons = np.asarray(lons, dtype=float)
+    lats = np.asarray(lats, dtype=float)
+    bad = (~np.isfinite(lons)) | (~np.isfinite(lats)) | \
+          ((lons == 0.0) & (lats == 0.0))
+    if not bad.any() or bad.all():
+        return lons, lats, 0
+    idx = np.arange(lons.size, dtype=float)
+    good = ~bad
+    out_lon = lons.copy()
+    out_lat = lats.copy()
+    out_lon[bad] = np.interp(idx[bad], idx[good], lons[good])
+    out_lat[bad] = np.interp(idx[bad], idx[good], lats[good])
+    return out_lon, out_lat, int(bad.sum())
+
+
 def _timestamp_dedup_mask(doy, hod, moh, som, sx, sy,
                           scalar: int = 0) -> Optional[np.ndarray]:
     """Return a boolean keep-mask (length n_traces) that drops consecutive traces
@@ -372,12 +418,14 @@ def _dist_km(lons: np.ndarray, lats: np.ndarray, coord_unit: int,
     flat-Earth cosine approximation (#12). Projected path: Euclidean, scaled by
     *meters_per_unit* (1.0 for metres, 0.3048 for feet — #13).
     """
+    # Degenerate inputs first — BOTH branches need ≥2 fixes (and nanmedian on
+    # an empty array warns), so guard before the geographic heuristic runs.
+    if lons.size < 2:
+        return np.zeros(lons.size)
     _is_geo = coord_unit in (2, 3) or (
         -180 <= float(np.nanmedian(lons)) <= 180 and
         -90  <= float(np.nanmedian(lats)) <= 90)
     if _is_geo:
-        if lons.size < 2:
-            return np.zeros(lons.size)
         # _WGS84.inv returns (fwd_az, back_az, dist_m); vectorised over all gaps.
         _, _, dist_m = _WGS84.inv(lons[:-1], lats[:-1], lons[1:], lats[1:])
         d = np.abs(dist_m) / 1000.0
@@ -591,11 +639,22 @@ def _populate_profile_from_file(prof: SegyProfile, f: "segyio.SegyFile",
         prof.lons = sxs
         prof.lats = sys_
 
-    # Cleaned DISPLAY track: median-filtered in trace order to reject GPS
-    # spikes/outliers. The raw prof.lons/prof.lats above are PRESERVED for FIX
-    # and geometry exports (authoritative recorded navigation); the smoothed
-    # pair drives the navigation map and the along-track distance axis only.
-    prof.track_lons, prof.track_lats = smooth_track(prof.lons, prof.lats)
+    # Cleaned DISPLAY track, built in two stages. Stage 1: repair GPS-dropout
+    # fixes — non-finite or exactly-(0,0) coordinates, the no-navigation
+    # signature — by interpolating across them from the neighbouring good
+    # fixes (see _repair_gps_dropouts: un-repaired zeros are valid WGS84, so
+    # they'd survive every downstream range check and drag the map track to
+    # Null Island while poisoning the distance axis). Stage 2: median-filter
+    # to reject short spikes/outliers. The raw prof.lons/prof.lats above are
+    # PRESERVED for FIX and geometry exports (authoritative recorded
+    # navigation); the repaired+smoothed pair drives the navigation map and
+    # the along-track distance axis only.
+    _lon_fix, _lat_fix, _n_gps_bad = _repair_gps_dropouts(prof.lons, prof.lats)
+    if _n_gps_bad:
+        _LOG.warning("%s: %d GPS dropout fix(es) — (0,0)/non-finite coordinates "
+                     "— interpolated for the display track (raw navigation "
+                     "kept untouched for exports).", prof.name, _n_gps_bad)
+    prof.track_lons, prof.track_lats = smooth_track(_lon_fix, _lat_fix)
 
     es   = prof.scalar_elev
     efac = _scalar_fac(es)

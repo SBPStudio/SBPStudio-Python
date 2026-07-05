@@ -217,3 +217,148 @@ class TestRealSampleFiles:
                                prof.coord_unit, prof.detected_crs)
         assert float(x[0]) == pytest.approx(3.7675, abs=0.01)
         assert float(y[0]) == pytest.approx(42.712, abs=0.01)
+
+
+# ── GPS dropout repair (the 'track dives to Null Island' map bug) ──────────────
+
+class TestRepairGpsDropouts:
+    """_repair_gps_dropouts — unit coverage of the interpolation repair."""
+
+    def _mk(self, n=20, lon0=-8.0, lat0=43.0, step=0.001):
+        lons = lon0 + np.arange(n) * step
+        lats = np.full(n, lat0)
+        return lons, lats
+
+    def test_clean_track_returned_unchanged(self):
+        from sbp_studio.core.io_segy import _repair_gps_dropouts
+        lons, lats = self._mk()
+        lo, la, n_bad = _repair_gps_dropouts(lons, lats)
+        assert n_bad == 0
+        np.testing.assert_array_equal(lo, lons)
+        np.testing.assert_array_equal(la, lats)
+
+    def test_mid_run_dropout_bridged_linearly(self):
+        """A 6-trace (0,0) run — longer than the median kernel can absorb —
+        must be bridged by a straight line between the surrounding fixes."""
+        from sbp_studio.core.io_segy import _repair_gps_dropouts
+        lons, lats = self._mk()
+        lons[8:14] = 0.0
+        lats[8:14] = 0.0
+        lo, la, n_bad = _repair_gps_dropouts(lons, lats)
+        assert n_bad == 6
+        assert not ((lo == 0.0) & (la == 0.0)).any()
+        # Bridge is linear over trace index → matches the original uniform line.
+        clean_lons, clean_lats = self._mk()
+        np.testing.assert_allclose(lo, clean_lons, atol=1e-12)
+        np.testing.assert_allclose(la, clean_lats, atol=1e-12)
+
+    def test_leading_and_trailing_runs_hold_first_last_good_fix(self):
+        from sbp_studio.core.io_segy import _repair_gps_dropouts
+        lons, lats = self._mk()
+        lons[:3] = 0.0; lats[:3] = 0.0
+        lons[-2:] = 0.0; lats[-2:] = 0.0
+        lo, la, n_bad = _repair_gps_dropouts(lons, lats)
+        assert n_bad == 5
+        assert (lo[:3] == lo[3]).all() and (la[:3] == la[3]).all()
+        assert (lo[-2:] == lo[-3]).all() and (la[-2:] == la[-3]).all()
+
+    def test_non_finite_fixes_also_repaired(self):
+        from sbp_studio.core.io_segy import _repair_gps_dropouts
+        lons, lats = self._mk()
+        lons[5] = np.nan
+        lats[10] = np.inf
+        lo, la, n_bad = _repair_gps_dropouts(lons, lats)
+        assert n_bad == 2
+        assert np.isfinite(lo).all() and np.isfinite(la).all()
+
+    def test_all_dropout_file_returned_unchanged(self):
+        """No good fixes at all (a no-navigation file): nothing to interpolate
+        from — must come back untouched, not crash or invent positions."""
+        from sbp_studio.core.io_segy import _repair_gps_dropouts
+        lons = np.zeros(10); lats = np.zeros(10)
+        lo, la, n_bad = _repair_gps_dropouts(lons, lats)
+        assert n_bad == 0
+        assert (lo == 0).all() and (la == 0).all()
+
+    def test_zero_lon_with_real_lat_is_not_a_dropout(self):
+        """Only the exact PAIR (0,0) is the no-nav signature — a track that
+        legitimately crosses the prime meridian (lon = 0, lat real) must not
+        be touched."""
+        from sbp_studio.core.io_segy import _repair_gps_dropouts
+        lons = np.array([-0.002, -0.001, 0.0, 0.001, 0.002])
+        lats = np.full(5, 51.0)
+        lo, la, n_bad = _repair_gps_dropouts(lons, lats)
+        assert n_bad == 0
+        np.testing.assert_array_equal(lo, lons)
+
+
+class TestLoaderGpsDropoutEndToEnd:
+    """Full loader path on a real synthetic file with a patched GPS outage —
+    the reported field symptom (erratic lines / wild bounding box / phantom
+    distance) must be gone, while raw navigation stays export-faithful."""
+
+    def _outage_file(self, tmp_path, n_traces=60, bad=slice(20, 35)):
+        import segyio
+        import shutil
+        from tests.make_synthetic_segy import make_synthetic_segy
+        clean = str(tmp_path / "clean.sgy")
+        make_synthetic_segy(clean, n_traces=n_traces, ns=64)
+        outage = str(tmp_path / "outage.sgy")
+        shutil.copy(clean, outage)
+        with segyio.open(outage, "r+", ignore_geometry=True) as f:
+            for i in range(*bad.indices(n_traces)):
+                f.header[i] = {segyio.TraceField.SourceX: 0,
+                               segyio.TraceField.SourceY: 0}
+        return clean, outage
+
+    def test_track_never_visits_null_island(self, tmp_path):
+        clean, outage = self._outage_file(tmp_path)
+        sd = load_profile(outage, load_traces=False)
+        assert sd.error is None
+        # The display track must stay inside the survey envelope (±0.01°),
+        # never dive toward (0,0).
+        ref = load_profile(clean, load_traces=False)
+        assert np.abs(sd.track_lons - ref.track_lons).max() < 0.01
+        assert np.abs(sd.track_lats - ref.track_lats).max() < 0.01
+        assert not ((sd.track_lons == 0) & (sd.track_lats == 0)).any()
+
+    def test_distance_axis_free_of_phantom_kilometres(self, tmp_path):
+        """Un-repaired, a dive from ~(-8°,43°) to (0,0) and back injects
+        thousands of km into dist_km; repaired, the outage file's total must
+        match the clean file's to within metres."""
+        clean, outage = self._outage_file(tmp_path)
+        ref = load_profile(clean, load_traces=False)
+        sd = load_profile(outage, load_traces=False)
+        assert sd.total_km == pytest.approx(ref.total_km, abs=0.01)
+        # dist_km stays monotonically non-decreasing (axis contract).
+        assert (np.diff(sd.dist_km) >= 0).all()
+
+    def test_raw_navigation_keeps_the_zeros_for_exports(self, tmp_path):
+        """Export fidelity: the RAW lons/lats (FIX/navline/pick sources) must
+        still carry the recorded zeros — the repair is display-only."""
+        _clean, outage = self._outage_file(tmp_path)
+        sd = load_profile(outage, load_traces=False)
+        assert ((sd.lons == 0) & (sd.lats == 0)).sum() >= 10
+
+    def test_repaired_track_passes_safe_map_coords_fully_finite(self, tmp_path):
+        """What actually reaches the map widget: every repaired track point
+        must be valid WGS84 (no NaN holes, no out-of-range)."""
+        _clean, outage = self._outage_file(tmp_path)
+        sd = load_profile(outage, load_traces=False)
+        lo, la = safe_map_coords(sd.track_lons, sd.track_lats,
+                                 sd.coord_unit, sd.detected_crs)
+        assert np.isfinite(lo).all() and np.isfinite(la).all()
+        assert (np.abs(lo) <= 180).all() and (np.abs(la) <= 90).all()
+
+    def test_isolated_corrupt_spike_still_absorbed_by_median(self, tmp_path):
+        """Regression pin for the pre-existing spike defence: one corrupted
+        header (huge jump) is rejected by the median smooth as before."""
+        import segyio
+        _clean, outage = self._outage_file(tmp_path, bad=slice(0, 0))  # no outage
+        with segyio.open(outage, "r+", ignore_geometry=True) as f:
+            f.header[30] = {segyio.TraceField.SourceX: 2_000_000_000,
+                            segyio.TraceField.SourceY: 2_000_000_000}
+        sd = load_profile(outage, load_traces=False)
+        ref = load_profile(_clean, load_traces=False)
+        assert np.abs(sd.track_lons - ref.track_lons).max() < 0.01
+        assert np.abs(sd.track_lats - ref.track_lats).max() < 0.01
