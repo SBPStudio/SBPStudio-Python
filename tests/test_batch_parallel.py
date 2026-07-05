@@ -162,3 +162,62 @@ class TestBatchRealProcessPool:
         except (cf.process.BrokenProcessPool, OSError, RuntimeError) as exc:
             pytest.skip(f"real process pool unavailable here: {exc}")
         assert sorted(os.listdir(out_dir)) == [f"line_{i}.png" for i in range(4)]
+
+
+class TestBatchRamBudgetDivision:
+    """Audit fix: the parallel branch must divide ONE machine-wide raster
+    budget across the pool — without it, each worker independently claimed
+    _RAM_SAFE_FRACTION of the WHOLE machine's free RAM (N× oversubscription,
+    the exact swap-a-laptop trap plan_workers exists to prevent)."""
+
+    def _captured_budgets(self, args, monkeypatch, n_workers):
+        import sbp_studio.core._backends as B
+        monkeypatch.setattr(B, "plan_workers", lambda *a, **k: n_workers)
+        monkeypatch.setattr(cf, "ProcessPoolExecutor", cf.ThreadPoolExecutor)
+        seen = []
+        real = C._batch_export_worker
+
+        def spy(payload):
+            seen.append(payload.get("mem_budget_gb"))
+            return real(payload)
+
+        monkeypatch.setattr(C, "_batch_export_worker", spy)
+        C.cmd_batch_export(args)
+        return seen
+
+    def test_parser_default_budget_divided_across_workers(self, batch_files,
+                                                          tmp_path, monkeypatch):
+        """The CLI default (--mem-budget-gb 6.0, see main.py) is the WHOLE-batch
+        rasteriser budget: 4 workers get 1.5 GB each — never 4 × 6 GB."""
+        _in, _paths = batch_files
+        budgets = self._captured_budgets(
+            _make_batch_args([_in], str(tmp_path / "o")), monkeypatch, n_workers=4)
+        assert budgets and all(b == pytest.approx(6.0 / 4) for b in budgets)
+
+    def test_user_budget_split_n_ways(self, batch_files, tmp_path, monkeypatch):
+        _in, _paths = batch_files
+        args = _make_batch_args([_in], str(tmp_path / "o"))
+        args.mem_budget_gb = 8.0
+        budgets = self._captured_budgets(args, monkeypatch, n_workers=4)
+        assert all(b == pytest.approx(2.0) for b in budgets)
+
+    def test_per_worker_floor_engages_for_many_workers(self, batch_files,
+                                                       tmp_path, monkeypatch):
+        """A tiny total budget over many workers floors at 0.25 GB/worker so a
+        single export never degrades to an unusably low pixel budget."""
+        _in, _paths = batch_files
+        args = _make_batch_args([_in], str(tmp_path / "o"))
+        args.mem_budget_gb = 0.5
+        budgets = self._captured_budgets(args, monkeypatch, n_workers=4)
+        assert all(b == pytest.approx(0.25) for b in budgets)
+
+    def test_sequential_path_keeps_budget_untouched(self, batch_files, tmp_path,
+                                                    monkeypatch):
+        """1 worker → the legacy in-process path: args.mem_budget_gb must stay
+        exactly the parser default (6.0), never rewritten by the division."""
+        import sbp_studio.core._backends as B
+        _in, _paths = batch_files
+        monkeypatch.setattr(B, "plan_workers", lambda *a, **k: 1)
+        args = _make_batch_args([_in], str(tmp_path / "o"))
+        C.cmd_batch_export(args)
+        assert args.mem_budget_gb == pytest.approx(6.0)

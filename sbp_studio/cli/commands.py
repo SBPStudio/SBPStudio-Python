@@ -818,6 +818,23 @@ def cmd_batch_export(args) -> None:
     n_workers = plan_workers(_estimate_batch_worker_bytes(files))
     parallel  = n_workers >= 2 and len(payloads) >= 2
 
+    if parallel:
+        # Audit fix: each worker's rasteriser independently budgets
+        # _RAM_SAFE_FRACTION of the machine's available RAM when no explicit
+        # --mem-budget-gb is given — N workers would aggregate to N× that,
+        # exactly the swap-the-laptop trap. Divide ONE machine-wide budget
+        # across the pool: an explicit user budget is split N ways; otherwise
+        # the same fraction-of-available default is computed ONCE here and
+        # split. Each worker then self-caps its raster to its own share.
+        user_budget = getattr(args, "mem_budget_gb", None)
+        if user_budget and user_budget > 0:
+            total_gb = float(user_budget)
+        else:
+            total_gb = (_available_ram_bytes() * _RAM_SAFE_FRACTION) / 1024 ** 3
+        per_worker_gb = max(0.25, total_gb / n_workers)   # floor keeps output sane
+        for p in payloads:
+            p["mem_budget_gb"] = per_worker_gb
+
     print(f"\nBatch export: {len(files)} file(s) → {out_dir}  "
           f"[format={fmt}, cmap={args.cmap or 'Viridis'}, "
           f"{'workers=' + str(n_workers) if parallel else 'sequential'}]",
