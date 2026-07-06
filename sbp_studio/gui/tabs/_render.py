@@ -52,6 +52,29 @@ def pixel_budget(mem_budget_gb: Optional[float]) -> Optional[float]:
     return max(1.0, (float(mem_budget_gb) * 1024 ** 3) / RASTER_BYTES_PER_PX)
 
 
+# HARD canvas ceiling for a GUI export, in megapixels — an ABSOLUTE safety cap,
+# independent of the (user-tunable) RAM budget. The budget default (6 GB ≈ 358
+# Mpx) proved far too permissive in the field: a ~293 Mpx canvas allocation
+# (matplotlib's resample index buffer alone is 4 bytes/px, the full draw ~18)
+# hard-crashed an 8 GB laptop with MemoryError. 100 Mpx (e.g. ~12500 × 8000 px,
+# an A0 page at ~260 DPI) is far beyond any legitimate deliverable while keeping
+# the worst-case draw footprint under ~2 GB. When the cap engages, only the DPI
+# drops (figsize — the physical proportions/VE — is never touched) and a warning
+# is logged so the reduction is visible in app.log.
+MAX_EXPORT_MEGAPIXELS = 100.0
+
+
+def hard_dpi_cap(figsize: tuple,
+                 max_megapixels: float = MAX_EXPORT_MEGAPIXELS) -> Optional[int]:
+    """Largest DPI whose canvas (figw·dpi × figh·dpi) stays under the HARD
+    megapixel ceiling, or None for degenerate figsize. Same coupled down-scale
+    contract as :func:`dpi_for_budget`, but non-negotiable (not budget-driven)."""
+    w, h = float(figsize[0]), float(figsize[1])
+    if w <= 0 or h <= 0 or max_megapixels <= 0:
+        return None
+    return int(max(1, ((max_megapixels * 1e6) / (w * h)) ** 0.5))
+
+
 def dpi_for_budget(figsize: tuple, mem_budget_gb: Optional[float]) -> Optional[int]:
     """Largest DPI whose raster (figw·dpi × figh·dpi) fits the RAM budget, or
     None when unbounded. Used to CAP the export DPI so a high-DPI / long-line GUI

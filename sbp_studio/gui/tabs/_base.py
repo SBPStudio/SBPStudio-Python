@@ -30,6 +30,7 @@ from ..i18n import language_manager
 from ..state import AppState
 from ._render import (
     dpi_for_budget, effective_aspect, effective_export_dpi, figsize_for_scale,
+    hard_dpi_cap,
 )
 
 if TYPE_CHECKING:  # type-only; avoids a runtime import cycle (_handlers ← _base)
@@ -544,6 +545,12 @@ class SubTabbedTab(QWidget):
             limited = cap is not None and eff > cap
             if limited:
                 eff = max(50, cap)
+            # Mirror the export's HARD megapixel ceiling (export_headless)
+            # so the readout predicts the DPI the export will actually use.
+            hcap = hard_dpi_cap(figsize)
+            if hcap is not None and eff > hcap:
+                eff = max(1, hcap)
+                limited = True
             mpx = (figsize[0] * eff) * (figsize[1] * eff) / 1e6
             tail = QCoreApplication.translate("SubTabbedTab", " (RAM-limited)") if limited else ""
             self.controls.set_dpi_estimate(QCoreApplication.translate(

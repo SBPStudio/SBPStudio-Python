@@ -331,6 +331,110 @@ class TestCropExportToView:
         assert widths["zoom"] < widths["full"]
 
 
+# ── Canvas safety cap: the hard megapixel ceiling (field MemoryError fix) ──────
+
+class TestCanvasSafetyCap:
+    """The field crash: a deep zoom / low traces-per-cm configuration produced a
+    ~293 Mpx canvas — under the 6 GB budget's 358 Mpx allowance but far beyond an
+    8 GB laptop's actual RAM (MemoryError in matplotlib's resample buffer).
+    These tests shrink MAX_EXPORT_MEGAPIXELS so the REAL capping path runs
+    cheaply, then verify the saved canvas is strictly bounded."""
+
+    def _render_px(self, path, tmp_path, scale_cfg, view=None, dpi=1200):
+        from PIL import Image
+        from sbp_studio.core import load_profile
+        from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
+        from sbp_studio.viz.render import save_figure
+        prof = load_profile(path, load_traces=True)
+        cfg = dict(_cfg(), dpi=dpi, mem_budget_gb=6.0)
+        fig, render_dpi = render_export_figure(
+            prof, cfg, _params(), [], scale_cfg, False, "profile",
+            _NoOpCancel(), view_range=view)
+        out = str(tmp_path / "cap.png")
+        save_figure(fig, out, dpi=render_dpi, fmt="png", pdf_page="auto")
+        fig.clear()
+        with Image.open(out) as im:
+            return im.size                      # (w_px, h_px)
+
+    def test_deep_zoom_low_tpc_canvas_bounded(self, tmp_path, monkeypatch, caplog):
+        """The reported field scenario: zoomed-in view + zoom-synced low
+        traces/cm + 1200 dpi dialog default → without the cap this explodes;
+        with it the SAVED canvas stays under the ceiling and a warning is
+        logged (never a MemoryError)."""
+        import logging
+        import numpy as np
+        import sbp_studio.gui.tabs._render as R
+        from sbp_studio.core import load_profile
+        monkeypatch.setattr(R, "MAX_EXPORT_MEGAPIXELS", 2.0)
+        big = str(tmp_path / "big.sgy")
+        make_synthetic_segy(big, n_traces=600, ns=256)
+        d = np.asarray(load_profile(big).dist_km, dtype=float)
+        lo, hi = float(d.min()), float(d.max())
+        zoom = ((lo + 0.2 * (hi - lo), lo + 0.7 * (hi - lo)), (-1e6, 1e6))
+        scale_cfg = dict(layout_mode="decoupled", mode="ve", ve=67.0,
+                         traces_per_cm=2.0)          # zoom-synced low density
+        # core.logger sets sbp_studio's root logger propagate=False (records go
+        # only to app.log); re-enable so caplog's root handler sees the warning.
+        monkeypatch.setattr(logging.getLogger("sbp_studio"), "propagate", True)
+        with caplog.at_level(logging.WARNING, "sbp_studio.gui.export_headless"):
+            w_px, h_px = self._render_px(big, tmp_path, scale_cfg, view=zoom)
+        assert w_px * h_px <= 2.0e6 * 1.10           # ceiling + 10 % slack
+        assert any("safety ceiling" in r.getMessage() for r in caplog.records)
+
+    def test_full_view_billboard_bounded(self, tmp_path, monkeypatch):
+        """The 'billboard': the view covers the WHOLE line (crop no-ops,
+        correctly) while traces/cm is extreme — the canvas must still be
+        bounded by the ceiling, because the crop can never be the only guard."""
+        import sbp_studio.gui.tabs._render as R
+        monkeypatch.setattr(R, "MAX_EXPORT_MEGAPIXELS", 2.0)
+        big = str(tmp_path / "big.sgy")
+        make_synthetic_segy(big, n_traces=600, ns=256)
+        scale_cfg = dict(layout_mode="decoupled", mode="ve", ve=67.0,
+                         traces_per_cm=1.0)          # 600/1/2.54 = 236 in wide
+        w_px, h_px = self._render_px(big, tmp_path, scale_cfg, view=None)
+        assert w_px * h_px <= 2.0e6 * 1.10
+
+    def test_cap_inert_below_ceiling(self, profile_file, tmp_path, caplog,
+                                     monkeypatch):
+        """A normal-sized export never triggers the ceiling: the returned DPI
+        equals the historical effective/budget result and no warning is logged
+        — the guard costs existing exports nothing."""
+        import logging
+        from sbp_studio.core import load_profile
+        from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
+        from sbp_studio.gui.tabs._render import (dpi_for_budget,
+                                                 effective_export_dpi,
+                                                 figsize_for_scale)
+        prof = load_profile(profile_file, load_traces=True)
+        cfg = dict(_cfg(), mem_budget_gb=6.0)
+        scale_cfg = _scale_cfg()
+        # See test_deep_zoom_low_tpc_canvas_bounded — make the absence
+        # assertion below meaningful, not a propagation artifact.
+        monkeypatch.setattr(logging.getLogger("sbp_studio"), "propagate", True)
+        with caplog.at_level(logging.WARNING, "sbp_studio.gui.export_headless"):
+            fig, render_dpi = render_export_figure(
+                prof, cfg, _params(), [], scale_cfg, False, "profile",
+                _NoOpCancel())
+        fig.clear()
+        figsize = figsize_for_scale(prof, scale_cfg, int(cfg["dpi"]),
+                                    cfg["velocity"])
+        expect = effective_export_dpi(figsize, (prof.ns, prof.n_traces),
+                                      int(cfg["dpi"]))
+        cap = dpi_for_budget(figsize, 6.0)
+        if cap is not None and expect > cap:
+            expect = max(50, cap)
+        assert render_dpi == expect
+        assert not any("safety ceiling" in r.getMessage() for r in caplog.records)
+
+    def test_hard_dpi_cap_formula(self):
+        from sbp_studio.gui.tabs._render import hard_dpi_cap
+        # 10×5 in at 100 Mpx → dpi = sqrt(100e6/50) ≈ 1414.
+        assert hard_dpi_cap((10.0, 5.0), 100.0) == int((100e6 / 50.0) ** 0.5)
+        assert hard_dpi_cap((0.0, 5.0)) is None
+        # Pathological page: the cap may drop below 50 — never re-inflated.
+        assert hard_dpi_cap((4000.0, 1300.0), 100.0) < 50
+
+
 # ── Issue 2: traces/cm ↔ on-screen zoom conversion (pure, Qt-free) ─────────────
 
 class TestTracesPerCmFormula:
