@@ -309,6 +309,23 @@ def effective_export_dpi(figsize: tuple, data_shape: tuple, requested_dpi: int,
     return int(min(max(req, math.ceil(need)), ceiling))
 
 
+def traces_per_cm_on_screen(visible_traces: float, viewport_px: float,
+                            dpi: float) -> float:
+    """Physical horizontal density (traces per cm) currently shown on screen.
+
+    ``visible_traces`` traces span ``viewport_px`` logical pixels of the data
+    ViewBox, on a display of ``dpi`` logical dots-per-inch. Physical width in cm
+    is ``viewport_px / dpi * 2.54``, so the density is ``visible_traces`` over
+    that. Pure + DPI-derived so the live SeismicView can convert a mouse-wheel
+    X-zoom into the SAME 'traces/cm' unit the export width uses
+    (``figsize_for_scale``: ``w = n_traces / tpc / 2.54``), keeping the control
+    in sync with the zoom. Returns 0.0 for degenerate input (caller skips)."""
+    if visible_traces <= 0 or viewport_px <= 0 or dpi <= 0:
+        return 0.0
+    width_cm = viewport_px / dpi * _CM_PER_IN
+    return (visible_traces / width_cm) if width_cm > 0 else 0.0
+
+
 def compute_section(obj: Any, data: np.ndarray, params: dict,
                     boundaries: Sequence[float] = ()) -> dict:
     """Build the dict consumed by ``SeismicView.show_image`` (minus the title).

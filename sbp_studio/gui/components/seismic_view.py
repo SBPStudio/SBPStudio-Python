@@ -217,6 +217,14 @@ class SeismicView(QWidget):
     # trace fractions and stores them in the selected WaterMuteNode's params.
     mute_horizon_edited = pyqtSignal(list)
 
+    # Emitted (debounced) with the on-screen horizontal density in traces per
+    # physical cm, computed from the ViewBox after a pan/zoom settles. The tab
+    # reflects it into the 'Traces/cm' control while Lock-VE mode is active, so a
+    # mouse-wheel X-zoom keeps that physical-scale readout in sync (see
+    # SubTabbedTab._on_view_horizontal_scale). Debounced + single float → never a
+    # per-frame cost while scrolling.
+    horizontal_scale_changed = pyqtSignal(float)
+
     # Viewport-settle debounce: DSP recompute fires this long after the LAST
     # pan/zoom event, so dragging never triggers a pipeline run mid-gesture.
     # 180 ms: long enough that a continuous drag (events firing far faster
@@ -233,6 +241,11 @@ class SeismicView(QWidget):
     # the map marker, imperceptible lag for a navigation overview while the
     # seismic view itself still pans natively at full frame rate.
     VT_THROTTLE_MS = 60
+
+    # Traces/cm sync debounce: the on-screen horizontal density is recomputed and
+    # broadcast this long after the LAST pan/zoom event, so aggressive mouse-wheel
+    # scrolling never recomputes it per frame — it fires once, on the settle.
+    TPC_SYNC_MS = 150
 
     # Max visible traces drawn as live wiggle before auto-falling back to the
     # raster base (keeps pan/zoom fluid). Mirrors the export budget
@@ -424,6 +437,14 @@ class SeismicView(QWidget):
         self._vt_pending: Optional[Tuple[int, int]] = None   # latest (t0, t1)
         self._vt_last_value: Optional[Tuple[int, int]] = None  # last emitted
         self._vt_last_emit: float = 0.0                       # perf_counter s
+
+        # Traces/cm sync debounce (see TPC_SYNC_MS + horizontal_scale_changed):
+        # restarted on every pan/zoom, so the density is broadcast only once the
+        # gesture settles — never per wheel-tick.
+        self._tpc_timer = QTimer(self)
+        self._tpc_timer.setSingleShot(True)
+        self._tpc_timer.setInterval(self.TPC_SYNC_MS)
+        self._tpc_timer.timeout.connect(self._emit_horizontal_scale)
 
         # Cross-module sync (Link Views) state: set by the owning tab whenever
         # the "Link Views" toggle changes (see set_link_views_enabled). Drives
@@ -1479,6 +1500,31 @@ class SeismicView(QWidget):
         self._vt_last_value = val
         self.visible_traces_changed.emit(*val)
 
+    def _emit_horizontal_scale(self) -> None:
+        """Compute the on-screen horizontal density (traces per physical cm) from
+        the current ViewBox and broadcast it via ``horizontal_scale_changed``.
+
+        Cheap and debounced (runs only on the settle timer, never per frame): one
+        searchsorted maps the visible X-range to a trace count, then
+        ``traces_per_cm_on_screen`` converts it against the data ViewBox's pixel
+        width and the display's logical DPI. The tab decides whether to apply it
+        (only in Lock-VE mode), so this stays mode-agnostic."""
+        dist = self._dist_km
+        if dist is None or dist.size < 2:
+            return
+        (x0, x1), _ = self.plot.getViewBox().viewRange()
+        x_min, x_max = (x0, x1) if x0 <= x1 else (x1, x0)
+        n = dist.size
+        t0 = max(0, min(int(np.searchsorted(dist, x_min, side="left")), n - 1))
+        t1 = max(t0 + 1, min(int(np.searchsorted(dist, x_max, side="right")), n))
+        visible_traces = t1 - t0
+        vb_px = float(self.plot.getViewBox().sceneBoundingRect().width())
+        dpi_x = float(self.logicalDpiX() or 96)
+        from sbp_studio.gui.tabs._render import traces_per_cm_on_screen
+        tpc = traces_per_cm_on_screen(visible_traces, vb_px, dpi_x)
+        if tpc > 0 and math.isfinite(tpc):
+            self.horizontal_scale_changed.emit(float(tpc))
+
     def _on_range_changed(self, _vb, ranges) -> None:
         """Schedule a display-buffer re-slice (or a preview refresh) on pan/zoom."""
         # Ephemeral HQ overlay: any GENUINE view change (a range different from the
@@ -1492,6 +1538,8 @@ class SeismicView(QWidget):
                 self.clear_hq_overlay()
         # Immediate (un-debounced) trace-index broadcast for the navigation map.
         self._emit_visible_traces(ranges)
+        # Debounced traces/cm sync (restart on every event → fires once on settle).
+        self._tpc_timer.start()
         if self._preview_mode:
             # SETTLE debounce: restart on every event so the DSP recompute only
             # fires once the viewport stops moving. During the drag PyQtGraph

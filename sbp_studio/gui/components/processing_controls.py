@@ -852,6 +852,33 @@ class ProcessingControls(QWidget):
                     traces_per_cm=float(self.sp_tpc.value()),
                     layout_mode="decoupled")
 
+    def set_traces_per_cm(self, value: float) -> bool:
+        """Programmatically set the horizontal scale (traces/cm) to ``value``
+        WITHOUT emitting ``scale_changed`` — used by the live view→UI sync when a
+        mouse-wheel X-zoom changes the on-screen density (see
+        SubTabbedTab._on_view_horizontal_scale).
+
+        Signals are blocked so this never re-triggers the preview re-aspect or a
+        feedback loop; both the slider and the spin are updated together. Clamped
+        to the control's range and rounded to its integer step. Returns True when
+        the displayed value actually changed (so the caller can refresh the DPI
+        readout only when needed), False when it was already there."""
+        v = int(round(max(self.sp_tpc.minimum(),
+                          min(self.sp_tpc.maximum(), float(value)))))
+        if v == int(round(self.sp_tpc.value())):
+            return False
+        self._syncing_tpc = True
+        b_spin = self.sp_tpc.blockSignals(True)
+        b_sld = self.sld_tpc.blockSignals(True)
+        try:
+            self.sp_tpc.setValue(float(v))
+            self.sld_tpc.setValue(v)
+        finally:
+            self.sp_tpc.blockSignals(b_spin)
+            self.sld_tpc.blockSignals(b_sld)
+            self._syncing_tpc = False
+        return True
+
     def px_per_trace(self) -> float:
         """Live-preview horizontal detail (px per trace) — a fixed value now that
         the physical 'traces per cm' control governs export width. Kept for the

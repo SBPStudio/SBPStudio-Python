@@ -66,10 +66,130 @@ def process_full_array(obj, params, node_cfg, align_enabled, cancel):
     return data, t0
 
 
+# ── Viewport crop (WYSIWYG export extent + the HQ overlay) ─────────────────────
+# Moved here from gui.tabs._base so the HQ viewport overlay AND the file export's
+# WYSIWYG crop share ONE Qt-free implementation. Pure numpy — no PyQt6 (the
+# import-purity regression test still passes).
+
+def _view_bounds(obj, shape, t0_full, x_range, y_range):
+    """Map the visible ViewBox window to half-open matrix bounds
+    ``(c0, c1, r0, r1)``. Columns via the per-trace distance axis (searchsorted),
+    rows via the processed array's time origin ``t0_full``. Single source of
+    truth for both the crop and the 'is the whole line visible?' test."""
+    import numpy as np
+    dist = np.asarray(obj.dist_km, dtype=float)
+    n_rows, n_cols = shape
+    xa, xb = sorted((float(x_range[0]), float(x_range[1])))
+    c0 = int(np.clip(np.searchsorted(dist, xa, side="left"), 0, n_cols - 1))
+    c1 = int(np.clip(np.searchsorted(dist, xb, side="right"), c0 + 1, n_cols))
+    dt_ms = obj.dt_us / 1000.0
+    ya, yb = sorted((float(y_range[0]), float(y_range[1])))
+    r0 = int(np.clip(round((ya - t0_full) / dt_ms), 0, n_rows - 1))
+    r1 = int(np.clip(round((yb - t0_full) / dt_ms), r0 + 1, n_rows))
+    return c0, c1, r0, r1
+
+
+def _crop_at_bounds(obj, proc, t0_full, c0, c1, r0, r1):
+    """Slice ``proc`` to ``[r0:r1, c0:c1]`` and return a lightweight source clone
+    carrying only the attributes the headless renderer + figsize_for_scale read,
+    with the per-trace arrays sliced so nothing is misaligned."""
+    import numpy as np
+    from types import SimpleNamespace
+    dist = np.asarray(obj.dist_km, dtype=float)
+    dt_ms = obj.dt_us / 1000.0
+    crop = np.ascontiguousarray(proc[r0:r1, c0:c1])
+
+    def _sl(name):
+        arr = getattr(obj, name, None)
+        return None if arr is None else np.asarray(arr)[c0:c1]
+
+    dk = dist[c0:c1]
+    t0_crop = t0_full + r0 * dt_ms
+    base_name = getattr(obj, "name", None) or getattr(obj, "label", "") or "viewport"
+    # File-seam boundaries (chain export) that fall inside the cropped km window —
+    # absolute km positions, so keep only those strictly between the crop edges.
+    raw_b = getattr(obj, "boundaries_km", None)
+    if raw_b is not None and dk.size:
+        lo_k, hi_k = float(dk[0]), float(dk[-1])
+        bnds = [float(b) for b in raw_b if lo_k < float(b) < hi_k]
+    else:
+        bnds = []
+    clone = SimpleNamespace(
+        # Keep the real name/label (no suffix) so the cropped export's title
+        # matches the full-line export exactly — only the extent changes.
+        name=base_name, label=base_name,
+        n_traces=int(c1 - c0), ns=int(r1 - r0), dt_us=int(obj.dt_us),
+        dist_km=dk, total_km=float(dk[-1] - dk[0]) if dk.size else 0.0,
+        timestamps=list(getattr(obj, "timestamps", []) or [])[c0:c1],
+        lons=_sl("lons"), lats=_sl("lats"), delays=_sl("delays"),
+        water_depth=_sl("water_depth"),
+        # Display track (the renderer's top time-axis reads these — profile AND
+        # chain); sliced to the crop so position labels stay aligned.
+        track_lons=_sl("track_lons"), track_lats=_sl("track_lats"),
+        boundaries_km=bnds,
+        # Already-processed data → render with align=False; the time origin is the
+        # crop's first row, so both align branches of time_window yield t0_crop.
+        min_delay=t0_crop, delay_ms=t0_crop, max_delay=t0_crop,
+    )
+    return clone, crop
+
+
+def _crop_for_viewport(obj, proc, t0_full, x_range, y_range):
+    """Crop the processed matrix to the visible ViewBox window and return a
+    lightweight source clone the headless renderer can consume (used by the HQ
+    viewport overlay). ``x_range`` is (km, km), ``y_range`` is (ms, ms)."""
+    c0, c1, r0, r1 = _view_bounds(obj, proc.shape, t0_full, x_range, y_range)
+    return _crop_at_bounds(obj, proc, t0_full, c0, c1, r0, r1)
+
+
+def _shift_picks(picks, c0, c1, t_lo, t_hi):
+    """Re-index interpretation picks into a crop: shift ``trace_index`` by the
+    crop's left column and drop any pick outside the crop's column/time window.
+    Returns duck-typed stand-ins (``_draw_picks`` reads only trace_index/time_ms/
+    id), so the caller need not import PickPoint."""
+    if not picks:
+        return picks
+    from types import SimpleNamespace
+    ncrop = c1 - c0
+    lo, hi = (t_lo, t_hi) if t_lo <= t_hi else (t_hi, t_lo)
+    out = []
+    for p in picks:
+        j = int(p.trace_index) - c0
+        if 0 <= j < ncrop and lo <= float(p.time_ms) <= hi:
+            out.append(SimpleNamespace(
+                trace_index=j, time_ms=float(p.time_ms), id=p.id))
+    return out
+
+
+def crop_export_to_view(obj, data, t0_full, x_range, y_range, picks=None):
+    """WYSIWYG export extent. If the visible ViewBox window (``x_range`` km,
+    ``y_range`` ms) is a STRICT sub-window of ``obj``'s full extent, return a
+    cropped ``(clone, data, picks)`` so the exported file matches the on-screen
+    zoom. When the view already covers the whole line (nothing zoomed away), the
+    inputs are returned UNCHANGED — the historical full-line export, byte for
+    byte (this is what keeps the batch/pool paths, which pass no view, identical).
+    ``picks`` are re-indexed into the crop; those outside it are dropped."""
+    import numpy as np
+    dist = getattr(obj, "dist_km", None)
+    if dist is None:
+        return obj, data, picks
+    dist = np.asarray(dist, dtype=float)
+    if dist.size < 2 or data.size == 0:
+        return obj, data, picks
+    n_rows, n_cols = data.shape
+    c0, c1, r0, r1 = _view_bounds(obj, data.shape, t0_full, x_range, y_range)
+    if c0 <= 0 and c1 >= n_cols and r0 <= 0 and r1 >= n_rows:
+        return obj, data, picks              # whole line visible → no crop
+    clone, crop = _crop_at_bounds(obj, data, t0_full, c0, c1, r0, r1)
+    t_hi = clone.min_delay + crop.shape[0] * (obj.dt_us / 1000.0)
+    picks_out = _shift_picks(picks, c0, c1, clone.min_delay, t_hi)
+    return clone, crop, picks_out
+
+
 # ── Export figure render (moved verbatim from gui.tabs._base) ──────────────────
 
 def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
-                         kind, cancel, picks=None):
+                         kind, cancel, picks=None, view_range=None):
     """Shared per-item export render — used by the single export, the
     sequential batch AND the process-pool batch, so their quality can never
     drift.
@@ -87,6 +207,12 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
 
     ``picks`` — interpretation markers to burn into the raster at full export
     resolution; ``None``/empty draws nothing (batch exports never pass it).
+
+    ``view_range`` — ``((x0_km, x1_km), (y0_ms, y1_ms))`` of the live ViewBox, or
+    ``None``. When given AND the user has zoomed into a sub-window, the processed
+    matrix + object + picks are cropped to it so the exported file matches the
+    screen (WYSIWYG extent). A full-line view (or ``None`` — the batch/pool path)
+    leaves everything untouched, so the historical full-line export is unchanged.
     """
     from sbp_studio.viz.render import (build_theme, render_chain_figure,
                                        render_profile_figure)
@@ -95,8 +221,13 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
                                              figsize_for_scale)
     # Full-resolution DSP pipeline (alignment + nodes) — shared with the viewport
     # HQ export so the crop is processed identically.
-    data, _t0_full = process_full_array(
+    data, t0_full = process_full_array(
         obj, params, node_cfg, align_enabled, cancel)
+    # WYSIWYG export extent: honour the live viewport crop when the caller passed
+    # the ViewBox window and the user has zoomed in (a full-line view is a no-op).
+    if view_range is not None:
+        obj, data, picks = crop_export_to_view(
+            obj, data, t0_full, view_range[0], view_range[1], picks)
     # figsize: paper size (fixed landscape inches) when the user selected one,
     # otherwise the view-scale-derived figsize (aspect / VE / hybrid mode).
     # Paper size exports skip the post-render WYSIWYG aspect loop since the

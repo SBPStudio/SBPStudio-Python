@@ -219,3 +219,137 @@ class TestDivideMemBudget:
         out = divide_mem_budget(cfg, 4)
         assert out["mem_budget_gb"] > 0
         assert "mem_budget_gb" not in cfg          # copy, not mutation
+
+
+# ── Issue 1: WYSIWYG export extent (crop the file to the live viewport) ────────
+
+def _synthetic_obj():
+    """A duck-typed profile stand-in with a monotonic distance axis — enough for
+    the pure crop math without loading a SEG-Y file."""
+    import numpy as np
+    from types import SimpleNamespace
+    ns, nt = 100, 200
+    data = np.arange(ns * nt, dtype=float).reshape(ns, nt)
+    dist = np.linspace(0.0, 10.0, nt)          # 0..10 km, uniform
+    obj = SimpleNamespace(
+        name="L", dist_km=dist, dt_us=1000, ns=ns, n_traces=nt, total_km=10.0,
+        timestamps=list(range(nt)), lons=dist.copy(), lats=dist.copy(),
+        delays=None, water_depth=None)
+    return obj, data
+
+
+class TestCropExportToView:
+    def test_full_view_is_a_noop_identity(self):
+        """A view covering the whole line returns the SAME object + array (no
+        clone, no copy) — this is what keeps a full-line export byte-identical to
+        the pre-feature behaviour and the batch/pool paths untouched."""
+        from sbp_studio.gui.export_headless import crop_export_to_view
+        obj, data = _synthetic_obj()
+        o2, d2, p2 = crop_export_to_view(
+            obj, data, 0.0, (-1.0, 11.0), (-10.0, 10_000.0), None)
+        assert o2 is obj and d2 is data and p2 is None
+
+    def test_zoomed_view_crops_both_axes(self):
+        from sbp_studio.gui.export_headless import crop_export_to_view
+        obj, data = _synthetic_obj()
+        o2, d2, _ = crop_export_to_view(
+            obj, data, 0.0, (2.0, 4.0), (10.0, 40.0), None)
+        assert d2.shape[0] < data.shape[0] and d2.shape[1] < data.shape[1]
+        # Clone geometry is consistent with the cropped matrix.
+        assert o2.n_traces == d2.shape[1] and o2.ns == d2.shape[0]
+        assert 0.0 < o2.total_km < 10.0
+        # Distance axis sliced to the window (~2..4 km).
+        assert o2.dist_km[0] >= 2.0 - 1e-6 and o2.dist_km[-1] <= 4.0 + 1e-6
+
+    def test_picks_reindexed_and_filtered(self):
+        """Picks shift by the crop's left column and those outside the crop's
+        column/time window are dropped (so overlay picks land correctly on a
+        zoomed export instead of clamping to the edge)."""
+        from types import SimpleNamespace
+        from sbp_studio.gui.export_headless import crop_export_to_view
+        obj, data = _synthetic_obj()
+        picks = [
+            SimpleNamespace(trace_index=5, time_ms=20.0, id="left_out"),   # x < 2km
+            SimpleNamespace(trace_index=60, time_ms=20.0, id="inside"),    # inside
+            SimpleNamespace(trace_index=60, time_ms=90.0, id="time_out"),  # t > window
+        ]
+        o2, d2, p2 = crop_export_to_view(
+            obj, data, 0.0, (2.0, 4.0), (10.0, 40.0), picks)
+        kept = {p.id for p in p2}
+        assert kept == {"inside"}
+        inside = next(p for p in p2 if p.id == "inside")
+        assert 0 <= inside.trace_index < d2.shape[1]     # re-indexed into the crop
+
+    def test_render_export_full_view_matches_no_view(self, profile_file, tmp_path):
+        """End-to-end byte-identity: rendering with a full-cover view_range yields
+        the EXACT same file as passing no view_range — the WYSIWYG hook cannot
+        regress the full-line export (or the batch/pool paths that pass None)."""
+        import numpy as np
+        from sbp_studio.core import load_profile
+        from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
+        from sbp_studio.viz.render import save_figure
+        p0 = load_profile(profile_file, load_traces=True)
+        d = np.asarray(p0.dist_km, dtype=float)
+        full_view = ((float(d.min()) - 1.0, float(d.max()) + 1.0), (-1e6, 1e6))
+        digests = {}
+        for tag, view in (("none", None), ("full", full_view)):
+            prof = load_profile(profile_file, load_traces=True)
+            fig, dpi = render_export_figure(
+                prof, _cfg(), _params(), [], _scale_cfg(), False, "profile",
+                _NoOpCancel(), view_range=view)
+            out = str(tmp_path / f"{tag}.png")
+            save_figure(fig, out, dpi=dpi, fmt="png", pdf_page="auto")
+            fig.clear()
+            digests[tag] = open(out, "rb").read()
+        assert digests["none"] == digests["full"]
+
+    def test_render_export_zoomed_view_shrinks_figure(self, tmp_path):
+        """A genuinely zoomed view_range crops the trace span, so with a
+        traces/cm scale the exported figure is physically NARROWER than the
+        full-line export — proof the crop reaches the render, on a deterministic
+        geometric assertion (not pixel content)."""
+        import numpy as np
+        from sbp_studio.core import load_profile
+        from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
+        big = str(tmp_path / "big.sgy")
+        make_synthetic_segy(big, n_traces=600, ns=192)
+        # Horizontal scale tied to trace count → width = n_traces / tpc / 2.54.
+        scale_cfg = dict(layout_mode="decoupled", mode="aspect", ratio=3.0,
+                         traces_per_cm=20.0)
+        p0 = load_profile(big, load_traces=True)
+        d = np.asarray(p0.dist_km, dtype=float)
+        lo, hi = float(d.min()), float(d.max())
+        zoom = ((lo + 0.25 * (hi - lo), lo + 0.55 * (hi - lo)), (-1e6, 1e6))
+        widths = {}
+        for tag, view in (("full", None), ("zoom", zoom)):
+            prof = load_profile(big, load_traces=True)
+            fig, _dpi = render_export_figure(
+                prof, _cfg(), _params(), [], scale_cfg, False, "profile",
+                _NoOpCancel(), view_range=view)
+            widths[tag] = float(fig.get_size_inches()[0])
+            fig.clear()
+        assert widths["zoom"] < widths["full"]
+
+
+# ── Issue 2: traces/cm ↔ on-screen zoom conversion (pure, Qt-free) ─────────────
+
+class TestTracesPerCmFormula:
+    def test_matches_physical_definition(self):
+        from sbp_studio.gui.tabs._render import traces_per_cm_on_screen
+        # 200 traces across 800 logical px at 96 dpi → 800/96*2.54 = 21.17 cm.
+        assert traces_per_cm_on_screen(200, 800, 96) == pytest.approx(
+            200 / (800 / 96 * 2.54))
+
+    def test_zoom_in_lowers_density(self):
+        """Zooming in (fewer visible traces over the same pixel width) LOWERS
+        traces/cm — matching figsize_for_scale's 'lower tpc = stretched'."""
+        from sbp_studio.gui.tabs._render import traces_per_cm_on_screen
+        wide = traces_per_cm_on_screen(200, 800, 96)
+        zoomed = traces_per_cm_on_screen(50, 800, 96)
+        assert zoomed < wide
+
+    def test_degenerate_inputs_return_zero(self):
+        from sbp_studio.gui.tabs._render import traces_per_cm_on_screen
+        assert traces_per_cm_on_screen(0, 800, 96) == 0.0
+        assert traces_per_cm_on_screen(200, 0, 96) == 0.0
+        assert traces_per_cm_on_screen(200, 800, 0) == 0.0

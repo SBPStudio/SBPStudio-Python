@@ -231,60 +231,29 @@ def _process_full_array(obj, params, node_cfg, align_enabled, cancel):
 
 
 def _crop_for_viewport(obj, proc, t0_full, x_range, y_range):
-    """Crop the processed matrix to the visible ViewBox window and return a
-    lightweight source clone the headless renderer can consume.
-
-    ``x_range`` is (km, km), ``y_range`` is (ms, ms) straight from the PyQtGraph
-    ViewBox. Columns are mapped via the per-trace distance axis (searchsorted) and
-    rows via the processed array's time origin ``t0_full``. The clone carries only
-    the attributes ``render_profile_figure`` + ``figsize_for_scale`` read, with the
-    per-trace arrays sliced so nothing is misaligned."""
-    import numpy as np
-    from types import SimpleNamespace
-    dist = np.asarray(obj.dist_km, dtype=float)
-    n_rows, n_cols = proc.shape
-    xa, xb = sorted((float(x_range[0]), float(x_range[1])))
-    c0 = int(np.clip(np.searchsorted(dist, xa, side="left"), 0, n_cols - 1))
-    c1 = int(np.clip(np.searchsorted(dist, xb, side="right"), c0 + 1, n_cols))
-    dt_ms = obj.dt_us / 1000.0
-    ya, yb = sorted((float(y_range[0]), float(y_range[1])))
-    r0 = int(np.clip(round((ya - t0_full) / dt_ms), 0, n_rows - 1))
-    r1 = int(np.clip(round((yb - t0_full) / dt_ms), r0 + 1, n_rows))
-    crop = np.ascontiguousarray(proc[r0:r1, c0:c1])
-
-    def _sl(name):
-        arr = getattr(obj, name, None)
-        return None if arr is None else np.asarray(arr)[c0:c1]
-
-    dk = dist[c0:c1]
-    t0_crop = t0_full + r0 * dt_ms
-    base_name = getattr(obj, "name", None) or getattr(obj, "label", "viewport")
-    clone = SimpleNamespace(
-        name=f"{base_name} · viewport",
-        n_traces=int(c1 - c0), ns=int(r1 - r0), dt_us=int(obj.dt_us),
-        dist_km=dk, total_km=float(dk[-1] - dk[0]) if dk.size else 0.0,
-        timestamps=list(getattr(obj, "timestamps", []) or [])[c0:c1],
-        lons=_sl("lons"), lats=_sl("lats"), delays=_sl("delays"),
-        water_depth=_sl("water_depth"),
-        # Already-processed data → render with align=False; the time origin is the
-        # crop's first row, so both align branches of time_window yield t0_crop.
-        min_delay=t0_crop, delay_ms=t0_crop, max_delay=t0_crop,
-    )
-    return clone, crop
+    """Delegates to the Qt-free engine (moved to ``gui.export_headless``) so the
+    HQ viewport overlay and the WYSIWYG export crop share one implementation."""
+    from sbp_studio.gui.export_headless import _crop_for_viewport as _impl
+    return _impl(obj, proc, t0_full, x_range, y_range)
 
 
 def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
-                          handler, cancel, picks=None):
+                          handler, cancel, picks=None, view_range=None):
     """Delegates to the extracted Qt-free engine — see
     ``gui.export_headless.render_export_figure`` (the former body of this
     function, moved VERBATIM: same DSP pass, same RAM-capped DPI, same WYSIWYG
     aspect-fit loop). The live SourceHandler maps to a plain ``kind`` string
     ("profile" | "chain" — see SourceHandler.render_kind); everything else is
-    passed through unchanged, so single/batch/pool exports cannot drift."""
+    passed through unchanged, so single/batch/pool exports cannot drift.
+
+    ``view_range`` — the live ViewBox window, forwarded so the SINGLE export can
+    crop to the on-screen zoom (WYSIWYG extent). Batch/pool pass ``None`` and
+    stay full-line."""
     from sbp_studio.gui.export_headless import render_export_figure
     kind = getattr(handler, "render_kind", "profile")
     return render_export_figure(obj, cfg, params, node_cfg, scale_cfg,
-                                align_enabled, kind, cancel, picks=picks)
+                                align_enabled, kind, cancel, picks=picks,
+                                view_range=view_range)
 
 
 class SubTabbedTab(QWidget):
@@ -395,6 +364,10 @@ class SubTabbedTab(QWidget):
         self.controls.export_import_picking_requested.connect(
             self._on_picking_export_import)
         self.controls.scale_changed.connect(self._on_scale_changed)
+        # Live view → UI: a mouse-wheel X-zoom updates the 'Traces/cm' control so
+        # the physical horizontal-scale readout tracks the on-screen zoom (only in
+        # Lock-VE mode — see _on_view_horizontal_scale). Debounced in SeismicView.
+        self._seismic.horizontal_scale_changed.connect(self._on_view_horizontal_scale)
         self.controls.boundaries_toggled.connect(self._on_boundaries_toggled)
         # Initial sync (same idiom as set_image_interpolation below): a
         # checkbox that starts unchecked never fires toggled() on
@@ -520,6 +493,20 @@ class SubTabbedTab(QWidget):
         if obj is None or getattr(obj, "error", None) or getattr(obj, "data", None) is None:
             return None
         return obj
+
+    def _on_view_horizontal_scale(self, tpc: float) -> None:
+        """Live view → UI sync (mouse-wheel X-zoom): reflect the on-screen
+        horizontal density in the 'Traces/cm' control.
+
+        ONLY acts in 'Lock vertical exaggeration' mode: there the vertical scale
+        is fixed, so an X-zoom maps cleanly onto trace density (in free/aspect/
+        hybrid a zoom means something else, so we never fight the user's chosen
+        values). The write is signal-blocked (no re-aspect, no feedback loop); we
+        refresh the DPI readout ourselves only when the value actually moved."""
+        if tpc <= 0 or self.controls.scale_config().get("mode") != "ve":
+            return
+        if self.controls.set_traces_per_cm(tpc):
+            self._update_dpi_estimate()
 
     def _on_scale_changed(self) -> None:
         """Apply the selected scale mode's effective aspect to the on-screen
@@ -794,6 +781,15 @@ class SubTabbedTab(QWidget):
         # so _render_export_figure's picks param is a no-op (see _draw_picks).
         picks = self._seismic.get_picks() if cfg.get("overlay_picks") else []
 
+        # WYSIWYG export extent: snapshot the visible ViewBox window on the GUI
+        # thread (Qt objects aren't thread-safe) so the export honours the user's
+        # current zoom/pan. None when nothing is displayed, or when the whole line
+        # is visible → crop_export_to_view no-ops and the full line is exported
+        # exactly as before (see its docstring).
+        view_range = (self._seismic.current_view_range()
+                      if self._seismic is not None and self._seismic.has_image()
+                      else None)
+
         def job(progress, cancel) -> str:
             from sbp_studio.viz.render import save_figure
             # Lazy-load safety: profiles are header-only stubs and CHAINS assemble
@@ -807,7 +803,7 @@ class SubTabbedTab(QWidget):
             # + decimation-free DPI floor + WYSIWYG aspect fit.
             fig, render_dpi = _render_export_figure(
                 _obj, cfg, params, node_cfg, scale_cfg, align_enabled, handler, cancel,
-                picks=picks)
+                picks=picks, view_range=view_range)
             try:
                 save_figure(fig, out, dpi=render_dpi, fmt=fmt, pdf_page=cfg["pdf_page"])
             except OSError as exc:
