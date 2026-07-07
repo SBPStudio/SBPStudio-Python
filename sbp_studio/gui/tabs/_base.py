@@ -365,10 +365,6 @@ class SubTabbedTab(QWidget):
         self.controls.export_import_picking_requested.connect(
             self._on_picking_export_import)
         self.controls.scale_changed.connect(self._on_scale_changed)
-        # Live view → UI: a mouse-wheel X-zoom updates the 'Traces/cm' control so
-        # the physical horizontal-scale readout tracks the on-screen zoom (only in
-        # Lock-VE mode — see _on_view_horizontal_scale). Debounced in SeismicView.
-        self._seismic.horizontal_scale_changed.connect(self._on_view_horizontal_scale)
         self.controls.boundaries_toggled.connect(self._on_boundaries_toggled)
         # Initial sync (same idiom as set_image_interpolation below): a
         # checkbox that starts unchecked never fires toggled() on
@@ -494,20 +490,6 @@ class SubTabbedTab(QWidget):
         if obj is None or getattr(obj, "error", None) or getattr(obj, "data", None) is None:
             return None
         return obj
-
-    def _on_view_horizontal_scale(self, tpc: float) -> None:
-        """Live view → UI sync (mouse-wheel X-zoom): reflect the on-screen
-        horizontal density in the 'Traces/cm' control.
-
-        ONLY acts in 'Lock vertical exaggeration' mode: there the vertical scale
-        is fixed, so an X-zoom maps cleanly onto trace density (in free/aspect/
-        hybrid a zoom means something else, so we never fight the user's chosen
-        values). The write is signal-blocked (no re-aspect, no feedback loop); we
-        refresh the DPI readout ourselves only when the value actually moved."""
-        if tpc <= 0 or self.controls.scale_config().get("mode") != "ve":
-            return
-        if self.controls.set_traces_per_cm(tpc):
-            self._update_dpi_estimate()
 
     def _on_scale_changed(self) -> None:
         """Apply the selected scale mode's effective aspect to the on-screen

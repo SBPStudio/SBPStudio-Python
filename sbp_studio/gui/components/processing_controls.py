@@ -504,42 +504,13 @@ class ProcessingControls(QWidget):
         self.sld_maxasp.valueChanged.connect(self._on_maxasp_slider)
         self.sp_maxasp.valueChanged.connect(self._on_maxasp_spin)
 
-        # ── Horizontal scale: traces per cm (label, then slider + numeric) ────
-        # Replaces the old px/trace control. STRICTLY horizontal: sets the export
-        # width (n_traces / tpc / 2.54) and the live horizontal density; the
-        # vertical (time) scale is held constant (decoupled — see figsize_for_scale
-        # and SeismicView.set_aspect). Higher = compressed; lower = stretched.
-        #
-        # Performance note: a rigorous VE formula that ties height to this
-        # control's live width was tried and REVERTED — it made VE/hybrid mode
-        # recompute the full vertical geometry on every drag tick, which made
-        # dragging this slider laggy. VE/hybrid deliberately stay decoupled
-        # (fixed GUI_X_SCALE constant, see figsize_for_scale) so this control
-        # stays cheap and instantaneous, at the cost of VE not being perfectly
-        # physically rigorous relative to the chosen trace density.
-        self.cap_tpc = QLabel()
-        self.cap_tpc.setObjectName("sub")
-        v.addWidget(self.cap_tpc)                 # label on its own line, above
-        self.sld_tpc = QSlider(Qt.Orientation.Horizontal)
-        self.sld_tpc.setRange(1, 2000)
-        self.sld_tpc.setSingleStep(1)
-        self.sld_tpc.setPageStep(25)
-        self.sp_tpc = QDoubleSpinBox()
-        self.sp_tpc.setRange(1.0, 2000.0)
-        self.sp_tpc.setDecimals(0)
-        self.sp_tpc.setSingleStep(1.0)
-        self.sp_tpc.setValue(40.0)
-        self.sp_tpc.setMaximumWidth(72)
-        self.sld_tpc.setValue(40)
-        _tpc_row = QHBoxLayout()
-        _tpc_row.setContentsMargins(0, 0, 0, 0)
-        _tpc_row.setSpacing(4)
-        _tpc_row.addWidget(self.sld_tpc, 1)       # slider fills the row width
-        _tpc_row.addWidget(self.sp_tpc, 0)
-        v.addLayout(_tpc_row)
-        self._syncing_tpc = False
-        self.sld_tpc.valueChanged.connect(self._on_tpc_slider)
-        self.sp_tpc.valueChanged.connect(self._on_tpc_spin)
+        # The manual 'Trazas / cm' control was REMOVED (viewport-driven UX): the
+        # horizontal scale is now driven entirely by zooming the section — wheel
+        # over the X axis stretches/compresses traces directly in EVERY mode
+        # (see SeismicView.set_aspect: the ViewBox is never aspect-locked). The
+        # export reads the resulting view; batch exports (no live view) size
+        # their width from the fixed DEFAULT_TRACES_PER_CM constant instead
+        # (see scale_config).
 
         # ── Dynamic export-DPI readout (Part 2) ──────────────────────────────
         # Shows the resolution the export will actually generate for the CURRENT
@@ -565,13 +536,6 @@ class ProcessingControls(QWidget):
             rb.toggled.connect(lambda *_: self._update_scale_mode_enabled())
         for sp in (self.sp_ratio, self.sp_ve, self.sp_maxasp):
             sp.valueChanged.connect(lambda *_: self.scale_changed.emit())
-        # The master Trazas/cm control is intentionally DECOUPLED from VE's
-        # height: VE/hybrid use a fixed constant (GUI_X_SCALE), not the live
-        # width, precisely so dragging this slider is cheap and instant — no
-        # vertical-geometry recompute is triggered by it (see figsize_for_scale
-        # in _render.py for the rationale; rigorous-but-expensive VE math tied
-        # to live width was tried and reverted for performance).
-        self.sp_tpc.valueChanged.connect(lambda *_: self.scale_changed.emit())
         # Set the correct INITIAL enabled state (Free is checked by default, so
         # the other three modes' controls must start disabled, not just on the
         # first toggle).
@@ -832,7 +796,13 @@ class ProcessingControls(QWidget):
         mode ∈ {'free','aspect','ve','hybrid'}; ratio (mode 'aspect'), ve (modes
         've'/'hybrid'), max_aspect (mode 'hybrid'). 'free' has no value of its
         own — it means 'no aspect lock', and the others are reported anyway so
-        the export still has a sane fallback if free's None can't apply."""
+        the export still has a sane fallback if free's None can't apply.
+
+        ``traces_per_cm`` is the FIXED module default now that the manual
+        control is gone (viewport-driven UX): only the headless BATCH export
+        still sizes its figure width from it (no live view exists there); the
+        single export reads the on-screen viewport instead."""
+        from ..tabs._render import DEFAULT_TRACES_PER_CM
         if self.rb_free.isChecked():
             mode = "free"
         elif self.rb_ve.isChecked():
@@ -841,43 +811,12 @@ class ProcessingControls(QWidget):
             mode = "hybrid"
         else:
             mode = "aspect"
-        # layout_mode is FORCED to 'decoupled' (the Layout-mode dropdown was
-        # removed): traces/cm is strictly horizontal, the vertical scale comes
-        # from VE and never changes with the trace spacing (kept cheap/instant
-        # — see the performance note on the traces/cm widget above).
         return dict(mode=mode,
                     ratio=float(self.sp_ratio.value()),
                     ve=float(self.sp_ve.value()),
                     max_aspect=float(self.sp_maxasp.value()),
-                    traces_per_cm=float(self.sp_tpc.value()),
+                    traces_per_cm=float(DEFAULT_TRACES_PER_CM),
                     layout_mode="decoupled")
-
-    def set_traces_per_cm(self, value: float) -> bool:
-        """Programmatically set the horizontal scale (traces/cm) to ``value``
-        WITHOUT emitting ``scale_changed`` — used by the live view→UI sync when a
-        mouse-wheel X-zoom changes the on-screen density (see
-        SubTabbedTab._on_view_horizontal_scale).
-
-        Signals are blocked so this never re-triggers the preview re-aspect or a
-        feedback loop; both the slider and the spin are updated together. Clamped
-        to the control's range and rounded to its integer step. Returns True when
-        the displayed value actually changed (so the caller can refresh the DPI
-        readout only when needed), False when it was already there."""
-        v = int(round(max(self.sp_tpc.minimum(),
-                          min(self.sp_tpc.maximum(), float(value)))))
-        if v == int(round(self.sp_tpc.value())):
-            return False
-        self._syncing_tpc = True
-        b_spin = self.sp_tpc.blockSignals(True)
-        b_sld = self.sld_tpc.blockSignals(True)
-        try:
-            self.sp_tpc.setValue(float(v))
-            self.sld_tpc.setValue(v)
-        finally:
-            self.sp_tpc.blockSignals(b_spin)
-            self.sld_tpc.blockSignals(b_sld)
-            self._syncing_tpc = False
-        return True
 
     def px_per_trace(self) -> float:
         """Live-preview horizontal detail (px per trace) — a fixed value now that
@@ -916,22 +855,6 @@ class ProcessingControls(QWidget):
         self._syncing_deform = True
         self.sld_deform.setValue(int(round(val * self._DEF_SCALE)))
         self._syncing_deform = False
-
-    # ── Traces-per-cm slider ↔ spin sync ─────────────────────────────────────
-
-    def _on_tpc_slider(self, val: int) -> None:
-        if self._syncing_tpc:
-            return
-        self._syncing_tpc = True
-        self.sp_tpc.setValue(float(val))
-        self._syncing_tpc = False
-
-    def _on_tpc_spin(self, val: float) -> None:
-        if self._syncing_tpc:
-            return
-        self._syncing_tpc = True
-        self.sld_tpc.setValue(int(round(val)))
-        self._syncing_tpc = False
 
     # ── VE slider ↔ spin sync ────────────────────────────────────────────────
 
@@ -974,9 +897,7 @@ class ProcessingControls(QWidget):
         UI cross-talk. The Hybrid mode shares the VE slider+spin with VE mode
         (it locks/edits the SAME 'vertical exaggeration' value, then caps the
         resulting aspect with its own max-aspect control), so VE's controls are
-        enabled for EITHER mode. Free has no controls of its own. The master
-        horizontal-scale control is NOT touched here — it stays enabled in
-        every mode (wired once in __init__, never disabled)."""
+        enabled for EITHER mode. Free has no controls of its own."""
         is_aspect = self.rb_aspect.isChecked()
         is_ve = self.rb_ve.isChecked()
         is_hybrid = self.rb_hybrid.isChecked()
@@ -1017,7 +938,6 @@ class ProcessingControls(QWidget):
         self.sp_ratio.setValue(3.0)        # syncs the deformation slider too
         self.sp_ve.setValue(67.0)
         self.sp_maxasp.setValue(5.0)
-        self.sp_tpc.setValue(40.0)         # syncs the traces/cm slider too
         self.scale_changed.emit()
 
     def aspect(self) -> Optional[float]:
@@ -1212,12 +1132,6 @@ class ProcessingControls(QWidget):
         self.sp_ratio.setToolTip(self.sld_deform.toolTip())
         self.btn_scale_reset.setText(self.tr("↺ Reset"))
         self.btn_scale_reset.setToolTip(self.tr("Reset aspect settings"))
-        self.cap_tpc.setText(self.tr("Traces / cm (horizontal scale)"))
-        self.sp_tpc.setToolTip(self.tr(
-            "Horizontal trace spacing: higher = more traces per cm (compressed), "
-            "lower = stretched. Strictly horizontal — the vertical (time) scale "
-            "never changes."))
-        self.sld_tpc.setToolTip(self.sp_tpc.toolTip())
         self.btn_render.setText(self.tr("⟳  Render Full"))
         self.btn_render.setToolTip(self.tr("Re-render the whole seismic line."))
         self.btn_render_viewport.setText(self.tr("🔍 Viewport HQ"))

@@ -134,7 +134,7 @@ class TestEffectiveAspect:
         assert effective_aspect(src, cfg) == pytest.approx(w / h, rel=1e-12)
 
 
-# ── 5. ProcessingControls widget: original names restored, no debounce ─────
+# ── 5. ProcessingControls widget: viewport-driven UX (no manual Traces/cm) ──
 
 class TestTracesPerCmControl:
     """Qt widget construction — the math above is the load-bearing check.
@@ -145,42 +145,39 @@ class TestTracesPerCmControl:
     underlying C++ object got deleted between tests) — a pytest/PyQt test-
     isolation artifact, not a bug in this code."""
 
-    def test_widget_reverted_correctly(self):
+    def test_widget_matches_viewport_driven_ux(self):
         pytest.importorskip("PyQt6")
         from PyQt6.QtWidgets import QApplication
         app = QApplication.instance() or QApplication([])
         from sbp_studio.gui.components.processing_controls import ProcessingControls
+        from sbp_studio.gui.tabs._render import DEFAULT_TRACES_PER_CM
 
         pc = ProcessingControls()
 
-        # ── Names/keys reverted ──
-        assert hasattr(pc, "sld_tpc") and hasattr(pc, "sp_tpc")
-        assert not hasattr(pc, "sld_hscale") and not hasattr(pc, "sp_hscale")
-        assert pc.scale_config()["traces_per_cm"] == pytest.approx(40.0)
-        pc.sp_tpc.setValue(100.0)
-        assert pc.scale_config()["traces_per_cm"] == pytest.approx(100.0)
+        # ── The manual 'Traces / cm' control is GONE (viewport-driven UX):
+        # the horizontal scale is set by wheel-zooming the section axes, in
+        # every mode. Only the fixed batch-sizing constant remains.
+        assert not hasattr(pc, "sld_tpc") and not hasattr(pc, "sp_tpc")
+        assert not hasattr(pc, "cap_tpc")
+        assert not hasattr(pc, "set_traces_per_cm")
+        assert pc.scale_config()["traces_per_cm"] == pytest.approx(
+            DEFAULT_TRACES_PER_CM)
 
-        # ── Debounce fully removed ──
-        assert not hasattr(pc, "_scale_debounce_timer")
-        assert not hasattr(pc, "_on_scale_input_changed")
-
-        # ── scale_changed fires synchronously, no QTimer wait needed ──
+        # ── scale_changed still fires synchronously from the mode values ──
         received = []
         pc.scale_changed.connect(lambda: received.append(True))
-        pc.sp_tpc.setValue(123.0)
+        pc.sp_ve.setValue(100.0)
         assert len(received) == 1
-        pc.sld_tpc.setValue(7)
-        assert len(received) == 2
 
         # ── Good parts kept: Free default + strict state machine ──
-        assert pc.rb_free.isChecked()
+        pc2_defaults_free = pc.rb_free.isChecked()
+        # (sp_ve edit above did not switch the MODE — only its value.)
+        assert pc2_defaults_free
         assert not pc.sld_deform.isEnabled()
         assert not pc.sld_ve.isEnabled()
         assert not pc.sld_maxasp.isEnabled()
-        assert pc.sld_tpc.isEnabled()       # master control, always on
 
         pc.rb_hybrid.setChecked(True)
         assert pc.sld_ve.isEnabled()
         assert pc.sld_maxasp.isEnabled()
         assert not pc.sld_deform.isEnabled()
-        assert pc.sld_tpc.isEnabled()

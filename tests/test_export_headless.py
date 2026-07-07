@@ -435,25 +435,6 @@ class TestCanvasSafetyCap:
         assert hard_dpi_cap((4000.0, 1300.0), 100.0) < 50
 
 
-# ── Issue 2: traces/cm ↔ on-screen zoom conversion (pure, Qt-free) ─────────────
-
-class TestTracesPerCmFormula:
-    def test_matches_physical_definition(self):
-        from sbp_studio.gui.tabs._render import traces_per_cm_on_screen
-        # 200 traces across 800 logical px at 96 dpi → 800/96*2.54 = 21.17 cm.
-        assert traces_per_cm_on_screen(200, 800, 96) == pytest.approx(
-            200 / (800 / 96 * 2.54))
-
-    def test_zoom_in_lowers_density(self):
-        """Zooming in (fewer visible traces over the same pixel width) LOWERS
-        traces/cm — matching figsize_for_scale's 'lower tpc = stretched'."""
-        from sbp_studio.gui.tabs._render import traces_per_cm_on_screen
-        wide = traces_per_cm_on_screen(200, 800, 96)
-        zoomed = traces_per_cm_on_screen(50, 800, 96)
-        assert zoomed < wide
-
-    def test_degenerate_inputs_return_zero(self):
-        from sbp_studio.gui.tabs._render import traces_per_cm_on_screen
-        assert traces_per_cm_on_screen(0, 800, 96) == 0.0
-        assert traces_per_cm_on_screen(200, 0, 96) == 0.0
-        assert traces_per_cm_on_screen(200, 800, 0) == 0.0
+# The traces/cm ↔ zoom sync (traces_per_cm_on_screen + its tests) was removed
+# with the manual 'Traces / cm' control: the viewport is the scale authority
+# now (universal axis-wheel zoom), so there is nothing to sync a widget to.

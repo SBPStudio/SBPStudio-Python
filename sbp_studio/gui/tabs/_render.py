@@ -164,19 +164,13 @@ def compute_figsize(source: Any, dpi: int, x_scale: Optional[float],
 GUI_X_SCALE = 2.0
 GUI_PX_PER_TRACE = 20.0
 
-# Horizontal-scale control: figure width derives from the physical trace spacing
-# (traces per cm), DPI-independent. Default chosen to land near the historical
-# px/trace width for a typical line; the slider lets the user stretch/compress.
-#
-# PERFORMANCE NOTE: a "rigorous" VE formula that derived height from this
-# control's actual width (h = VE * w * depth_km / total_km, so VE stays a true
-# physical ratio regardless of trace density) was implemented and then
-# REVERTED at the user's explicit request — it made every drag tick on this
-# slider recompute the full VE/hybrid vertical geometry, which was too slow/
-# laggy in practice. VE/hybrid height is therefore intentionally DECOUPLED
-# from this control again (see the ``else`` branch in figsize_for_scale,
-# which always uses the fixed GUI_X_SCALE constant) so dragging this slider
-# stays cheap: only the width changes, never the height.
+# Batch-export horizontal scale: figure width derives from the physical trace
+# spacing (traces per cm), DPI-independent. The manual UI control for this was
+# REMOVED (viewport-driven UX: the single export reads the on-screen viewport
+# instead — wheel over an axis zooms it directly in every scale mode); this
+# constant remains the width rule for HEADLESS batch/pool exports, where no
+# live view exists. VE/hybrid height stays decoupled from it (fixed
+# GUI_X_SCALE — see figsize_for_scale).
 DEFAULT_TRACES_PER_CM = 40.0
 _CM_PER_IN = 2.54
 
@@ -330,23 +324,6 @@ def effective_export_dpi(figsize: tuple, data_shape: tuple, requested_dpi: int,
         return req
     need = max(src_w / w_in, src_h / h_in)        # dpi to reach native in both axes
     return int(min(max(req, math.ceil(need)), ceiling))
-
-
-def traces_per_cm_on_screen(visible_traces: float, viewport_px: float,
-                            dpi: float) -> float:
-    """Physical horizontal density (traces per cm) currently shown on screen.
-
-    ``visible_traces`` traces span ``viewport_px`` logical pixels of the data
-    ViewBox, on a display of ``dpi`` logical dots-per-inch. Physical width in cm
-    is ``viewport_px / dpi * 2.54``, so the density is ``visible_traces`` over
-    that. Pure + DPI-derived so the live SeismicView can convert a mouse-wheel
-    X-zoom into the SAME 'traces/cm' unit the export width uses
-    (``figsize_for_scale``: ``w = n_traces / tpc / 2.54``), keeping the control
-    in sync with the zoom. Returns 0.0 for degenerate input (caller skips)."""
-    if visible_traces <= 0 or viewport_px <= 0 or dpi <= 0:
-        return 0.0
-    width_cm = viewport_px / dpi * _CM_PER_IN
-    return (visible_traces / width_cm) if width_cm > 0 else 0.0
 
 
 def compute_section(obj: Any, data: np.ndarray, params: dict,

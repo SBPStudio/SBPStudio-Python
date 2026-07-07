@@ -217,14 +217,6 @@ class SeismicView(QWidget):
     # trace fractions and stores them in the selected WaterMuteNode's params.
     mute_horizon_edited = pyqtSignal(list)
 
-    # Emitted (debounced) with the on-screen horizontal density in traces per
-    # physical cm, computed from the ViewBox after a pan/zoom settles. The tab
-    # reflects it into the 'Traces/cm' control while Lock-VE mode is active, so a
-    # mouse-wheel X-zoom keeps that physical-scale readout in sync (see
-    # SubTabbedTab._on_view_horizontal_scale). Debounced + single float → never a
-    # per-frame cost while scrolling.
-    horizontal_scale_changed = pyqtSignal(float)
-
     # Viewport-settle debounce: DSP recompute fires this long after the LAST
     # pan/zoom event, so dragging never triggers a pipeline run mid-gesture.
     # 180 ms: long enough that a continuous drag (events firing far faster
@@ -241,11 +233,6 @@ class SeismicView(QWidget):
     # the map marker, imperceptible lag for a navigation overview while the
     # seismic view itself still pans natively at full frame rate.
     VT_THROTTLE_MS = 60
-
-    # Traces/cm sync debounce: the on-screen horizontal density is recomputed and
-    # broadcast this long after the LAST pan/zoom event, so aggressive mouse-wheel
-    # scrolling never recomputes it per frame — it fires once, on the settle.
-    TPC_SYNC_MS = 150
 
     # Max visible traces drawn as live wiggle before auto-falling back to the
     # raster base (keeps pan/zoom fluid). Mirrors the export budget
@@ -438,14 +425,6 @@ class SeismicView(QWidget):
         self._vt_last_value: Optional[Tuple[int, int]] = None  # last emitted
         self._vt_last_emit: float = 0.0                       # perf_counter s
 
-        # Traces/cm sync debounce (see TPC_SYNC_MS + horizontal_scale_changed):
-        # restarted on every pan/zoom, so the density is broadcast only once the
-        # gesture settles — never per wheel-tick.
-        self._tpc_timer = QTimer(self)
-        self._tpc_timer.setSingleShot(True)
-        self._tpc_timer.setInterval(self.TPC_SYNC_MS)
-        self._tpc_timer.timeout.connect(self._emit_horizontal_scale)
-
         # Cross-module sync (Link Views) state: set by the owning tab whenever
         # the "Link Views" toggle changes (see set_link_views_enabled). Drives
         # whether the live hover marker/anomaly menu action are meaningful —
@@ -546,34 +525,43 @@ class SeismicView(QWidget):
         self.set_aspect(aspect)
 
     def set_aspect(self, aspect: Optional[float]) -> None:
-        """Lock the data box to a W:H ratio (None = free).
+        """Apply a scale-mode PRESET to the view (None = Libre / free).
 
-        STRICT vertical preservation: when an aspect is set we anchor the VERTICAL
-        (time) extent to the full record and let the locked aspect derive the
-        horizontal window. This pins ms-per-pixel, so changing the horizontal
-        scale (traces/cm → a different aspect) compresses/spreads the traces
-        horizontally WITHOUT ever rescaling time. ``autoRange`` is used only in the
-        free (unlocked) case, since it would letterbox and shrink the vertical when
-        the figure is wide."""
+        Universal axis-wheel zoom: the ViewBox is NEVER aspect-locked — in
+        every mode, scrolling the wheel over the X or Y axis zooms that axis
+        alone, and scrolling over the section zooms both. The viewport is the
+        scale authority; the export reads the resulting view, not a lock.
+
+        A non-None ``aspect`` (Aspect / VE / Hybrid mode) is applied as a
+        ONE-SHOT fit reproducing exactly the geometry the old hard lock
+        produced: the vertical (time) extent is anchored to the full record,
+        and the visible X window is sized so the full data box reads as the
+        target W:H proportion at the current widget size. Afterwards the user
+        is free to re-scale each axis; re-selecting a mode (or editing its
+        value) re-applies the fit."""
         self._aspect = aspect
         vb = self.plot.getViewBox()
+        vb.setAspectLocked(False)
         d0, d1, t0, t1 = self._rect
         x_ext, y_ext = (d1 - d0), (t1 - t0)
         if aspect and x_ext > 0 and y_ext > 0:
-            vb.setAspectLocked(True, ratio=aspect * y_ext / x_ext)
             lo_t, hi_t = (t0, t1) if t1 >= t0 else (t1, t0)
-            vb.setYRange(lo_t, hi_t, padding=0)   # anchor time; X WIDTH follows the lock
-            # The lock derives X's width from Y + the widget's pixel aspect, but
-            # never recenters X's pan position — so loading a brand-new source
-            # (a different distance domain) would otherwise stay parked over the
-            # PREVIOUS file's old window. Recenter X on the new data's midpoint;
-            # passing only xRange (no yRange) leaves the just-set Y range intact.
+            vb.setYRange(lo_t, hi_t, padding=0)   # anchor time to the full record
+            # Pixel-true fit: with the full record vb_h px tall, showing x_vis
+            # of the total x_ext makes the full data box (x_ext/x_vis)·vb_w px
+            # wide — solve for the target data-box proportion `aspect`.
+            vb_w = max(1.0, float(vb.width()))
+            vb_h = max(1.0, float(vb.height()))
+            x_vis = x_ext * vb_w / (vb_h * aspect)
+            # Preserve the user's pan position when it is over the data;
+            # recenter on the data midpoint otherwise (fresh source load).
             (cur_x0, cur_x1), _ = vb.viewRange()
-            half_width = (cur_x1 - cur_x0) / 2.0
-            x_center = (d0 + d1) / 2.0
-            vb.setXRange(x_center - half_width, x_center + half_width, padding=0)
+            x_center = (cur_x0 + cur_x1) / 2.0
+            if not (d0 <= x_center <= d1):
+                x_center = (d0 + d1) / 2.0
+            vb.setXRange(x_center - x_vis / 2.0, x_center + x_vis / 2.0,
+                         padding=0)
         else:
-            vb.setAspectLocked(False)
             self.plot.autoRange()
 
     def has_image(self) -> bool:
@@ -1500,31 +1488,6 @@ class SeismicView(QWidget):
         self._vt_last_value = val
         self.visible_traces_changed.emit(*val)
 
-    def _emit_horizontal_scale(self) -> None:
-        """Compute the on-screen horizontal density (traces per physical cm) from
-        the current ViewBox and broadcast it via ``horizontal_scale_changed``.
-
-        Cheap and debounced (runs only on the settle timer, never per frame): one
-        searchsorted maps the visible X-range to a trace count, then
-        ``traces_per_cm_on_screen`` converts it against the data ViewBox's pixel
-        width and the display's logical DPI. The tab decides whether to apply it
-        (only in Lock-VE mode), so this stays mode-agnostic."""
-        dist = self._dist_km
-        if dist is None or dist.size < 2:
-            return
-        (x0, x1), _ = self.plot.getViewBox().viewRange()
-        x_min, x_max = (x0, x1) if x0 <= x1 else (x1, x0)
-        n = dist.size
-        t0 = max(0, min(int(np.searchsorted(dist, x_min, side="left")), n - 1))
-        t1 = max(t0 + 1, min(int(np.searchsorted(dist, x_max, side="right")), n))
-        visible_traces = t1 - t0
-        vb_px = float(self.plot.getViewBox().sceneBoundingRect().width())
-        dpi_x = float(self.logicalDpiX() or 96)
-        from sbp_studio.gui.tabs._render import traces_per_cm_on_screen
-        tpc = traces_per_cm_on_screen(visible_traces, vb_px, dpi_x)
-        if tpc > 0 and math.isfinite(tpc):
-            self.horizontal_scale_changed.emit(float(tpc))
-
     def _on_range_changed(self, _vb, ranges) -> None:
         """Schedule a display-buffer re-slice (or a preview refresh) on pan/zoom."""
         # Ephemeral HQ overlay: any GENUINE view change (a range different from the
@@ -1538,8 +1501,6 @@ class SeismicView(QWidget):
                 self.clear_hq_overlay()
         # Immediate (un-debounced) trace-index broadcast for the navigation map.
         self._emit_visible_traces(ranges)
-        # Debounced traces/cm sync (restart on every event → fires once on settle).
-        self._tpc_timer.start()
         if self._preview_mode:
             # SETTLE debounce: restart on every event so the DSP recompute only
             # fires once the viewport stops moving. During the drag PyQtGraph
