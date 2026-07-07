@@ -591,19 +591,26 @@ class SeismicView(QWidget):
         avoid a clipping mismatch with what's on screen."""
         return self._vmin, self._vmax
 
-    def viewport_inches(self) -> Optional[tuple]:
-        """The data ViewBox's PHYSICAL on-screen size as ``(w_in, h_in)``, from
-        its pixel size and the display's logical DPI — the dynamic 'Auto (match
-        view)' export page (see export_headless.render_export_figure's
-        ``view_figsize``). ``None`` when the widget has no meaningful geometry
-        yet (not laid out)."""
+    def current_view_scale(self) -> Optional[tuple]:
+        """The viewport's PHYSICAL scale per axis: ``(in_per_km, in_per_ms)``.
+
+        The single thing the live view contributes to an export: how many
+        physical on-screen inches one km (X) and one ms (Y) currently occupy —
+        the viewport as a SCALE AUTHOR (see export_headless._page_from_scale;
+        the export applies this scale to the FULL data extent, never cropping).
+        From the data-ViewBox pixel size, the display's logical DPI, and the
+        current view ranges. ``None`` when the widget has no meaningful
+        geometry or the view is degenerate."""
         vb = self.plot.getViewBox()
         w_px, h_px = float(vb.width()), float(vb.height())
         dpi_x = float(self.logicalDpiX() or 96.0)
         dpi_y = float(self.logicalDpiY() or 96.0)
-        if w_px < 2 or h_px < 2 or dpi_x <= 0 or dpi_y <= 0:
+        (x0, x1), (y0, y1) = vb.viewRange()
+        view_km, view_ms = abs(float(x1) - float(x0)), abs(float(y1) - float(y0))
+        if w_px < 2 or h_px < 2 or dpi_x <= 0 or dpi_y <= 0 \
+                or view_km <= 0 or view_ms <= 0:
             return None
-        return (w_px / dpi_x, h_px / dpi_y)
+        return (w_px / dpi_x / view_km, h_px / dpi_y / view_ms)
 
     def set_image_interpolation(self, mode: str) -> None:
         """Toggle pixel-scaling smoothing for the live raster (and the HQ overlay)

@@ -47,6 +47,24 @@ def _payload(path, out, node_cfg=()):
                 align_enabled=False)
 
 
+def _expected_page(prof, cfg, view_scale):
+    """Independent derivation of the 'Auto' page: FULL extents x scale."""
+    import numpy as np
+    d = np.asarray(prof.dist_km, dtype=float)
+    data_km = float(d[-1] - d[0])
+    rec_ms = prof.ns * prof.dt_us / 1000.0         + float(cfg.get("margin_top") or 0.0)         + float(cfg.get("margin_bottom") or 0.0)
+    return (max(0.5, data_km * view_scale[0]), max(0.5, rec_ms * view_scale[1]))
+
+
+def _scale_for_page(prof, cfg, w_in, h_in):
+    """The (in/km, in/ms) view scale that yields a w_in x h_in page for prof."""
+    import numpy as np
+    d = np.asarray(prof.dist_km, dtype=float)
+    data_km = float(d[-1] - d[0])
+    rec_ms = prof.ns * prof.dt_us / 1000.0         + float(cfg.get("margin_top") or 0.0)         + float(cfg.get("margin_bottom") or 0.0)
+    return (w_in / data_km, h_in / rec_ms)
+
+
 @pytest.fixture
 def profile_file(tmp_path):
     p = str(tmp_path / "hp.sgy")
@@ -221,7 +239,7 @@ class TestDivideMemBudget:
         assert "mem_budget_gb" not in cfg          # copy, not mutation
 
 
-# ── Issue 1: WYSIWYG export extent (crop the file to the live viewport) ────────
+# ── Viewport crop engine: HQ-overlay ONLY (export never crops — see below) ────
 
 def _synthetic_obj():
     """A duck-typed profile stand-in with a monotonic distance axis — enough for
@@ -238,97 +256,25 @@ def _synthetic_obj():
     return obj, data
 
 
-class TestCropExportToView:
-    def test_full_view_is_a_noop_identity(self):
-        """A view covering the whole line returns the SAME object + array (no
-        clone, no copy) — this is what keeps a full-line export byte-identical to
-        the pre-feature behaviour and the batch/pool paths untouched."""
-        from sbp_studio.gui.export_headless import crop_export_to_view
+class TestViewportCropForHQ:
+    """_crop_for_viewport backs ONLY the in-viewer HQ overlay. The former
+    export-extent cropping (crop_export_to_view) was REMOVED by field
+    directive — the viewport authors the SCALE, never the extent."""
+
+    def test_crop_engine_slices_both_axes(self):
+        from sbp_studio.gui.export_headless import _crop_for_viewport
         obj, data = _synthetic_obj()
-        o2, d2, p2 = crop_export_to_view(
-            obj, data, 0.0, (-1.0, 11.0), (-10.0, 10_000.0), None)
-        assert o2 is obj and d2 is data and p2 is None
+        clone, crop = _crop_for_viewport(obj, data, 0.0, (2.0, 4.0), (10.0, 40.0))
+        assert crop.shape[0] < data.shape[0] and crop.shape[1] < data.shape[1]
+        assert clone.n_traces == crop.shape[1] and clone.ns == crop.shape[0]
+        assert clone.dist_km[0] >= 2.0 - 1e-6 and clone.dist_km[-1] <= 4.0 + 1e-6
 
-    def test_zoomed_view_crops_both_axes(self):
-        from sbp_studio.gui.export_headless import crop_export_to_view
-        obj, data = _synthetic_obj()
-        o2, d2, _ = crop_export_to_view(
-            obj, data, 0.0, (2.0, 4.0), (10.0, 40.0), None)
-        assert d2.shape[0] < data.shape[0] and d2.shape[1] < data.shape[1]
-        # Clone geometry is consistent with the cropped matrix.
-        assert o2.n_traces == d2.shape[1] and o2.ns == d2.shape[0]
-        assert 0.0 < o2.total_km < 10.0
-        # Distance axis sliced to the window (~2..4 km).
-        assert o2.dist_km[0] >= 2.0 - 1e-6 and o2.dist_km[-1] <= 4.0 + 1e-6
-
-    def test_picks_reindexed_and_filtered(self):
-        """Picks shift by the crop's left column and those outside the crop's
-        column/time window are dropped (so overlay picks land correctly on a
-        zoomed export instead of clamping to the edge)."""
-        from types import SimpleNamespace
-        from sbp_studio.gui.export_headless import crop_export_to_view
-        obj, data = _synthetic_obj()
-        picks = [
-            SimpleNamespace(trace_index=5, time_ms=20.0, id="left_out"),   # x < 2km
-            SimpleNamespace(trace_index=60, time_ms=20.0, id="inside"),    # inside
-            SimpleNamespace(trace_index=60, time_ms=90.0, id="time_out"),  # t > window
-        ]
-        o2, d2, p2 = crop_export_to_view(
-            obj, data, 0.0, (2.0, 4.0), (10.0, 40.0), picks)
-        kept = {p.id for p in p2}
-        assert kept == {"inside"}
-        inside = next(p for p in p2 if p.id == "inside")
-        assert 0 <= inside.trace_index < d2.shape[1]     # re-indexed into the crop
-
-    def test_render_export_full_view_matches_no_view(self, profile_file, tmp_path):
-        """End-to-end byte-identity: rendering with a full-cover view_range yields
-        the EXACT same file as passing no view_range — the WYSIWYG hook cannot
-        regress the full-line export (or the batch/pool paths that pass None)."""
-        import numpy as np
-        from sbp_studio.core import load_profile
-        from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
-        from sbp_studio.viz.render import save_figure
-        p0 = load_profile(profile_file, load_traces=True)
-        d = np.asarray(p0.dist_km, dtype=float)
-        full_view = ((float(d.min()) - 1.0, float(d.max()) + 1.0), (-1e6, 1e6))
-        digests = {}
-        for tag, view in (("none", None), ("full", full_view)):
-            prof = load_profile(profile_file, load_traces=True)
-            fig, dpi = render_export_figure(
-                prof, _cfg(), _params(), [], _scale_cfg(), False, "profile",
-                _NoOpCancel(), view_range=view)
-            out = str(tmp_path / f"{tag}.png")
-            save_figure(fig, out, dpi=dpi, fmt="png", pdf_page="auto")
-            fig.clear()
-            digests[tag] = open(out, "rb").read()
-        assert digests["none"] == digests["full"]
-
-    def test_render_export_zoomed_view_shrinks_figure(self, tmp_path):
-        """A genuinely zoomed view_range crops the trace span, so with a
-        traces/cm scale the exported figure is physically NARROWER than the
-        full-line export — proof the crop reaches the render, on a deterministic
-        geometric assertion (not pixel content)."""
-        import numpy as np
-        from sbp_studio.core import load_profile
-        from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
-        big = str(tmp_path / "big.sgy")
-        make_synthetic_segy(big, n_traces=600, ns=192)
-        # Horizontal scale tied to trace count → width = n_traces / tpc / 2.54.
-        scale_cfg = dict(layout_mode="decoupled", mode="aspect", ratio=3.0,
-                         traces_per_cm=20.0)
-        p0 = load_profile(big, load_traces=True)
-        d = np.asarray(p0.dist_km, dtype=float)
-        lo, hi = float(d.min()), float(d.max())
-        zoom = ((lo + 0.25 * (hi - lo), lo + 0.55 * (hi - lo)), (-1e6, 1e6))
-        widths = {}
-        for tag, view in (("full", None), ("zoom", zoom)):
-            prof = load_profile(big, load_traces=True)
-            fig, _dpi = render_export_figure(
-                prof, _cfg(), _params(), [], scale_cfg, False, "profile",
-                _NoOpCancel(), view_range=view)
-            widths[tag] = float(fig.get_size_inches()[0])
-            fig.clear()
-        assert widths["zoom"] < widths["full"]
+    def test_extent_cropping_is_gone_from_the_export(self):
+        """Regression pin for the field workflow: zooming must never crop the
+        exported data. The extent-crop entry point no longer exists."""
+        import sbp_studio.gui.export_headless as EH
+        assert not hasattr(EH, "crop_export_to_view")
+        assert not hasattr(EH, "_shift_picks")
 
 
 # ── Uncompromising quality: NO hidden pixel ceiling; the budget is the law ────
@@ -358,15 +304,16 @@ class TestUncompromisingQuality:
         from sbp_studio.gui.tabs._render import (dpi_for_budget,
                                                  effective_export_dpi)
         prof = load_profile(profile_file, load_traces=True)
-        view_figsize = (10.0, 6.0)
         cfg = dict(_cfg(), paper_size="Auto", mem_budget_gb=6.0)
+        view_scale = (2.0, 0.5)                  # in/km, in/ms
         fig, render_dpi = render_export_figure(
             prof, cfg, _params(), [], _scale_cfg(), False, "profile",
-            _NoOpCancel(), view_figsize=view_figsize)
+            _NoOpCancel(), view_scale=view_scale)
         fig.clear()
-        expect = effective_export_dpi(view_figsize, (prof.ns, prof.n_traces),
+        figsize = _expected_page(prof, cfg, view_scale)
+        expect = effective_export_dpi(figsize, (prof.ns, prof.n_traces),
                                       int(cfg["dpi"]))
-        cap = dpi_for_budget(view_figsize, 6.0)
+        cap = dpi_for_budget(figsize, 6.0)
         if cap is not None and expect > cap:
             expect = max(50, cap)
         assert render_dpi == expect
@@ -383,7 +330,7 @@ class TestUncompromisingQuality:
                        mem_budget_gb=budget)
             fig, render_dpi = render_export_figure(
                 prof, cfg, _params(), [], _scale_cfg(), False, "profile",
-                _NoOpCancel(), view_figsize=(3.0, 2.0))
+                _NoOpCancel(), view_scale=_scale_for_page(prof, cfg, 3.0, 2.0))
             fig.clear()
             dpis[budget] = render_dpi
         assert dpis[64.0] > dpis[0.5]    # 0.5 GB clamps below 2400; 64 GB doesn't
@@ -398,22 +345,22 @@ class TestUncompromisingQuality:
 # ── Field triage: every export logs its view decision, unconditionally ─────────
 
 class TestViewDecisionLogging:
-    """One line in app.log per export states which extent path ran (cropped /
-    full view / no view_range) — the instrument that settles any future 'the
-    export ignored my zoom' report from the log alone. core.logger sets the
-    sbp_studio root logger propagate=False (records go only to app.log), so the
-    tests re-enable propagation for caplog to see the records."""
+    """One line in app.log per export states which SIZING path ran (fixed
+    paper / full line at the on-screen scale / formula) — the field-triage
+    instrument. core.logger sets the sbp_studio root logger propagate=False
+    (records go only to app.log), so the tests re-enable propagation."""
 
     def _messages(self, caplog):
         return [r.getMessage() for r in caplog.records]
 
-    def _render(self, path, view):
+    def _render(self, path, cfg_extra=None, view_scale=None):
         from sbp_studio.core import load_profile
         from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
         prof = load_profile(path, load_traces=True)
+        cfg = dict(_cfg(), **(cfg_extra or {}))
         fig, _ = render_export_figure(
-            prof, _cfg(), _params(), [], _scale_cfg(), False, "profile",
-            _NoOpCancel(), view_range=view)
+            prof, cfg, _params(), [], _scale_cfg(), False, "profile",
+            _NoOpCancel(), view_scale=view_scale)
         fig.clear()
 
     @pytest.fixture(autouse=True)
@@ -421,69 +368,57 @@ class TestViewDecisionLogging:
         import logging
         monkeypatch.setattr(logging.getLogger("sbp_studio"), "propagate", True)
 
-    def test_no_view_range_logged(self, profile_file, caplog):
+    def test_formula_path_logged(self, profile_file, caplog):
         import logging
         with caplog.at_level(logging.INFO, "sbp_studio.gui.export_headless"):
-            self._render(profile_file, None)
-        assert any("no view_range supplied" in m for m in self._messages(caplog))
+            self._render(profile_file)
+        assert any("formula figsize" in m for m in self._messages(caplog))
 
-    def test_full_view_no_crop_logged(self, profile_file, caplog):
+    def test_view_scale_path_logged(self, profile_file, caplog):
         import logging
         with caplog.at_level(logging.INFO, "sbp_studio.gui.export_headless"):
-            self._render(profile_file, ((-1e9, 1e9), (-1e9, 1e9)))
-        assert any("no crop" in m for m in self._messages(caplog))
-
-    def test_crop_bounds_logged(self, profile_file, caplog):
-        import logging
-        import numpy as np
-        from sbp_studio.core import load_profile
-        d = np.asarray(load_profile(profile_file).dist_km, dtype=float)
-        lo, hi = float(d.min()), float(d.max())
-        zoom = ((lo + 0.3 * (hi - lo), lo + 0.7 * (hi - lo)), (-1e9, 1e9))
-        with caplog.at_level(logging.INFO, "sbp_studio.gui.export_headless"):
-            self._render(profile_file, zoom)
-        assert any("cropped to the on-screen window" in m
+            self._render(profile_file, view_scale=(2.0, 0.5))
+        assert any("FULL line at the on-screen scale" in m
                    for m in self._messages(caplog))
 
+    def test_paper_path_logged(self, profile_file, caplog):
+        import logging
+        with caplog.at_level(logging.INFO, "sbp_studio.gui.export_headless"):
+            self._render(profile_file, cfg_extra={"paper_size": "A4"},
+                         view_scale=(2.0, 0.5))
+        assert any("fixed paper A4" in m for m in self._messages(caplog))
 
-# ── Dynamic paper: 'Auto (match view)' page vs explicit sheets vs formula ──────
 
 class TestDynamicPaper:
     """Figsize priority in render_export_figure: explicit paper (A4/A3/A0) >
-    live viewport inches (Auto) > figsize_for_scale formula (batch/pool). The
-    'A4 trap' regression pins: an Auto export must NEVER be squeezed onto a
-    fixed sheet."""
+    FULL line at the viewport scale (Auto) > figsize_for_scale formula."""
 
-    def _fig_size(self, path, cfg_extra, view_figsize=None):
+    def _fig_size(self, path, cfg_extra, view_scale=None):
         from sbp_studio.core import load_profile
         from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
         prof = load_profile(path, load_traces=True)
         cfg = dict(_cfg(), **cfg_extra)
         fig, _dpi = render_export_figure(
             prof, cfg, _params(), [], _scale_cfg(), False, "profile",
-            _NoOpCancel(), view_figsize=view_figsize)
+            _NoOpCancel(), view_scale=view_scale)
         size = tuple(fig.get_size_inches())
         fig.clear()
         return size
 
-    def test_auto_page_takes_viewport_inches(self, profile_file):
-        """'Auto' + a live viewport → the page IS the viewport. The WYSIWYG
-        aspect-fit loop may refine the HEIGHT (decorations), but the width is
-        the viewport's, exactly — never a fixed sheet's."""
-        w, _h = self._fig_size(profile_file, {"paper_size": "Auto"},
-                               view_figsize=(10.0, 6.0))
-        assert w == pytest.approx(10.0)
-        assert w != pytest.approx(11.69)          # not the old default A4 width
+    def test_auto_page_is_full_extent_times_scale(self, profile_file):
+        from sbp_studio.core import load_profile
+        prof = load_profile(profile_file)
+        cfg = dict(_cfg(), paper_size="Auto")
+        vs = (2.0, 0.5)
+        w, _h = self._fig_size(profile_file, {"paper_size": "Auto"}, vs)
+        assert w == pytest.approx(_expected_page(prof, cfg, vs)[0])
 
     def test_explicit_paper_still_wins(self, profile_file):
-        """A user-chosen fixed sheet is respected verbatim (loop skipped)."""
         size = self._fig_size(profile_file, {"paper_size": "A4"},
-                              view_figsize=(10.0, 6.0))
+                              view_scale=(2.0, 0.5))
         assert size == (pytest.approx(11.69), pytest.approx(8.27))
 
     def test_auto_without_view_falls_back_to_formula(self, profile_file):
-        """Batch/pool: 'Auto' with no live viewport sizes from the scale
-        formula — the historical batch geometry, unchanged."""
         from sbp_studio.core import load_profile
         from sbp_studio.gui.tabs._render import figsize_for_scale
         prof = load_profile(profile_file)
@@ -491,13 +426,13 @@ class TestDynamicPaper:
         w, _h = self._fig_size(profile_file, {"paper_size": "Auto"})
         assert w == pytest.approx(expect_w)
 
-    def test_degenerate_view_figsize_ignored(self, profile_file):
+    def test_degenerate_view_scale_ignored(self, profile_file):
         from sbp_studio.core import load_profile
         from sbp_studio.gui.tabs._render import figsize_for_scale
         prof = load_profile(profile_file)
         expect_w = figsize_for_scale(prof, _scale_cfg(), 300, 1500.0)[0]
         w, _h = self._fig_size(profile_file, {"paper_size": "Auto"},
-                               view_figsize=(0.0, 6.0))
+                               view_scale=(0.0, 0.5))
         assert w == pytest.approx(expect_w)
 
 
@@ -524,10 +459,11 @@ class TestProportionateDecorations:
                                                     deco_scale_for, _NoOpCancel)
         prof = load_profile(profile_file, load_traces=True)
         cfg = dict(_cfg(), paper_size="Auto")
+        vs = _scale_for_page(prof, cfg, 4.0, 4.0)
         fig, _ = render_export_figure(
             prof, cfg, _params(), [], _scale_cfg(), False, "profile",
-            _NoOpCancel(), view_figsize=(4.0, 4.0))
-        s = deco_scale_for((4.0, 4.0))
+            _NoOpCancel(), view_scale=vs)
+        s = deco_scale_for(_expected_page(prof, cfg, vs))
         assert s == 0.5                                   # clamped floor here
         seis = next(a for a in fig.axes if a.get_images())
         cbar = next(a for a in fig.axes if not a.get_images())
@@ -549,22 +485,14 @@ class TestProportionateDecorations:
         fig.clear()
 
 
-class TestWysiwygPhysicalScale:
-    """The field 'proportions destroyed' regression (Libre mode, wheel-zoomed
-    OUT past the data): the crop clamps to the data bounds, so sizing the page
-    to the RAW viewport stretched the data across screen area it never
-    occupied (26 km of view over a 17.4 km line → ~49 % horizontal stretch).
-    The invariant pinned here: the Auto page carries the screen's PHYSICAL
-    scale per axis — inches-per-km and inches-per-ms on the page equal the
-    viewport's — zoomed in, out, or mixed."""
+class TestFullLineAtViewScale:
+    """The field workflow contract: the viewport authors the SCALE, never the
+    extent. Whatever the zoom, the export covers the FULL line, sized by the
+    per-axis scale snapshot — width from the X scale only, height from the Y
+    scale only (independence is finalized by the data-box fit, tested after
+    the loop fix)."""
 
-    def _figsize(self, path, view_range, view_figsize, margins=0.0):
-        """Returns (page_w, page_h, data_w, data_h) in inches after the full
-        render (incl. the WYSIWYG aspect-fit loop). The pipeline's contract:
-        the page WIDTH is the target width verbatim, and the DATA BOX lands at
-        the target PROPORTIONS (the loop re-derives the page height so the
-        decorations get their own room) — so scale assertions go against the
-        page width and the data-box aspect."""
+    def _page(self, path, view_scale, margins=10.0):
         from sbp_studio.core import load_profile
         from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
         prof = load_profile(path, load_traces=True)
@@ -572,82 +500,38 @@ class TestWysiwygPhysicalScale:
                    margin_bottom=margins)
         fig, _ = render_export_figure(
             prof, cfg, _params(), [], _scale_cfg(), False, "profile",
-            _NoOpCancel(), view_range=view_range, view_figsize=view_figsize)
-        fig.canvas.draw()
-        fw, fh = fig.get_size_inches()
-        seis = next(a for a in fig.axes if a.get_images())
-        pos = seis.get_position()
-        out = (float(fw), float(fh), float(pos.width * fw), float(pos.height * fh))
+            _NoOpCancel(), view_scale=view_scale)
+        size = tuple(fig.get_size_inches())
         fig.clear()
-        return out
+        return size
 
-    def test_zoomed_out_page_shrinks_to_data_not_viewport(self, tmp_path):
-        """View exactly 2× the data extent on BOTH axes → the data occupies
-        half the screen each way, so the page must be HALF the viewport per
-        axis (data at true on-screen scale), not the full viewport."""
+    def test_full_extent_at_any_zoom_level(self, tmp_path):
+        """Two different X scales (a compressed and a stretched view): BOTH
+        pages span the FULL line km — page width == full_km x in_per_km
+        exactly. Nothing is ever cropped by zooming."""
         import numpy as np
         from sbp_studio.core import load_profile
         big = str(tmp_path / "big.sgy")
         make_synthetic_segy(big, n_traces=600, ns=256)
-        prof = load_profile(big)
-        d = np.asarray(prof.dist_km, dtype=float)
-        x_ext = float(d[-1] - d[0])
-        rec_ms = prof.ns * prof.dt_us / 1000.0
-        t0 = float(prof.delay_ms)
-        # Centered view, twice the data extent per axis → no crop occurs.
-        view = ((float(d[0]) - x_ext / 2, float(d[-1]) + x_ext / 2),
-                (t0 - rec_ms / 2, t0 + rec_ms * 1.5))
-        w, _h, dw, dh = self._figsize(big, view, (10.0, 6.0))
-        # Page width = data at true on-screen scale: HALF the viewport, not
-        # the full 10 in (which would be the reported ~2× horizontal stretch).
-        assert w == pytest.approx(10.0 / 2, rel=1e-6)
-        # Data-box proportions = the on-screen proportions (5.0 × 3.0 target).
-        # 4 % tolerance: the aspect-fit loop's 4-iteration convergence leaves a
-        # small residual on a small page (decorations proportionally large) —
-        # the regression this guards against is a ~50-100 % stretch.
-        assert dw / dh == pytest.approx(5.0 / 3.0, rel=0.04)
+        d = np.asarray(load_profile(big).dist_km, dtype=float)
+        full_km = float(d[-1] - d[0])
+        for ipk in (0.15, 0.6):                      # compressed / stretched
+            w, _h = self._page(big, (ipk, 0.05))
+            assert w == pytest.approx(full_km * ipk)
 
-    def test_zoomed_in_preserves_inches_per_km(self, tmp_path):
-        """Zoomed inside the data: page width / cropped km == viewport width /
-        view km (trace-snapping makes the crop a whisker wider than the view —
-        the SCALE, not the raw size, is the invariant)."""
-        import numpy as np
-        from sbp_studio.core import load_profile
-        from sbp_studio.gui.export_headless import (crop_export_to_view,
-                                                    process_full_array,
-                                                    _NoOpCancel)
-        big = str(tmp_path / "big.sgy")
-        make_synthetic_segy(big, n_traces=600, ns=256)
-        prof = load_profile(big, load_traces=True)
-        d = np.asarray(prof.dist_km, dtype=float)
-        lo, hi = float(d.min()), float(d.max())
-        view = ((lo + 0.25 * (hi - lo), lo + 0.65 * (hi - lo)), (-1e9, 1e9))
-        view_km = view[0][1] - view[0][0]
-        # The exact crop the renderer will draw (same code path).
-        data, t0f = process_full_array(prof, _params(), [], False, _NoOpCancel())
-        cobj, cdata, _ = crop_export_to_view(prof, data, t0f,
-                                             view[0], view[1], None)
-        crop_km = float(cobj.dist_km[-1] - cobj.dist_km[0])
-        w, _h, _dw, _dh = self._figsize(big, view, (10.0, 6.0))
-        assert w / crop_km == pytest.approx(10.0 / view_km, rel=1e-6)
-
-    def test_margins_ride_along_in_height(self, tmp_path):
-        """Export margins extend the page vertically at the SAME ms-per-inch,
-        so the data itself stays at true scale."""
-        import numpy as np
-        from sbp_studio.core import load_profile
-        big = str(tmp_path / "m.sgy")
-        make_synthetic_segy(big, n_traces=200, ns=256)
-        prof = load_profile(big)
-        rec_ms = prof.ns * prof.dt_us / 1000.0
-        t0 = float(prof.delay_ms)
-        d = np.asarray(prof.dist_km, dtype=float)
-        view = ((float(d[0]), float(d[-1])), (t0, t0 + rec_ms))  # exact fit
-        _w0, _h0, dw0, dh0 = self._figsize(big, view, (10.0, 6.0), margins=0.0)
-        _w1, _h1, dw1, dh1 = self._figsize(big, view, (10.0, 6.0), margins=10.0)
-        # Margins extend the raster by 20 ms at the SAME ms-per-inch, so the
-        # data-box aspect must scale by exactly rec_ms/(rec_ms + 20).
-        ratio0 = dw0 / dh0
-        ratio1 = dw1 / dh1
-        assert ratio1 / ratio0 == pytest.approx(rec_ms / (rec_ms + 20.0),
-                                                rel=0.02)
+    def test_batch_payload_carries_the_scale(self, tmp_path):
+        """The pool worker honors payload['view_scale']: same file, two
+        scales -> saved PNG widths in the same ratio (each full-extent)."""
+        from PIL import Image
+        from sbp_studio.gui.export_headless import render_batch_item
+        p = str(tmp_path / "b.sgy")
+        make_synthetic_segy(p, n_traces=200, ns=160)
+        widths = {}
+        for tag, ipk in (("narrow", 0.2), ("wide", 0.4)):
+            pl = _payload(p, str(tmp_path / f"{tag}.png"))
+            pl["view_scale"] = (ipk, 0.05)
+            out, ok, err = render_batch_item(pl)
+            assert ok, err
+            with Image.open(out) as im:
+                widths[tag] = im.size[0]
+        assert widths["wide"] / widths["narrow"] == pytest.approx(2.0, rel=0.05)

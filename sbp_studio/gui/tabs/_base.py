@@ -238,8 +238,7 @@ def _crop_for_viewport(obj, proc, t0_full, x_range, y_range):
 
 
 def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
-                          handler, cancel, picks=None, view_range=None,
-                          view_figsize=None):
+                          handler, cancel, picks=None, view_scale=None):
     """Delegates to the extracted Qt-free engine — see
     ``gui.export_headless.render_export_figure`` (the former body of this
     function, moved VERBATIM: same DSP pass, same RAM-capped DPI, same WYSIWYG
@@ -247,16 +246,14 @@ def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     ("profile" | "chain" — see SourceHandler.render_kind); everything else is
     passed through unchanged, so single/batch/pool exports cannot drift.
 
-    ``view_range`` / ``view_figsize`` — the live ViewBox window + its physical
-    on-screen size, forwarded so the SINGLE export can crop to the on-screen
-    zoom AND size its page dynamically from the viewport ('Auto' paper).
-    Batch/pool pass ``None`` for both and stay full-line/formula-sized."""
+    ``view_scale`` — the ``(in_per_km, in_per_ms)`` viewport scale snapshot;
+    the export applies it to the FULL data extent (the viewport authors the
+    SCALE, never the extent). ``None`` → the formula figsize."""
     from sbp_studio.gui.export_headless import render_export_figure
     kind = getattr(handler, "render_kind", "profile")
     return render_export_figure(obj, cfg, params, node_cfg, scale_cfg,
                                 align_enabled, kind, cancel, picks=picks,
-                                view_range=view_range,
-                                view_figsize=view_figsize)
+                                view_scale=view_scale)
 
 
 class SubTabbedTab(QWidget):
@@ -688,9 +685,9 @@ class SubTabbedTab(QWidget):
             return
         dlg = ExportDialog(self, source=obj, scale_cfg=self.controls.scale_config(),
                            velocity=1500.0,
-                           view_figsize=(self._seismic.viewport_inches()
-                                         if self._seismic is not None and
-                                         self._seismic.has_image() else None))
+                           view_scale=(self._seismic.current_view_scale()
+                                       if self._seismic is not None and
+                                       self._seismic.has_image() else None))
         try:
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
@@ -769,17 +766,13 @@ class SubTabbedTab(QWidget):
         # so _render_export_figure's picks param is a no-op (see _draw_picks).
         picks = self._seismic.get_picks() if cfg.get("overlay_picks") else []
 
-        # WYSIWYG snapshot, taken on the GUI thread (Qt objects aren't
-        # thread-safe) as ONE unit so the two halves can never diverge:
-        #   view_range   — the visible ViewBox window; a zoomed sub-window crops
-        #                  the export to it (full view → no-op, full line).
-        #   view_figsize — the viewport's physical on-screen inches; with the
-        #                  'Auto' paper size (the default) the export page takes
-        #                  exactly these dimensions/proportions instead of being
-        #                  squeezed onto a fixed sheet (the 'A4 trap' fix).
+        # SCALE snapshot, taken on the GUI thread (Qt objects aren't
+        # thread-safe): the viewport's physical scale per axis (in/km, in/ms).
+        # The viewport AUTHORS THE SCALE, never the extent — the export always
+        # covers the full line, sized to this scale ('Auto' paper). None (no
+        # live view) → the formula figsize.
         _has_view = self._seismic is not None and self._seismic.has_image()
-        view_range = self._seismic.current_view_range() if _has_view else None
-        view_figsize = self._seismic.viewport_inches() if _has_view else None
+        view_scale = self._seismic.current_view_scale() if _has_view else None
 
         def job(progress, cancel) -> str:
             from sbp_studio.viz.render import save_figure
@@ -794,7 +787,7 @@ class SubTabbedTab(QWidget):
             # + decimation-free DPI floor + WYSIWYG aspect fit.
             fig, render_dpi = _render_export_figure(
                 _obj, cfg, params, node_cfg, scale_cfg, align_enabled, handler, cancel,
-                picks=picks, view_range=view_range, view_figsize=view_figsize)
+                picks=picks, view_scale=view_scale)
             try:
                 save_figure(fig, out, dpi=render_dpi, fmt=fmt, pdf_page=cfg["pdf_page"])
             except OSError as exc:
@@ -947,6 +940,13 @@ class SubTabbedTab(QWidget):
         node_cfg = [(n.KEY, dict(n.params)) for n in self.pipeline_panel.active_nodes()]
         align_enabled = self.controls.align_enabled()
         params["align"] = align_enabled
+        # The field batch workflow: set a visual proportion on ONE line, then
+        # export MANY — every item inherits the SAME on-screen physical scale
+        # (in/km, in/ms), applied to its own FULL extent. Snapshot on the GUI
+        # thread; two plain floats, so it pickles into pool payloads as-is.
+        view_scale = (self._seismic.current_view_scale()
+                      if self._seismic is not None and self._seismic.has_image()
+                      else None)
 
         valid = [o for o in items
                  if o is not None and not getattr(o, "error", None)]
@@ -972,7 +972,7 @@ class SubTabbedTab(QWidget):
                 try:
                     fig, render_dpi = _render_export_figure(
                         render_obj, cfg, params, node_cfg, scale_cfg,
-                        align_enabled, handler, cancel)
+                        align_enabled, handler, cancel, view_scale=view_scale)
                     save_figure(fig, str(out), dpi=render_dpi, fmt=fmt,
                                 pdf_page=cfg["pdf_page"])
                 finally:
@@ -1009,6 +1009,7 @@ class SubTabbedTab(QWidget):
                         fmt=fmt, pdf_page=cfg["pdf_page"],
                         cfg=per_worker_cfg, params=params, node_cfg=node_cfg,
                         scale_cfg=scale_cfg, align_enabled=align_enabled,
+                        view_scale=view_scale,
                     ) for obj in valid]
                     return run_batch_export_pool(
                         payloads, n_workers, progress=_report, cancel=cancel)

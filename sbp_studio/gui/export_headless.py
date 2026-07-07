@@ -145,59 +145,11 @@ def _crop_for_viewport(obj, proc, t0_full, x_range, y_range):
     return _crop_at_bounds(obj, proc, t0_full, c0, c1, r0, r1)
 
 
-def _shift_picks(picks, c0, c1, t_lo, t_hi):
-    """Re-index interpretation picks into a crop: shift ``trace_index`` by the
-    crop's left column and drop any pick outside the crop's column/time window.
-    Returns duck-typed stand-ins (``_draw_picks`` reads only trace_index/time_ms/
-    id), so the caller need not import PickPoint."""
-    if not picks:
-        return picks
-    from types import SimpleNamespace
-    ncrop = c1 - c0
-    lo, hi = (t_lo, t_hi) if t_lo <= t_hi else (t_hi, t_lo)
-    out = []
-    for p in picks:
-        j = int(p.trace_index) - c0
-        if 0 <= j < ncrop and lo <= float(p.time_ms) <= hi:
-            out.append(SimpleNamespace(
-                trace_index=j, time_ms=float(p.time_ms), id=p.id))
-    return out
-
-
-def crop_export_to_view(obj, data, t0_full, x_range, y_range, picks=None):
-    """WYSIWYG export extent. If the visible ViewBox window (``x_range`` km,
-    ``y_range`` ms) is a STRICT sub-window of ``obj``'s full extent, return a
-    cropped ``(clone, data, picks)`` so the exported file matches the on-screen
-    zoom. When the view already covers the whole line (nothing zoomed away), the
-    inputs are returned UNCHANGED — the historical full-line export, byte for
-    byte (this is what keeps the batch/pool paths, which pass no view, identical).
-    ``picks`` are re-indexed into the crop; those outside it are dropped."""
-    import numpy as np
-    dist = getattr(obj, "dist_km", None)
-    if dist is None:
-        _LOG.info("WYSIWYG export: source has no distance axis — full line.")
-        return obj, data, picks
-    dist = np.asarray(dist, dtype=float)
-    if dist.size < 2 or data.size == 0:
-        _LOG.info("WYSIWYG export: degenerate geometry (%d fixes, %d samples)"
-                  " — full line.", dist.size, data.size)
-        return obj, data, picks
-    n_rows, n_cols = data.shape
-    c0, c1, r0, r1 = _view_bounds(obj, data.shape, t0_full, x_range, y_range)
-    if c0 <= 0 and c1 >= n_cols and r0 <= 0 and r1 >= n_rows:
-        # Field-diagnosable: app.log states explicitly that the whole line was
-        # visible, so "the export ignored my zoom" reports can be triaged from
-        # the log alone (crop applied vs. view genuinely covered everything).
-        _LOG.info("WYSIWYG export: view covers the full line "
-                  "(%d traces × %d samples) — no crop.", n_cols, n_rows)
-        return obj, data, picks              # whole line visible → no crop
-    clone, crop = _crop_at_bounds(obj, data, t0_full, c0, c1, r0, r1)
-    _LOG.info("WYSIWYG export: cropped to the on-screen window — traces "
-              "[%d:%d) of %d, samples [%d:%d) of %d.",
-              c0, c1, n_cols, r0, r1, n_rows)
-    t_hi = clone.min_delay + crop.shape[0] * (obj.dt_us / 1000.0)
-    picks_out = _shift_picks(picks, c0, c1, clone.min_delay, t_hi)
-    return clone, crop, picks_out
+# NOTE: the former ``crop_export_to_view`` (WYSIWYG *extent* cropping) was
+# REMOVED by field directive: zooming is a SCALE-authoring gesture, not an
+# extent selection - the export always covers the FULL line, at the
+# on-screen physical scale (see ``_page_from_scale``). The crop engine above
+# survives solely for the in-viewer HQ overlay (``_crop_for_viewport``).
 
 
 # Reference page for decoration sizing: the renderers' own default figsize
@@ -222,53 +174,40 @@ def deco_scale_for(figsize) -> float:
     return max(0.5, min(3.0, ((w * h) / _DECO_REF_AREA) ** 0.5))
 
 
-def _wysiwyg_figsize(obj, data, cfg, view_range, view_figsize):
-    """The 'Auto' page: the DATA region's physical on-screen size, in inches.
+def _page_from_scale(obj, data, cfg, view_scale):
+    """The 'Auto' page: the FULL data extent at the on-screen physical scale.
 
-    The raw ``view_figsize`` is the WHOLE ViewBox — but when the user zooms
-    OUT past the data on an axis, the data occupies only part of the screen,
-    while the export crop is clamped to the data bounds. Sizing the page to
-    the full viewport would stretch the clamped crop across it (the reported
-    'proportions destroyed' failure: 26 km of view over a 17.4 km line →
-    ~49 % horizontal stretch). WYSIWYG means the PHYSICAL SCALE must carry
-    over, per axis: inches-per-km and inches-per-ms on the page must equal
-    the screen's. So convert the on-screen scale (view extent over viewport
-    inches) to the POST-CROP data extents:
+    ``view_scale`` is the GUI-thread snapshot ``(in_per_km, in_per_ms)`` — the
+    viewport's physical scale per axis (SeismicView.current_view_scale). The
+    viewport is a SCALE AUTHOR, never an extent selector: zooming tunes the
+    proportions, and the export applies them to the WHOLE line —
 
-        page_w = data_km · (viewport_w_in / view_km)
-        page_h = (data_ms + margins) · (viewport_h_in / view_ms)
+        page_w = full_line_km   · in_per_km
+        page_h = (full_record_ms + export margins) · in_per_ms
 
-    Zoomed IN, crop extent ≈ view extent → page ≈ viewport (unchanged
-    behaviour). Zoomed OUT, the page shrinks to the data's true on-screen
-    size instead of stretching the data. The export margins ride along in
-    height so the data itself stays at true scale. Falls back to the raw
-    viewport inches when the scale cannot be derived (no view_range or
-    degenerate extents)."""
+    The two axes are mathematically INDEPENDENT: compressing X on screen
+    narrows the page but cannot touch its height, and vice versa. Margins ride
+    along in height at the same ms-per-inch so the data itself stays at true
+    scale. Returns ``None`` for degenerate input (caller falls back to the
+    formula figsize)."""
     import numpy as np
-    w_in, h_in = float(view_figsize[0]), float(view_figsize[1])
-    if view_range is None:
-        return (w_in, h_in)
-    xa, xb = sorted((float(view_range[0][0]), float(view_range[0][1])))
-    ya, yb = sorted((float(view_range[1][0]), float(view_range[1][1])))
-    view_km, view_ms = xb - xa, yb - ya
+    ipk, ipm = float(view_scale[0]), float(view_scale[1])
     dist = np.asarray(getattr(obj, "dist_km", ()), dtype=float)
-    if view_km <= 0 or view_ms <= 0 or dist.size < 2 or data.size == 0:
-        return (w_in, h_in)
+    if ipk <= 0 or ipm <= 0 or dist.size < 2 or data.size == 0:
+        return None
     data_km = float(dist[-1] - dist[0])
     data_ms = data.shape[0] * float(obj.dt_us) / 1000.0
     data_ms += (float(cfg.get("margin_top") or 0.0)
                 + float(cfg.get("margin_bottom") or 0.0))
     if data_km <= 0 or data_ms <= 0:
-        return (w_in, h_in)
-    return (max(0.5, data_km * w_in / view_km),
-            max(0.5, data_ms * h_in / view_ms))
+        return None
+    return (max(0.5, data_km * ipk), max(0.5, data_ms * ipm))
 
 
 # ── Export figure render (moved verbatim from gui.tabs._base) ──────────────────
 
 def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
-                         kind, cancel, picks=None, view_range=None,
-                         view_figsize=None):
+                         kind, cancel, picks=None, view_scale=None):
     """Shared per-item export render — used by the single export, the
     sequential batch AND the process-pool batch, so their quality can never
     drift.
@@ -293,50 +232,40 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     screen (WYSIWYG extent). A full-line view (or ``None`` — the batch/pool path)
     leaves everything untouched, so the historical full-line export is unchanged.
 
-    ``view_figsize`` — the live data-ViewBox's PHYSICAL on-screen size in inches
-    (``(w_in, h_in)``), or ``None``. Figsize priority, in order:
+    ``view_scale`` — the GUI-thread scale snapshot ``(in_per_km, in_per_ms)``,
+    or ``None``. The viewport is a SCALE AUTHOR only — the export ALWAYS
+    covers the full line (extent cropping was removed by field directive).
+    Figsize priority, in order:
       1. an EXPLICIT paper size the user selected in the dialog (A4/A3/A0);
-      2. ``view_figsize`` — the 'Auto (match view)' dynamic page: the page takes
-         the viewport's own proportions/size and GROWS with the zoomed extent at
-         the on-screen scale, never squeezing the section onto a fixed sheet;
-      3. the ``figsize_for_scale`` formula (batch/pool — no live view exists).
+      2. ``view_scale`` — the 'Auto' dynamic page: the FULL data extent at the
+         on-screen physical scale, each axis independent (_page_from_scale);
+      3. the ``figsize_for_scale`` formula (no live view existed).
     """
     from sbp_studio.viz.render import (build_theme, render_chain_figure,
                                        render_profile_figure)
     from sbp_studio.gui.tabs._render import (PAPER_SIZES, dpi_for_budget,
                                              effective_export_dpi,
                                              figsize_for_scale)
-    # Full-resolution DSP pipeline (alignment + nodes) — shared with the viewport
-    # HQ export so the crop is processed identically.
-    data, t0_full = process_full_array(
+    # Full-resolution DSP pipeline (alignment + nodes) on the FULL matrix.
+    data, _t0_full = process_full_array(
         obj, params, node_cfg, align_enabled, cancel)
-    # WYSIWYG export extent: honour the live viewport crop when the caller passed
-    # the ViewBox window and the user has zoomed in (a full-line view is a no-op).
-    # The decision is ALWAYS logged — one line in app.log per export states which
-    # path ran, so a field report of a wrong extent is triaged from the log alone.
-    if view_range is not None:
-        obj, data, picks = crop_export_to_view(
-            obj, data, t0_full, view_range[0], view_range[1], picks)
-    else:
-        _LOG.info("WYSIWYG export: no view_range supplied — full-line export "
-                  "(batch/pool path, or no live view).")
-    # figsize priority (see docstring): explicit paper > live viewport (Auto) >
-    # formula. Paper-size exports skip the post-render WYSIWYG aspect loop since
-    # the page dimensions are fixed by the chosen standard size.
+    # figsize priority (see docstring): explicit paper > full line at the
+    # viewport scale (Auto) > formula. The decision is ALWAYS logged — one line
+    # in app.log per export states which sizing ran, for field triage.
     paper_key = cfg.get("paper_size", "")
+    scaled = (_page_from_scale(obj, data, cfg, view_scale)
+              if view_scale is not None else None)
     if paper_key in PAPER_SIZES:
         figsize = PAPER_SIZES[paper_key]
-    elif (view_figsize is not None and float(view_figsize[0]) > 0
-          and float(view_figsize[1]) > 0):
-        # Auto (match view): dynamic paper sized so the PHYSICAL on-screen
-        # scale (km/in, ms/in) carries onto the page exactly — the cropped
-        # data extents at the viewport's scale, NOT the raw viewport rect
-        # (which would stretch a data-clamped crop when the user has zoomed
-        # OUT past the data). See _wysiwyg_figsize. Computed AFTER the crop,
-        # from the same obj/data the renderer will draw.
-        figsize = _wysiwyg_figsize(obj, data, cfg, view_range, view_figsize)
+        _LOG.info("export sizing: fixed paper %s.", paper_key)
+    elif scaled is not None:
+        figsize = scaled
+        _LOG.info("export sizing: FULL line at the on-screen scale "
+                  "(%.4f in/km, %.5f in/ms).", view_scale[0], view_scale[1])
     else:
         figsize = figsize_for_scale(obj, scale_cfg, int(cfg["dpi"]), cfg["velocity"])
+        _LOG.info("export sizing: formula figsize (no live view scale — "
+                  "batch default, or nothing displayed).")
     render_dpi = effective_export_dpi(figsize, data.shape, int(cfg["dpi"]))
     # RAM cap (parity with the CLI): never let the raster exceed the memory
     # budget. effective_export_dpi can raise the DPI toward 2400 to hit the native
@@ -432,7 +361,10 @@ def render_batch_item(payload: dict) -> tuple:
 
     ``payload`` (all plain picklable values, snapshotted on the GUI thread):
     path, out, fmt, pdf_page, cfg, params, node_cfg, scale_cfg, align_enabled,
-    name (for progress/failure reporting).
+    name (for progress/failure reporting), and optionally ``view_scale`` — the
+    ``(in_per_km, in_per_ms)`` snapshot of the live viewport, so EVERY item in
+    the batch exports its FULL line at the SAME on-screen visual scale (the
+    'set a proportion, export everything' field workflow).
     """
     out = str(payload.get("out", ""))
     fig = None
@@ -446,7 +378,7 @@ def render_batch_item(payload: dict) -> tuple:
         fig, render_dpi = render_export_figure(
             prof, payload["cfg"], payload["params"], payload["node_cfg"],
             payload["scale_cfg"], payload["align_enabled"], "profile",
-            _NoOpCancel())
+            _NoOpCancel(), view_scale=payload.get("view_scale"))
         save_figure(fig, out, dpi=render_dpi, fmt=payload["fmt"],
                     pdf_page=payload["pdf_page"])
         return (out, True, "")

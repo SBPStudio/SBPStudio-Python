@@ -41,7 +41,7 @@ class ExportDialog(QDialog):
     def __init__(self, parent: Optional[QWidget] = None, *,
                  source: object = None, scale_cfg: Optional[dict] = None,
                  velocity: float = 1500.0, batch: bool = False,
-                 view_figsize: Optional[tuple] = None) -> None:
+                 view_scale: Optional[tuple] = None) -> None:
         super().__init__(parent)
         # Optional live-estimate context: the active profile/chain + the selected
         # scale mode let the dialog show the real output size and the forced DPI
@@ -49,11 +49,12 @@ class ExportDialog(QDialog):
         self._source = source
         self._scale_cfg = scale_cfg
         self._velocity = float(velocity)
-        # The live viewport's physical inches (w_in, h_in) — the page the 'Auto
-        # (match view)' paper size will actually produce, so the estimate labels
-        # reflect the dynamic page rather than a formula approximation. None for
-        # batch (no live view) → the estimate falls back to figsize_for_scale.
-        self._view_figsize = view_figsize
+        # The live viewport's physical scale (in_per_km, in_per_ms) — the 'Auto'
+        # page is the FULL data extent at this scale (the viewport authors the
+        # scale, never the extent — see export_headless._page_from_scale), so
+        # the estimate labels reflect the real dynamic page. None (no live
+        # view) → the estimate falls back to figsize_for_scale.
+        self._view_scale = view_scale
         # ``batch`` mode adds the optional "custom output directory" row (only
         # meaningful for a multi-item batch — a single export picks its path in
         # the following Save dialog instead). Kept off for single export so that
@@ -270,15 +271,24 @@ class ExportDialog(QDialog):
                                         dpi_for_budget)
             chosen = self._dpi()
             paper_key = self.cb_papersize.currentText()
+            figsize = None
             if paper_key in PAPER_SIZES:
                 figsize = PAPER_SIZES[paper_key]
-            elif self._view_figsize is not None and self._view_figsize[0] > 0 \
-                    and self._view_figsize[1] > 0:
-                # 'Auto' with a live view → the page is the viewport itself
-                # (same priority rule as render_export_figure's view_figsize).
-                figsize = (float(self._view_figsize[0]),
-                           float(self._view_figsize[1]))
-            else:
+            elif self._view_scale is not None and self._view_scale[0] > 0 \
+                    and self._view_scale[1] > 0:
+                # 'Auto' with a live view → the FULL data extent at the
+                # on-screen scale (same rule as _page_from_scale: width from
+                # the X scale × line length, height from the Y scale × record
+                # + margins — the axes are independent).
+                ipk, ipm = float(self._view_scale[0]), float(self._view_scale[1])
+                total_km = float(getattr(self._source, "total_km", 0.0) or 0.0)
+                ns_ = int(getattr(self._source, "ns", 0) or 0)
+                dt_us = float(getattr(self._source, "dt_us", 0) or 0)
+                rec_ms = ns_ * dt_us / 1000.0 + float(self.sp_mtop.value()) \
+                    + float(self.sp_mbot.value())
+                if total_km > 0 and rec_ms > 0:
+                    figsize = (max(0.5, total_km * ipk), max(0.5, rec_ms * ipm))
+            if figsize is None:
                 figsize = figsize_for_scale(self._source, self._scale_cfg, chosen,
                                             self._velocity)
             ns = int(getattr(self._source, "ns", 0))
