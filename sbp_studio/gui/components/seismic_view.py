@@ -1344,7 +1344,22 @@ class SeismicView(QWidget):
             self._img_trace_lo = int(c0)
             self._img_trace_hi = int(c1)
         if fit:
-            self.set_aspect(self._aspect)   # autoRanges to fit the new section
+            # Deterministic fit to THE NEW SECTION'S OWN BOUNDS (the fit frame
+            # always carries the full extent — see PreviewController._refresh).
+            # Never plot.autoRange(): that fits the union of ALL scene items,
+            # and at this instant overlays from the PREVIOUS file (FIX marks,
+            # boundaries, ruler — repositioned only after this) can still sit
+            # in the old file's coordinate domain, dragging the union range off
+            # the new data ('lost in space' on selecting a distant file).
+            lo_t, hi_t = (t0, t1) if t1 >= t0 else (t1, t0)
+            vb = self.plot.getViewBox()
+            vb.setXRange(float(dist0), float(dist1), padding=0.02)
+            vb.setYRange(float(lo_t), float(hi_t), padding=0.02)
+            if self._aspect:
+                # Re-apply the scale-mode preset on the now-fresh _rect (the
+                # explicit ranges above just centred the view on the data, so
+                # the preset's pan-preservation keeps it there).
+                self.set_aspect(self._aspect)
         if self._picks:
             self._redraw_picks()
         self._reposition_boundaries()
