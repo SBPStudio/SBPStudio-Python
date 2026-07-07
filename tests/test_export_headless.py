@@ -438,3 +438,58 @@ class TestCanvasSafetyCap:
 # The traces/cm ↔ zoom sync (traces_per_cm_on_screen + its tests) was removed
 # with the manual 'Traces / cm' control: the viewport is the scale authority
 # now (universal axis-wheel zoom), so there is nothing to sync a widget to.
+
+
+# ── Dynamic paper: 'Auto (match view)' page vs explicit sheets vs formula ──────
+
+class TestDynamicPaper:
+    """Figsize priority in render_export_figure: explicit paper (A4/A3/A0) >
+    live viewport inches (Auto) > figsize_for_scale formula (batch/pool). The
+    'A4 trap' regression pins: an Auto export must NEVER be squeezed onto a
+    fixed sheet."""
+
+    def _fig_size(self, path, cfg_extra, view_figsize=None):
+        from sbp_studio.core import load_profile
+        from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
+        prof = load_profile(path, load_traces=True)
+        cfg = dict(_cfg(), **cfg_extra)
+        fig, _dpi = render_export_figure(
+            prof, cfg, _params(), [], _scale_cfg(), False, "profile",
+            _NoOpCancel(), view_figsize=view_figsize)
+        size = tuple(fig.get_size_inches())
+        fig.clear()
+        return size
+
+    def test_auto_page_takes_viewport_inches(self, profile_file):
+        """'Auto' + a live viewport → the page IS the viewport. The WYSIWYG
+        aspect-fit loop may refine the HEIGHT (decorations), but the width is
+        the viewport's, exactly — never a fixed sheet's."""
+        w, _h = self._fig_size(profile_file, {"paper_size": "Auto"},
+                               view_figsize=(10.0, 6.0))
+        assert w == pytest.approx(10.0)
+        assert w != pytest.approx(11.69)          # not the old default A4 width
+
+    def test_explicit_paper_still_wins(self, profile_file):
+        """A user-chosen fixed sheet is respected verbatim (loop skipped)."""
+        size = self._fig_size(profile_file, {"paper_size": "A4"},
+                              view_figsize=(10.0, 6.0))
+        assert size == (pytest.approx(11.69), pytest.approx(8.27))
+
+    def test_auto_without_view_falls_back_to_formula(self, profile_file):
+        """Batch/pool: 'Auto' with no live viewport sizes from the scale
+        formula — the historical batch geometry, unchanged."""
+        from sbp_studio.core import load_profile
+        from sbp_studio.gui.tabs._render import figsize_for_scale
+        prof = load_profile(profile_file)
+        expect_w = figsize_for_scale(prof, _scale_cfg(), 300, 1500.0)[0]
+        w, _h = self._fig_size(profile_file, {"paper_size": "Auto"})
+        assert w == pytest.approx(expect_w)
+
+    def test_degenerate_view_figsize_ignored(self, profile_file):
+        from sbp_studio.core import load_profile
+        from sbp_studio.gui.tabs._render import figsize_for_scale
+        prof = load_profile(profile_file)
+        expect_w = figsize_for_scale(prof, _scale_cfg(), 300, 1500.0)[0]
+        w, _h = self._fig_size(profile_file, {"paper_size": "Auto"},
+                               view_figsize=(0.0, 6.0))
+        assert w == pytest.approx(expect_w)

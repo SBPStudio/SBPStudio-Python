@@ -40,7 +40,8 @@ class ExportDialog(QDialog):
 
     def __init__(self, parent: Optional[QWidget] = None, *,
                  source: object = None, scale_cfg: Optional[dict] = None,
-                 velocity: float = 1500.0, batch: bool = False) -> None:
+                 velocity: float = 1500.0, batch: bool = False,
+                 view_figsize: Optional[tuple] = None) -> None:
         super().__init__(parent)
         # Optional live-estimate context: the active profile/chain + the selected
         # scale mode let the dialog show the real output size and the forced DPI
@@ -48,6 +49,11 @@ class ExportDialog(QDialog):
         self._source = source
         self._scale_cfg = scale_cfg
         self._velocity = float(velocity)
+        # The live viewport's physical inches (w_in, h_in) — the page the 'Auto
+        # (match view)' paper size will actually produce, so the estimate labels
+        # reflect the dynamic page rather than a formula approximation. None for
+        # batch (no live view) → the estimate falls back to figsize_for_scale.
+        self._view_figsize = view_figsize
         # ``batch`` mode adds the optional "custom output directory" row (only
         # meaningful for a multi-item batch — a single export picks its path in
         # the following Save dialog instead). Kept off for single export so that
@@ -62,10 +68,17 @@ class ExportDialog(QDialog):
         for label, ext in (("PDF (vector)", "pdf"), ("PNG", "png"),
                             ("TIFF", "tiff"), ("SVG (vector)", "svg")):
             self.cb_format.addItem(label, ext)
+        # Paper size: 'Auto' (dynamic page — matches the on-screen view for a
+        # single export, the scale formula for a batch) is FIRST and the
+        # DEFAULT. Fixed sheets (A4/A3/A0) remain as explicit choices. 'Auto'
+        # was previously missing entirely and the default was A4 — the 'A4
+        # trap': every export was squeezed onto a fixed sheet and the scale
+        # mode / zoom never reached the page geometry.
         self.cb_papersize = QComboBox()
+        self.cb_papersize.addItem("Auto")
         for key in PAPER_SIZES:
             self.cb_papersize.addItem(key)
-        self.cb_papersize.setCurrentText("A4")
+        self.cb_papersize.setCurrentText("Auto")
         self.cb_papersize.currentTextChanged.connect(lambda *_: self._update_budget_status())
         self.cb_dpi = QComboBox()
         self.cb_dpi.setEditable(True)
@@ -259,6 +272,12 @@ class ExportDialog(QDialog):
             paper_key = self.cb_papersize.currentText()
             if paper_key in PAPER_SIZES:
                 figsize = PAPER_SIZES[paper_key]
+            elif self._view_figsize is not None and self._view_figsize[0] > 0 \
+                    and self._view_figsize[1] > 0:
+                # 'Auto' with a live view → the page is the viewport itself
+                # (same priority rule as render_export_figure's view_figsize).
+                figsize = (float(self._view_figsize[0]),
+                           float(self._view_figsize[1]))
             else:
                 figsize = figsize_for_scale(self._source, self._scale_cfg, chosen,
                                             self._velocity)

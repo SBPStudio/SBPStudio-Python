@@ -591,6 +591,20 @@ class SeismicView(QWidget):
         avoid a clipping mismatch with what's on screen."""
         return self._vmin, self._vmax
 
+    def viewport_inches(self) -> Optional[tuple]:
+        """The data ViewBox's PHYSICAL on-screen size as ``(w_in, h_in)``, from
+        its pixel size and the display's logical DPI — the dynamic 'Auto (match
+        view)' export page (see export_headless.render_export_figure's
+        ``view_figsize``). ``None`` when the widget has no meaningful geometry
+        yet (not laid out)."""
+        vb = self.plot.getViewBox()
+        w_px, h_px = float(vb.width()), float(vb.height())
+        dpi_x = float(self.logicalDpiX() or 96.0)
+        dpi_y = float(self.logicalDpiY() or 96.0)
+        if w_px < 2 or h_px < 2 or dpi_x <= 0 or dpi_y <= 0:
+            return None
+        return (w_px / dpi_x, h_px / dpi_y)
+
     def set_image_interpolation(self, mode: str) -> None:
         """Toggle pixel-scaling smoothing for the live raster (and the HQ overlay)
         to approximate the Render/Export interpolation choice. PyQtGraph's

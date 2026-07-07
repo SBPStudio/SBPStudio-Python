@@ -239,7 +239,8 @@ def _crop_for_viewport(obj, proc, t0_full, x_range, y_range):
 
 
 def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
-                          handler, cancel, picks=None, view_range=None):
+                          handler, cancel, picks=None, view_range=None,
+                          view_figsize=None):
     """Delegates to the extracted Qt-free engine — see
     ``gui.export_headless.render_export_figure`` (the former body of this
     function, moved VERBATIM: same DSP pass, same RAM-capped DPI, same WYSIWYG
@@ -247,14 +248,16 @@ def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     ("profile" | "chain" — see SourceHandler.render_kind); everything else is
     passed through unchanged, so single/batch/pool exports cannot drift.
 
-    ``view_range`` — the live ViewBox window, forwarded so the SINGLE export can
-    crop to the on-screen zoom (WYSIWYG extent). Batch/pool pass ``None`` and
-    stay full-line."""
+    ``view_range`` / ``view_figsize`` — the live ViewBox window + its physical
+    on-screen size, forwarded so the SINGLE export can crop to the on-screen
+    zoom AND size its page dynamically from the viewport ('Auto' paper).
+    Batch/pool pass ``None`` for both and stay full-line/formula-sized."""
     from sbp_studio.gui.export_headless import render_export_figure
     kind = getattr(handler, "render_kind", "profile")
     return render_export_figure(obj, cfg, params, node_cfg, scale_cfg,
                                 align_enabled, kind, cancel, picks=picks,
-                                view_range=view_range)
+                                view_range=view_range,
+                                view_figsize=view_figsize)
 
 
 class SubTabbedTab(QWidget):
@@ -691,7 +694,10 @@ class SubTabbedTab(QWidget):
             self.tasks.notify(QCoreApplication.translate("SubTabbedTab", "Select an item first."))
             return
         dlg = ExportDialog(self, source=obj, scale_cfg=self.controls.scale_config(),
-                           velocity=1500.0)
+                           velocity=1500.0,
+                           view_figsize=(self._seismic.viewport_inches()
+                                         if self._seismic is not None and
+                                         self._seismic.has_image() else None))
         try:
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
@@ -770,14 +776,17 @@ class SubTabbedTab(QWidget):
         # so _render_export_figure's picks param is a no-op (see _draw_picks).
         picks = self._seismic.get_picks() if cfg.get("overlay_picks") else []
 
-        # WYSIWYG export extent: snapshot the visible ViewBox window on the GUI
-        # thread (Qt objects aren't thread-safe) so the export honours the user's
-        # current zoom/pan. None when nothing is displayed, or when the whole line
-        # is visible → crop_export_to_view no-ops and the full line is exported
-        # exactly as before (see its docstring).
-        view_range = (self._seismic.current_view_range()
-                      if self._seismic is not None and self._seismic.has_image()
-                      else None)
+        # WYSIWYG snapshot, taken on the GUI thread (Qt objects aren't
+        # thread-safe) as ONE unit so the two halves can never diverge:
+        #   view_range   — the visible ViewBox window; a zoomed sub-window crops
+        #                  the export to it (full view → no-op, full line).
+        #   view_figsize — the viewport's physical on-screen inches; with the
+        #                  'Auto' paper size (the default) the export page takes
+        #                  exactly these dimensions/proportions instead of being
+        #                  squeezed onto a fixed sheet (the 'A4 trap' fix).
+        _has_view = self._seismic is not None and self._seismic.has_image()
+        view_range = self._seismic.current_view_range() if _has_view else None
+        view_figsize = self._seismic.viewport_inches() if _has_view else None
 
         def job(progress, cancel) -> str:
             from sbp_studio.viz.render import save_figure
@@ -792,7 +801,7 @@ class SubTabbedTab(QWidget):
             # + decimation-free DPI floor + WYSIWYG aspect fit.
             fig, render_dpi = _render_export_figure(
                 _obj, cfg, params, node_cfg, scale_cfg, align_enabled, handler, cancel,
-                picks=picks, view_range=view_range)
+                picks=picks, view_range=view_range, view_figsize=view_figsize)
             try:
                 save_figure(fig, out, dpi=render_dpi, fmt=fmt, pdf_page=cfg["pdf_page"])
             except OSError as exc:

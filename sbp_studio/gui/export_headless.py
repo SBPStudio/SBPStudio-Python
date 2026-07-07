@@ -200,7 +200,8 @@ def crop_export_to_view(obj, data, t0_full, x_range, y_range, picks=None):
 # ── Export figure render (moved verbatim from gui.tabs._base) ──────────────────
 
 def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
-                         kind, cancel, picks=None, view_range=None):
+                         kind, cancel, picks=None, view_range=None,
+                         view_figsize=None):
     """Shared per-item export render — used by the single export, the
     sequential batch AND the process-pool batch, so their quality can never
     drift.
@@ -224,6 +225,14 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     matrix + object + picks are cropped to it so the exported file matches the
     screen (WYSIWYG extent). A full-line view (or ``None`` — the batch/pool path)
     leaves everything untouched, so the historical full-line export is unchanged.
+
+    ``view_figsize`` — the live data-ViewBox's PHYSICAL on-screen size in inches
+    (``(w_in, h_in)``), or ``None``. Figsize priority, in order:
+      1. an EXPLICIT paper size the user selected in the dialog (A4/A3/A0);
+      2. ``view_figsize`` — the 'Auto (match view)' dynamic page: the page takes
+         the viewport's own proportions/size and GROWS with the zoomed extent at
+         the on-screen scale, never squeezing the section onto a fixed sheet;
+      3. the ``figsize_for_scale`` formula (batch/pool — no live view exists).
     """
     from sbp_studio.viz.render import (build_theme, render_chain_figure,
                                        render_profile_figure)
@@ -240,13 +249,18 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     if view_range is not None:
         obj, data, picks = crop_export_to_view(
             obj, data, t0_full, view_range[0], view_range[1], picks)
-    # figsize: paper size (fixed landscape inches) when the user selected one,
-    # otherwise the view-scale-derived figsize (aspect / VE / hybrid mode).
-    # Paper size exports skip the post-render WYSIWYG aspect loop since the
-    # page dimensions are fixed by the chosen standard size.
+    # figsize priority (see docstring): explicit paper > live viewport (Auto) >
+    # formula. Paper-size exports skip the post-render WYSIWYG aspect loop since
+    # the page dimensions are fixed by the chosen standard size.
     paper_key = cfg.get("paper_size", "")
     if paper_key in PAPER_SIZES:
         figsize = PAPER_SIZES[paper_key]
+    elif (view_figsize is not None and float(view_figsize[0]) > 0
+          and float(view_figsize[1]) > 0):
+        # Auto (match view): the page IS the on-screen viewport, in inches —
+        # dynamic paper that respects the visual scale instead of forcing the
+        # extent onto a fixed sheet (the 'A4 trap').
+        figsize = (float(view_figsize[0]), float(view_figsize[1]))
     else:
         figsize = figsize_for_scale(obj, scale_cfg, int(cfg["dpi"]), cfg["velocity"])
     render_dpi = effective_export_dpi(figsize, data.shape, int(cfg["dpi"]))
