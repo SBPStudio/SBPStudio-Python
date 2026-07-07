@@ -282,7 +282,6 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     dpi_cap = dpi_for_budget(figsize, cfg.get("mem_budget_gb"))
     if dpi_cap is not None and render_dpi > dpi_cap:
         render_dpi = max(50, dpi_cap)
-    eff_aspect = figsize[0] / figsize[1] if figsize[1] > 0 else None
     _LOG.info("export render: figsize=%.2f×%.2f in, dpi=%d (~%.0f Mpx), "
               "budget=%s GB.", figsize[0], figsize[1], render_dpi,
               (figsize[0] * render_dpi) * (figsize[1] * render_dpi) / 1e6,
@@ -325,24 +324,33 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     render_fn = render_chain_figure if kind == "chain" else render_profile_figure
     fig = render_fn(obj, data, params, figsize=figsize, dpi=render_dpi,
                     **render_opts)
-    # WYSIWYG aspect fit: grow the figure so the DATA box hits the mode's effective
-    # aspect at full size (decorations take a fixed inch margin) — restores pixels.
-    # Skipped when a paper size is set: the page dimensions are fixed by the chosen
-    # standard size; the two-pass RGBA sizing inside render_*_figure already ensures
-    # the raster fills the exact axes box without a secondary Matplotlib resample.
-    aspect = None if paper_key in PAPER_SIZES else eff_aspect
-    if aspect:
+    # WYSIWYG data-box fit: ``figsize`` is the target size OF THE DATA BOX
+    # ITSELF (full extents × the on-screen scale, or the formula size); the
+    # page grows beyond it by exactly the MEASURED decoration margins, PER
+    # AXIS. This makes the two axes mathematically independent — compressing
+    # X can never change the page height — and lands in/km + in/ms on the
+    # page EXACTLY. (The former loop was width-anchored: it squeezed the data
+    # box into (page − decorations), shrinking BOTH axes by the decoration
+    # fraction — the 'narrowing X also shortened the page' field bug.)
+    # Skipped when a paper size is set: the page dimensions are fixed by the
+    # chosen standard size.
+    if paper_key not in PAPER_SIZES:
+        target_w, target_h = float(figsize[0]), float(figsize[1])
         seis = next((a for a in fig.axes if a.get_images()), None)
-        if seis is not None:
+        if seis is not None and target_w > 0 and target_h > 0:
             for _ in range(4):
                 fig.canvas.draw()
                 pos = seis.get_position()
                 fw, fh = fig.get_size_inches()
                 if pos.width <= 0 or pos.height <= 0:
                     break
-                data_w = pos.width * fw
-                margin_v = fh - pos.height * fh   # absolute non-data height
-                fig.set_size_inches(fw, data_w / aspect + margin_v)
+                margin_w = fw - pos.width * fw    # decoration inches, X axis
+                margin_h = fh - pos.height * fh   # decoration inches, Y axis
+                new_w = target_w + margin_w
+                new_h = target_h + margin_h
+                if abs(new_w - fw) < 1e-3 and abs(new_h - fh) < 1e-3:
+                    break                          # converged
+                fig.set_size_inches(new_w, new_h)
                 try:
                     fig.tight_layout(pad=1.2)
                 except Exception:

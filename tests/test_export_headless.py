@@ -65,6 +65,15 @@ def _scale_for_page(prof, cfg, w_in, h_in):
     return (w_in / data_km, h_in / rec_ms)
 
 
+def _measure(fig):
+    """(page_w, page_h, data_w, data_h) in inches after the data-box fit."""
+    fig.canvas.draw()
+    fw, fh = fig.get_size_inches()
+    seis = next(a for a in fig.axes if a.get_images())
+    pos = seis.get_position()
+    return float(fw), float(fh), float(pos.width * fw), float(pos.height * fh)
+
+
 @pytest.fixture
 def profile_file(tmp_path):
     p = str(tmp_path / "hp.sgy")
@@ -393,7 +402,7 @@ class TestDynamicPaper:
     """Figsize priority in render_export_figure: explicit paper (A4/A3/A0) >
     FULL line at the viewport scale (Auto) > figsize_for_scale formula."""
 
-    def _fig_size(self, path, cfg_extra, view_scale=None):
+    def _boxes(self, path, cfg_extra, view_scale=None):
         from sbp_studio.core import load_profile
         from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
         prof = load_profile(path, load_traces=True)
@@ -401,39 +410,44 @@ class TestDynamicPaper:
         fig, _dpi = render_export_figure(
             prof, cfg, _params(), [], _scale_cfg(), False, "profile",
             _NoOpCancel(), view_scale=view_scale)
-        size = tuple(fig.get_size_inches())
+        out = _measure(fig)
         fig.clear()
-        return size
+        return out          # (page_w, page_h, data_w, data_h)
 
-    def test_auto_page_is_full_extent_times_scale(self, profile_file):
+    def test_auto_data_box_is_full_extent_times_scale(self, profile_file):
+        """figsize is the DATA-BOX target; the page adds decoration margins."""
         from sbp_studio.core import load_profile
         prof = load_profile(profile_file)
         cfg = dict(_cfg(), paper_size="Auto")
         vs = (2.0, 0.5)
-        w, _h = self._fig_size(profile_file, {"paper_size": "Auto"}, vs)
-        assert w == pytest.approx(_expected_page(prof, cfg, vs)[0])
+        page_w, _ph, data_w, data_h = self._boxes(
+            profile_file, {"paper_size": "Auto"}, vs)
+        exp_w, exp_h = _expected_page(prof, cfg, vs)
+        assert data_w == pytest.approx(exp_w, rel=0.01)
+        assert data_h == pytest.approx(exp_h, rel=0.01)
+        assert page_w > exp_w                       # decorations get THEIR room
 
     def test_explicit_paper_still_wins(self, profile_file):
-        size = self._fig_size(profile_file, {"paper_size": "A4"},
-                              view_scale=(2.0, 0.5))
-        assert size == (pytest.approx(11.69), pytest.approx(8.27))
+        page_w, page_h, _dw, _dh = self._boxes(
+            profile_file, {"paper_size": "A4"}, view_scale=(2.0, 0.5))
+        assert (page_w, page_h) == (pytest.approx(11.69), pytest.approx(8.27))
 
     def test_auto_without_view_falls_back_to_formula(self, profile_file):
         from sbp_studio.core import load_profile
         from sbp_studio.gui.tabs._render import figsize_for_scale
         prof = load_profile(profile_file)
         expect_w = figsize_for_scale(prof, _scale_cfg(), 300, 1500.0)[0]
-        w, _h = self._fig_size(profile_file, {"paper_size": "Auto"})
-        assert w == pytest.approx(expect_w)
+        _pw, _ph, data_w, _dh = self._boxes(profile_file, {"paper_size": "Auto"})
+        assert data_w == pytest.approx(expect_w, rel=0.01)
 
     def test_degenerate_view_scale_ignored(self, profile_file):
         from sbp_studio.core import load_profile
         from sbp_studio.gui.tabs._render import figsize_for_scale
         prof = load_profile(profile_file)
         expect_w = figsize_for_scale(prof, _scale_cfg(), 300, 1500.0)[0]
-        w, _h = self._fig_size(profile_file, {"paper_size": "Auto"},
-                               view_scale=(0.0, 0.5))
-        assert w == pytest.approx(expect_w)
+        _pw, _ph, data_w, _dh = self._boxes(profile_file, {"paper_size": "Auto"},
+                                            view_scale=(0.0, 0.5))
+        assert data_w == pytest.approx(expect_w, rel=0.01)
 
 
 class TestProportionateDecorations:
@@ -501,14 +515,14 @@ class TestFullLineAtViewScale:
         fig, _ = render_export_figure(
             prof, cfg, _params(), [], _scale_cfg(), False, "profile",
             _NoOpCancel(), view_scale=view_scale)
-        size = tuple(fig.get_size_inches())
+        out = _measure(fig)
         fig.clear()
-        return size
+        return out          # (page_w, page_h, data_w, data_h)
 
     def test_full_extent_at_any_zoom_level(self, tmp_path):
         """Two different X scales (a compressed and a stretched view): BOTH
-        pages span the FULL line km — page width == full_km x in_per_km
-        exactly. Nothing is ever cropped by zooming."""
+        exports span the FULL line km — data-box width == full_km x in_per_km.
+        Nothing is ever cropped by zooming."""
         import numpy as np
         from sbp_studio.core import load_profile
         big = str(tmp_path / "big.sgy")
@@ -516,8 +530,35 @@ class TestFullLineAtViewScale:
         d = np.asarray(load_profile(big).dist_km, dtype=float)
         full_km = float(d[-1] - d[0])
         for ipk in (0.15, 0.6):                      # compressed / stretched
-            w, _h = self._page(big, (ipk, 0.05))
-            assert w == pytest.approx(full_km * ipk)
+            _pw, _ph, data_w, _dh = self._page(big, (ipk, 0.05))
+            assert data_w == pytest.approx(full_km * ipk, rel=0.01)
+
+    def test_axes_are_independent(self, tmp_path):
+        """Halving the X scale (narrower page) must NOT move the DATA-BOX
+        height — it is a function of the Y scale and data depth ONLY. (The
+        former width-anchored loop would have ~halved the page height here.)
+        The PAGE height may drift by the decoration delta alone: deco_scale
+        is page-area-based, so the narrower page carries slightly smaller
+        title/label text — the approved proportionality feature, not axis
+        coupling of the data."""
+        big = str(tmp_path / "ind.sgy")
+        make_synthetic_segy(big, n_traces=600, ns=256)
+        _pw1, ph1, _dw1, dh1 = self._page(big, (0.6, 0.05))
+        _pw2, ph2, _dw2, dh2 = self._page(big, (0.3, 0.05))   # X halved
+        assert dh2 == pytest.approx(dh1, rel=0.01)     # DATA: exact
+        # Decoration-only drift (fonts), never the old ~50 % data coupling.
+        assert abs(ph2 - ph1) < 0.75
+        # The drift is fully explained by the decoration margins:
+        assert (ph2 - dh2) - (ph1 - dh1) == pytest.approx(ph2 - ph1, abs=0.05)
+
+    def test_margins_extend_at_constant_ms_per_inch(self, tmp_path):
+        """Export margins grow the data box vertically at the SAME in/ms."""
+        big = str(tmp_path / "mg.sgy")
+        make_synthetic_segy(big, n_traces=200, ns=256)
+        ipm = 0.05
+        _pw0, _ph0, _dw0, dh0 = self._page(big, (0.3, ipm), margins=0.0)
+        _pw1, _ph1, _dw1, dh1 = self._page(big, (0.3, ipm), margins=10.0)
+        assert dh1 - dh0 == pytest.approx(20.0 * ipm, rel=0.02)
 
     def test_batch_payload_carries_the_scale(self, tmp_path):
         """The pool worker honors payload['view_scale']: same file, two
@@ -534,4 +575,7 @@ class TestFullLineAtViewScale:
             assert ok, err
             with Image.open(out) as im:
                 widths[tag] = im.size[0]
-        assert widths["wide"] / widths["narrow"] == pytest.approx(2.0, rel=0.05)
+        # Page = data box + decoration margins, so the raw ratio sits
+        # between the margin-diluted floor and the pure 2x data ratio.
+        ratio = widths["wide"] / widths["narrow"]
+        assert 1.4 < ratio <= 2.05
