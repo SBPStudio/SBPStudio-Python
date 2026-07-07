@@ -175,9 +175,12 @@ def crop_export_to_view(obj, data, t0_full, x_range, y_range, picks=None):
     import numpy as np
     dist = getattr(obj, "dist_km", None)
     if dist is None:
+        _LOG.info("WYSIWYG export: source has no distance axis — full line.")
         return obj, data, picks
     dist = np.asarray(dist, dtype=float)
     if dist.size < 2 or data.size == 0:
+        _LOG.info("WYSIWYG export: degenerate geometry (%d fixes, %d samples)"
+                  " — full line.", dist.size, data.size)
         return obj, data, picks
     n_rows, n_cols = data.shape
     c0, c1, r0, r1 = _view_bounds(obj, data.shape, t0_full, x_range, y_range)
@@ -245,9 +248,14 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
         obj, params, node_cfg, align_enabled, cancel)
     # WYSIWYG export extent: honour the live viewport crop when the caller passed
     # the ViewBox window and the user has zoomed in (a full-line view is a no-op).
+    # The decision is ALWAYS logged — one line in app.log per export states which
+    # path ran, so a field report of a wrong extent is triaged from the log alone.
     if view_range is not None:
         obj, data, picks = crop_export_to_view(
             obj, data, t0_full, view_range[0], view_range[1], picks)
+    else:
+        _LOG.info("WYSIWYG export: no view_range supplied — full-line export "
+                  "(batch/pool path, or no live view).")
     # figsize priority (see docstring): explicit paper > live viewport (Auto) >
     # formula. Paper-size exports skip the post-render WYSIWYG aspect loop since
     # the page dimensions are fixed by the chosen standard size.

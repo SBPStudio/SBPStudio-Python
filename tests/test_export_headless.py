@@ -395,6 +395,57 @@ class TestUncompromisingQuality:
 # now (universal axis-wheel zoom), so there is nothing to sync a widget to.
 
 
+# ── Field triage: every export logs its view decision, unconditionally ─────────
+
+class TestViewDecisionLogging:
+    """One line in app.log per export states which extent path ran (cropped /
+    full view / no view_range) — the instrument that settles any future 'the
+    export ignored my zoom' report from the log alone. core.logger sets the
+    sbp_studio root logger propagate=False (records go only to app.log), so the
+    tests re-enable propagation for caplog to see the records."""
+
+    def _messages(self, caplog):
+        return [r.getMessage() for r in caplog.records]
+
+    def _render(self, path, view):
+        from sbp_studio.core import load_profile
+        from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
+        prof = load_profile(path, load_traces=True)
+        fig, _ = render_export_figure(
+            prof, _cfg(), _params(), [], _scale_cfg(), False, "profile",
+            _NoOpCancel(), view_range=view)
+        fig.clear()
+
+    @pytest.fixture(autouse=True)
+    def _propagate(self, monkeypatch):
+        import logging
+        monkeypatch.setattr(logging.getLogger("sbp_studio"), "propagate", True)
+
+    def test_no_view_range_logged(self, profile_file, caplog):
+        import logging
+        with caplog.at_level(logging.INFO, "sbp_studio.gui.export_headless"):
+            self._render(profile_file, None)
+        assert any("no view_range supplied" in m for m in self._messages(caplog))
+
+    def test_full_view_no_crop_logged(self, profile_file, caplog):
+        import logging
+        with caplog.at_level(logging.INFO, "sbp_studio.gui.export_headless"):
+            self._render(profile_file, ((-1e9, 1e9), (-1e9, 1e9)))
+        assert any("no crop" in m for m in self._messages(caplog))
+
+    def test_crop_bounds_logged(self, profile_file, caplog):
+        import logging
+        import numpy as np
+        from sbp_studio.core import load_profile
+        d = np.asarray(load_profile(profile_file).dist_km, dtype=float)
+        lo, hi = float(d.min()), float(d.max())
+        zoom = ((lo + 0.3 * (hi - lo), lo + 0.7 * (hi - lo)), (-1e9, 1e9))
+        with caplog.at_level(logging.INFO, "sbp_studio.gui.export_headless"):
+            self._render(profile_file, zoom)
+        assert any("cropped to the on-screen window" in m
+                   for m in self._messages(caplog))
+
+
 # ── Dynamic paper: 'Auto (match view)' page vs explicit sheets vs formula ──────
 
 class TestDynamicPaper:
