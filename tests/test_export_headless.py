@@ -501,6 +501,54 @@ class TestDynamicPaper:
         assert w == pytest.approx(expect_w)
 
 
+class TestProportionateDecorations:
+    """Fonts are POINTS (absolute 1/72 in): on the dynamic WYSIWYG page they
+    must scale with the page or a small page drowns in text (the field
+    'massive fonts / cramped colorbar' report). deco_scale = √(area/ref_area),
+    ref = the renderer's default 12×7 page (scale 1.0 there), clamped
+    [0.5, 3.0]."""
+
+    def test_formula(self):
+        from sbp_studio.gui.export_headless import deco_scale_for
+        assert deco_scale_for((12.0, 7.0)) == pytest.approx(1.0)
+        assert deco_scale_for((6.0, 3.5)) == pytest.approx(0.5)   # quarter area
+        assert deco_scale_for((1.0, 1.0)) == 0.5                  # clamp floor
+        assert deco_scale_for((120.0, 70.0)) == 3.0               # clamp ceil
+        assert deco_scale_for((0.0, 7.0)) == 1.0                  # degenerate
+
+    def test_small_page_scales_title_and_colorbar(self, profile_file):
+        """A small Auto page: the renderer-internal title (historical 10 pt)
+        and colorbar label (8 pt) shrink by exactly deco_scale."""
+        from sbp_studio.core import load_profile
+        from sbp_studio.gui.export_headless import (render_export_figure,
+                                                    deco_scale_for, _NoOpCancel)
+        prof = load_profile(profile_file, load_traces=True)
+        cfg = dict(_cfg(), paper_size="Auto")
+        fig, _ = render_export_figure(
+            prof, cfg, _params(), [], _scale_cfg(), False, "profile",
+            _NoOpCancel(), view_figsize=(4.0, 4.0))
+        s = deco_scale_for((4.0, 4.0))
+        assert s == 0.5                                   # clamped floor here
+        seis = next(a for a in fig.axes if a.get_images())
+        cbar = next(a for a in fig.axes if not a.get_images())
+        assert seis.title.get_fontsize() == pytest.approx(10 * s)
+        assert cbar.yaxis.label.get_size() == pytest.approx(8 * s)
+        fig.clear()
+
+    def test_direct_renderer_default_sizes_unchanged(self, profile_file):
+        """CLI zero-regression pin: calling the core renderer WITHOUT
+        deco_scale keeps the historical 10 pt title / 8 pt colorbar label."""
+        from sbp_studio.core import load_profile
+        from sbp_studio.viz.render import render_profile_figure
+        prof = load_profile(profile_file, load_traces=True)
+        fig = render_profile_figure(prof, prof.data, {})
+        seis = next(a for a in fig.axes if a.get_images())
+        cbar = next(a for a in fig.axes if not a.get_images())
+        assert seis.title.get_fontsize() == pytest.approx(10.0)
+        assert cbar.yaxis.label.get_size() == pytest.approx(8.0)
+        fig.clear()
+
+
 class TestWysiwygPhysicalScale:
     """The field 'proportions destroyed' regression (Libre mode, wheel-zoomed
     OUT past the data): the crop clamps to the data bounds, so sizing the page

@@ -200,6 +200,28 @@ def crop_export_to_view(obj, data, t0_full, x_range, y_range, picks=None):
     return clone, crop, picks_out
 
 
+# Reference page for decoration sizing: the renderers' own default figsize
+# (12 × 7 in), where every historical point size (7 pt axes, 10 pt title, 8 pt
+# colorbar label…) is proportionate by construction. deco_scale == 1.0 there.
+_DECO_REF_AREA = 12.0 * 7.0
+
+
+def deco_scale_for(figsize) -> float:
+    """Decoration scale factor for a dynamically-sized page.
+
+    Matplotlib font sizes are POINTS — an absolute physical unit (1/72 in) —
+    so on the WYSIWYG 'Auto' page (which can legitimately be a few inches
+    wide, or metres for a long line) fixed point sizes become disproportionate:
+    massive text crowding a small page, or invisible text on a huge one. Scale
+    every decoration by √(page_area / reference_area) — the geometric mean
+    treats narrow, wide and tall pages symmetrically — clamped to [0.5, 3.0]
+    so text never becomes unreadably small nor comically large."""
+    w, h = float(figsize[0]), float(figsize[1])
+    if w <= 0 or h <= 0:
+        return 1.0
+    return max(0.5, min(3.0, ((w * h) / _DECO_REF_AREA) ** 0.5))
+
+
 def _wysiwyg_figsize(obj, data, cfg, view_range, view_figsize):
     """The 'Auto' page: the DATA region's physical on-screen size, in inches.
 
@@ -336,14 +358,22 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
               "budget=%s GB.", figsize[0], figsize[1], render_dpi,
               (figsize[0] * render_dpi) * (figsize[1] * render_dpi) / 1e6,
               cfg.get("mem_budget_gb"))
+    # Proportionate decorations on the dynamic page: every font (and the
+    # renderer-internal title/colorbar text, via the deco_scale kwarg) is
+    # multiplied by the page-area factor, so the layout reads identically
+    # whether the WYSIWYG page came out 4 inches wide or 40. The user's
+    # dialog font choices scale RELATIVELY (their ratios are preserved).
+    _deco = deco_scale_for(figsize)
     render_opts = dict(
         x_tick_km=cfg["x_tick"], t_tick_ms=cfg["t_tick"], show_grid=cfg["grid"],
         title_override=None, clip_lo=0.0, time_tick_min=cfg["time_ticks"],
         margin_top_ms=cfg["margin_top"], margin_bottom_ms=cfg["margin_bottom"],
-        time_fmt=cfg["time_fmt"], time_font_size=cfg["time_font_size"],
-        time_align=cfg["time_align"], fix_font_size=5.0,
+        time_fmt=cfg["time_fmt"],
+        time_font_size=cfg["time_font_size"] * _deco,
+        time_align=cfg["time_align"], fix_font_size=5.0 * _deco,
         fix_bbox_alpha=cfg["fix_bbox_alpha"], fix_color=cfg["fix_color"],
-        axis_font_size=cfg.get("axis_font_size", 7.0),
+        axis_font_size=cfg.get("axis_font_size", 7.0) * _deco,
+        deco_scale=_deco,
         grid_alpha=cfg.get("grid_alpha", 0.18), grid_lw=cfg.get("grid_lw", 0.5),
         colors=build_theme(theme=cfg["theme"]),
         # Layered render style from the live controls (display_params / scale_cfg),

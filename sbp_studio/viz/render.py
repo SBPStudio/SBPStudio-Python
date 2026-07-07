@@ -928,9 +928,15 @@ def render_profile_figure(
     max_wiggles: int = WIGGLE_MAX_TRACES,
     max_abs_pool: bool = False,
     picks: Optional[list] = None,
+    deco_scale: float = 1.0,
 ) -> Figure:
     """
     Render a seismic profile as a headless Matplotlib figure.
+
+    ``deco_scale`` — multiplier for the renderer-internal decoration sizes
+    (title, colorbar text; the caller-supplied font sizes arrive pre-scaled),
+    so a dynamically-sized WYSIWYG page keeps proportionate text. Default 1.0
+    = the historical fixed sizes (CLI path unchanged).
 
     Layered rendering
     -----------------
@@ -1018,9 +1024,9 @@ def render_profile_figure(
     sm = matplotlib.cm.ScalarMappable(cmap=cmap_name, norm=mcolors.Normalize(vmin, vmax))
     sm.set_array([])
     cb = fig.colorbar(sm, ax=ax, pad=0.01, fraction=0.015)
-    cb.ax.yaxis.set_tick_params(color=C["sub"], labelsize=7)
+    cb.ax.yaxis.set_tick_params(color=C["sub"], labelsize=7 * deco_scale)
     cb.ax.yaxis.set_tick_params(labelcolor=C["sub"])
-    cb.set_label("Amplitude", color=C["sub"], fontsize=8)
+    cb.set_label("Amplitude", color=C["sub"], fontsize=8 * deco_scale)
 
     if title_override:
         title_str = title_override
@@ -1031,7 +1037,8 @@ def render_profile_figure(
         delay_lbl   = "  ·  aligned" if params.get("align") else ""
         title_str   = (f"{sd.name}  ·  {sd.n_traces} tr  ·  "
                        f"{sd.dt_us} µs{preset_lbl}{delay_lbl}")
-    ax.set_title(title_str, color=C["text"], fontsize=10, pad=8)
+    ax.set_title(title_str, color=C["text"], fontsize=10 * deco_scale,
+                 pad=8 * deco_scale)
     _label_x_axis(ax, x_axis, sd.dist_km, d.shape[1], x_tick_km, C,
                   label_font_size=axis_font_size + 2)
     ax.set_ylabel("Time (ms)", color=C["text"], fontsize=axis_font_size + 2)
@@ -1127,9 +1134,13 @@ def render_chain_figure(
     max_wiggles: int = WIGGLE_MAX_TRACES,
     max_abs_pool: bool = False,
     picks: Optional[list] = None,
+    deco_scale: float = 1.0,
 ) -> Figure:
     """
     Render a ProfileChain as a headless Matplotlib figure.
+
+    ``deco_scale`` — internal-decoration multiplier (title, colorbar text);
+    see :func:`render_profile_figure`. Default 1.0 = historical sizes.
 
     Global vmax normalisation (max across segments), boundary vlines, colorbar
     shares the same global vmax — avoids brightness seams at file joins (#15).
@@ -1229,14 +1240,16 @@ def render_chain_figure(
                                       norm=mcolors.Normalize(vmin_cb, vmax_cb))
     sm.set_array([])
     cb = fig.colorbar(sm, ax=ax, pad=0.01, fraction=0.015)
-    cb.ax.yaxis.set_tick_params(color=C["sub"], labelsize=7)
+    cb.ax.yaxis.set_tick_params(color=C["sub"], labelsize=7 * deco_scale)
     cb.ax.yaxis.set_tick_params(labelcolor=C["sub"])
-    cb.set_label("Amplitude (global vmax)", color=C["sub"], fontsize=8)
+    cb.set_label("Amplitude (global vmax)", color=C["sub"],
+                 fontsize=8 * deco_scale)
 
     title_str = title_override or (
         f"{ch.label}  ·  {ch.n_traces} tr  ·  {ch.dt_us} µs  ·  "
         f"{ch.total_km:.1f} km")
-    ax.set_title(title_str, color=C["text"], fontsize=10, pad=8)
+    ax.set_title(title_str, color=C["text"], fontsize=10 * deco_scale,
+                 pad=8 * deco_scale)
     _label_x_axis(ax, x_axis, ch.dist_km, n_traces_native, x_tick_km, C,
                   label_font_size=axis_font_size + 2)
     ax.set_ylabel("Time (ms)", color=C["text"], fontsize=axis_font_size + 2)
