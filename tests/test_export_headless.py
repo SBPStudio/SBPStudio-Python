@@ -499,3 +499,107 @@ class TestDynamicPaper:
         w, _h = self._fig_size(profile_file, {"paper_size": "Auto"},
                                view_figsize=(0.0, 6.0))
         assert w == pytest.approx(expect_w)
+
+
+class TestWysiwygPhysicalScale:
+    """The field 'proportions destroyed' regression (Libre mode, wheel-zoomed
+    OUT past the data): the crop clamps to the data bounds, so sizing the page
+    to the RAW viewport stretched the data across screen area it never
+    occupied (26 km of view over a 17.4 km line → ~49 % horizontal stretch).
+    The invariant pinned here: the Auto page carries the screen's PHYSICAL
+    scale per axis — inches-per-km and inches-per-ms on the page equal the
+    viewport's — zoomed in, out, or mixed."""
+
+    def _figsize(self, path, view_range, view_figsize, margins=0.0):
+        """Returns (page_w, page_h, data_w, data_h) in inches after the full
+        render (incl. the WYSIWYG aspect-fit loop). The pipeline's contract:
+        the page WIDTH is the target width verbatim, and the DATA BOX lands at
+        the target PROPORTIONS (the loop re-derives the page height so the
+        decorations get their own room) — so scale assertions go against the
+        page width and the data-box aspect."""
+        from sbp_studio.core import load_profile
+        from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
+        prof = load_profile(path, load_traces=True)
+        cfg = dict(_cfg(), paper_size="Auto", margin_top=margins,
+                   margin_bottom=margins)
+        fig, _ = render_export_figure(
+            prof, cfg, _params(), [], _scale_cfg(), False, "profile",
+            _NoOpCancel(), view_range=view_range, view_figsize=view_figsize)
+        fig.canvas.draw()
+        fw, fh = fig.get_size_inches()
+        seis = next(a for a in fig.axes if a.get_images())
+        pos = seis.get_position()
+        out = (float(fw), float(fh), float(pos.width * fw), float(pos.height * fh))
+        fig.clear()
+        return out
+
+    def test_zoomed_out_page_shrinks_to_data_not_viewport(self, tmp_path):
+        """View exactly 2× the data extent on BOTH axes → the data occupies
+        half the screen each way, so the page must be HALF the viewport per
+        axis (data at true on-screen scale), not the full viewport."""
+        import numpy as np
+        from sbp_studio.core import load_profile
+        big = str(tmp_path / "big.sgy")
+        make_synthetic_segy(big, n_traces=600, ns=256)
+        prof = load_profile(big)
+        d = np.asarray(prof.dist_km, dtype=float)
+        x_ext = float(d[-1] - d[0])
+        rec_ms = prof.ns * prof.dt_us / 1000.0
+        t0 = float(prof.delay_ms)
+        # Centered view, twice the data extent per axis → no crop occurs.
+        view = ((float(d[0]) - x_ext / 2, float(d[-1]) + x_ext / 2),
+                (t0 - rec_ms / 2, t0 + rec_ms * 1.5))
+        w, _h, dw, dh = self._figsize(big, view, (10.0, 6.0))
+        # Page width = data at true on-screen scale: HALF the viewport, not
+        # the full 10 in (which would be the reported ~2× horizontal stretch).
+        assert w == pytest.approx(10.0 / 2, rel=1e-6)
+        # Data-box proportions = the on-screen proportions (5.0 × 3.0 target).
+        # 4 % tolerance: the aspect-fit loop's 4-iteration convergence leaves a
+        # small residual on a small page (decorations proportionally large) —
+        # the regression this guards against is a ~50-100 % stretch.
+        assert dw / dh == pytest.approx(5.0 / 3.0, rel=0.04)
+
+    def test_zoomed_in_preserves_inches_per_km(self, tmp_path):
+        """Zoomed inside the data: page width / cropped km == viewport width /
+        view km (trace-snapping makes the crop a whisker wider than the view —
+        the SCALE, not the raw size, is the invariant)."""
+        import numpy as np
+        from sbp_studio.core import load_profile
+        from sbp_studio.gui.export_headless import (crop_export_to_view,
+                                                    process_full_array,
+                                                    _NoOpCancel)
+        big = str(tmp_path / "big.sgy")
+        make_synthetic_segy(big, n_traces=600, ns=256)
+        prof = load_profile(big, load_traces=True)
+        d = np.asarray(prof.dist_km, dtype=float)
+        lo, hi = float(d.min()), float(d.max())
+        view = ((lo + 0.25 * (hi - lo), lo + 0.65 * (hi - lo)), (-1e9, 1e9))
+        view_km = view[0][1] - view[0][0]
+        # The exact crop the renderer will draw (same code path).
+        data, t0f = process_full_array(prof, _params(), [], False, _NoOpCancel())
+        cobj, cdata, _ = crop_export_to_view(prof, data, t0f,
+                                             view[0], view[1], None)
+        crop_km = float(cobj.dist_km[-1] - cobj.dist_km[0])
+        w, _h, _dw, _dh = self._figsize(big, view, (10.0, 6.0))
+        assert w / crop_km == pytest.approx(10.0 / view_km, rel=1e-6)
+
+    def test_margins_ride_along_in_height(self, tmp_path):
+        """Export margins extend the page vertically at the SAME ms-per-inch,
+        so the data itself stays at true scale."""
+        import numpy as np
+        from sbp_studio.core import load_profile
+        big = str(tmp_path / "m.sgy")
+        make_synthetic_segy(big, n_traces=200, ns=256)
+        prof = load_profile(big)
+        rec_ms = prof.ns * prof.dt_us / 1000.0
+        t0 = float(prof.delay_ms)
+        d = np.asarray(prof.dist_km, dtype=float)
+        view = ((float(d[0]), float(d[-1])), (t0, t0 + rec_ms))  # exact fit
+        _w0, _h0, dw0, dh0 = self._figsize(big, view, (10.0, 6.0), margins=0.0)
+        _w1, _h1, dw1, dh1 = self._figsize(big, view, (10.0, 6.0), margins=10.0)
+        # Margins extend the raster by 20 ms at the SAME ms-per-inch, so the
+        # data-box aspect must scale by exactly rec_ms/(rec_ms + 20).
+        ratio0 = dw0 / dh0
+        ratio1 = dw1 / dh1
+        assert ratio1 / ratio0 == pytest.approx(rec_ms / (rec_ms + 20.0),
+                                                rel=0.02)

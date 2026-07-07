@@ -200,6 +200,48 @@ def crop_export_to_view(obj, data, t0_full, x_range, y_range, picks=None):
     return clone, crop, picks_out
 
 
+def _wysiwyg_figsize(obj, data, cfg, view_range, view_figsize):
+    """The 'Auto' page: the DATA region's physical on-screen size, in inches.
+
+    The raw ``view_figsize`` is the WHOLE ViewBox — but when the user zooms
+    OUT past the data on an axis, the data occupies only part of the screen,
+    while the export crop is clamped to the data bounds. Sizing the page to
+    the full viewport would stretch the clamped crop across it (the reported
+    'proportions destroyed' failure: 26 km of view over a 17.4 km line →
+    ~49 % horizontal stretch). WYSIWYG means the PHYSICAL SCALE must carry
+    over, per axis: inches-per-km and inches-per-ms on the page must equal
+    the screen's. So convert the on-screen scale (view extent over viewport
+    inches) to the POST-CROP data extents:
+
+        page_w = data_km · (viewport_w_in / view_km)
+        page_h = (data_ms + margins) · (viewport_h_in / view_ms)
+
+    Zoomed IN, crop extent ≈ view extent → page ≈ viewport (unchanged
+    behaviour). Zoomed OUT, the page shrinks to the data's true on-screen
+    size instead of stretching the data. The export margins ride along in
+    height so the data itself stays at true scale. Falls back to the raw
+    viewport inches when the scale cannot be derived (no view_range or
+    degenerate extents)."""
+    import numpy as np
+    w_in, h_in = float(view_figsize[0]), float(view_figsize[1])
+    if view_range is None:
+        return (w_in, h_in)
+    xa, xb = sorted((float(view_range[0][0]), float(view_range[0][1])))
+    ya, yb = sorted((float(view_range[1][0]), float(view_range[1][1])))
+    view_km, view_ms = xb - xa, yb - ya
+    dist = np.asarray(getattr(obj, "dist_km", ()), dtype=float)
+    if view_km <= 0 or view_ms <= 0 or dist.size < 2 or data.size == 0:
+        return (w_in, h_in)
+    data_km = float(dist[-1] - dist[0])
+    data_ms = data.shape[0] * float(obj.dt_us) / 1000.0
+    data_ms += (float(cfg.get("margin_top") or 0.0)
+                + float(cfg.get("margin_bottom") or 0.0))
+    if data_km <= 0 or data_ms <= 0:
+        return (w_in, h_in)
+    return (max(0.5, data_km * w_in / view_km),
+            max(0.5, data_ms * h_in / view_ms))
+
+
 # ── Export figure render (moved verbatim from gui.tabs._base) ──────────────────
 
 def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
@@ -264,10 +306,13 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
         figsize = PAPER_SIZES[paper_key]
     elif (view_figsize is not None and float(view_figsize[0]) > 0
           and float(view_figsize[1]) > 0):
-        # Auto (match view): the page IS the on-screen viewport, in inches —
-        # dynamic paper that respects the visual scale instead of forcing the
-        # extent onto a fixed sheet (the 'A4 trap').
-        figsize = (float(view_figsize[0]), float(view_figsize[1]))
+        # Auto (match view): dynamic paper sized so the PHYSICAL on-screen
+        # scale (km/in, ms/in) carries onto the page exactly — the cropped
+        # data extents at the viewport's scale, NOT the raw viewport rect
+        # (which would stretch a data-clamped crop when the user has zoomed
+        # OUT past the data). See _wysiwyg_figsize. Computed AFTER the crop,
+        # from the same obj/data the renderer will draw.
+        figsize = _wysiwyg_figsize(obj, data, cfg, view_range, view_figsize)
     else:
         figsize = figsize_for_scale(obj, scale_cfg, int(cfg["dpi"]), cfg["velocity"])
     render_dpi = effective_export_dpi(figsize, data.shape, int(cfg["dpi"]))
