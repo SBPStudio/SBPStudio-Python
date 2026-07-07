@@ -238,8 +238,7 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
                                        render_profile_figure)
     from sbp_studio.gui.tabs._render import (PAPER_SIZES, dpi_for_budget,
                                              effective_export_dpi,
-                                             figsize_for_scale, hard_dpi_cap,
-                                             MAX_EXPORT_MEGAPIXELS)
+                                             figsize_for_scale)
     # Full-resolution DSP pipeline (alignment + nodes) — shared with the viewport
     # HQ export so the crop is processed identically.
     data, t0_full = process_full_array(
@@ -269,42 +268,21 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     # grid; for a long/deep line that is gigapixels → the GUI export hangs. Cap the
     # DPI to what the budget allows. figsize (the aspect/VE proportions) is kept
     # exact — only pixel density drops, exactly like the CLI's coupled down-scale.
+    # UNCOMPROMISING QUALITY (user directive): there is NO hidden hard pixel
+    # ceiling. The ONLY limit on the canvas is the USER-OWNED memory budget
+    # (the export dialog's 'Memory budget (GB)' — cfg["mem_budget_gb"]): its
+    # DPI clamp is announced in the dialog BEFORE exporting, and the dialog
+    # separately warns when the budget exceeds the machine's free RAM. A
+    # 64 GB workstation with a raised budget gets its full-resolution export;
+    # driving the budget past physical RAM is an informed user decision.
     dpi_cap = dpi_for_budget(figsize, cfg.get("mem_budget_gb"))
     if dpi_cap is not None and render_dpi > dpi_cap:
         render_dpi = max(50, dpi_cap)
     eff_aspect = figsize[0] / figsize[1] if figsize[1] > 0 else None
-    # HARD canvas ceiling (MAX_EXPORT_MEGAPIXELS) — the non-negotiable guard the
-    # RAM budget alone failed to provide in the field (a 6 GB default budget
-    # admits ~358 Mpx; a ~293 Mpx draw MemoryError-crashed an 8 GB laptop).
-    # Two properties make this cap airtight where the budget cap wasn't:
-    #   1. It is ABSOLUTE — a mis-set/omitted budget can never lift it.
-    #   2. It is computed against the PROJECTED post-WYSIWYG size, not the
-    #      initial figsize: the aspect-fit loop below GROWS the figure height
-    #      toward width/aspect and calls fig.canvas.draw() at each step, so a
-    #      cap taken at the initial height would be exceeded mid-loop — the
-    #      exact allocation that produced the field crash.
-    # Only the DPI drops (graceful downscale); figsize — the physical
-    # proportions, aspect and VE — is never touched.
-    proj_h = figsize[1]
-    if paper_key not in PAPER_SIZES and eff_aspect:
-        # The fit loop drives height → data_width/aspect + decoration margin;
-        # 2.0 in is a conservative allowance for the decorations.
-        proj_h = max(proj_h, figsize[0] / eff_aspect + 2.0)
-    # Ceiling passed explicitly (not via the def-time default) so it reads the
-    # CURRENT module constant — tests shrink it to exercise this path cheaply.
-    hard_cap = hard_dpi_cap((figsize[0], proj_h), MAX_EXPORT_MEGAPIXELS)
-    if hard_cap is not None and render_dpi > hard_cap:
-        _LOG.warning(
-            "Export canvas would reach %.0f Mpx (%.1f×%.1f in @ %d DPI) — "
-            "beyond the %.0f Mpx safety ceiling. DPI reduced to %d to prevent "
-            "an out-of-memory crash; physical size and proportions unchanged.",
-            (figsize[0] * render_dpi) * (proj_h * render_dpi) / 1e6,
-            figsize[0], proj_h, render_dpi, MAX_EXPORT_MEGAPIXELS,
-            max(1, hard_cap))
-        # No 50-DPI floor here (unlike the budget cap): a floor above the
-        # ceiling would silently re-inflate a pathological figsize past the
-        # very limit this guard exists to enforce. The ceiling always wins.
-        render_dpi = max(1, hard_cap)
+    _LOG.info("export render: figsize=%.2f×%.2f in, dpi=%d (~%.0f Mpx), "
+              "budget=%s GB.", figsize[0], figsize[1], render_dpi,
+              (figsize[0] * render_dpi) * (figsize[1] * render_dpi) / 1e6,
+              cfg.get("mem_budget_gb"))
     render_opts = dict(
         x_tick_km=cfg["x_tick"], t_tick_ms=cfg["t_tick"], show_grid=cfg["grid"],
         title_override=None, clip_lo=0.0, time_tick_min=cfg["time_ticks"],
