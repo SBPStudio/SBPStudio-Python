@@ -579,3 +579,58 @@ class TestFullLineAtViewScale:
         # between the margin-diluted floor and the pure 2x data ratio.
         ratio = widths["wide"] / widths["narrow"]
         assert 1.4 < ratio <= 2.05
+
+
+# ── Physical page ceiling: the PDF 200-inch / Acrobat limit (field crash) ──────
+
+class TestPageCeiling:
+    """An unbounded Auto page (long line x generous in/km) exceeded the PDF
+    format's 200x200 in maximum — Acrobat refused the file ('Page dimensions
+    exceed limits'). The finished page is now uniformly print-scaled under
+    MAX_PAGE_IN with inverse-DPI compensation: aspect, VE and the total pixel
+    count are preserved exactly."""
+
+    def _render(self, path, view_scale, cfg_dpi=50):
+        from sbp_studio.core import load_profile
+        from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
+        prof = load_profile(path, load_traces=True)
+        cfg = dict(_cfg(), dpi=cfg_dpi, paper_size="Auto")
+        fig, dpi = render_export_figure(
+            prof, cfg, _params(), [], _scale_cfg(), False, "profile",
+            _NoOpCancel(), view_scale=view_scale)
+        fw, fh = (float(v) for v in fig.get_size_inches())
+        fig.clear()
+        return fw, fh, dpi
+
+    def test_oversized_page_clamped_uniformly_pixels_preserved(
+            self, tmp_path, monkeypatch, caplog):
+        import logging
+        import numpy as np
+        import sbp_studio.gui.export_headless as EH
+        from sbp_studio.core import load_profile
+        big = str(tmp_path / "long.sgy")
+        make_synthetic_segy(big, n_traces=600, ns=256)
+        d = np.asarray(load_profile(big).dist_km, dtype=float)
+        ipk = 260.0 / float(d[-1] - d[0])       # ~260 in wide -> over the limit
+        monkeypatch.setattr(logging.getLogger("sbp_studio"), "propagate", True)
+        # Unclamped reference (ceiling lifted) for ratio + pixel-count checks.
+        monkeypatch.setattr(EH, "MAX_PAGE_IN", 1e9)
+        fw0, fh0, dpi0 = self._render(big, (ipk, 0.05))
+        assert fw0 > 200.0                       # genuinely oversized without it
+        monkeypatch.setattr(EH, "MAX_PAGE_IN", 199.0)
+        with caplog.at_level(logging.WARNING, "sbp_studio.gui.export_headless"):
+            fw1, fh1, dpi1 = self._render(big, (ipk, 0.05))
+        assert max(fw1, fh1) <= 199.0 + 1e-6
+        # Uniform: aspect preserved to numerical precision.
+        assert fw1 / fh1 == pytest.approx(fw0 / fh0, rel=1e-6)
+        # Pixel count preserved (inverse-DPI compensation), within rounding.
+        assert fw1 * dpi1 == pytest.approx(fw0 * dpi0, rel=0.01)
+        assert any("ceiling" in r.getMessage() for r in caplog.records)
+
+    def test_normal_page_untouched(self, profile_file, monkeypatch, caplog):
+        import logging
+        monkeypatch.setattr(logging.getLogger("sbp_studio"), "propagate", True)
+        with caplog.at_level(logging.WARNING, "sbp_studio.gui.export_headless"):
+            fw, fh, _dpi = self._render(profile_file, (2.0, 0.5), cfg_dpi=300)
+        assert max(fw, fh) < 199.0
+        assert not any("ceiling" in r.getMessage() for r in caplog.records)

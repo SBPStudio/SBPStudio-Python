@@ -152,6 +152,19 @@ def _crop_for_viewport(obj, proc, t0_full, x_range, y_range):
 # survives solely for the in-viewer HQ overlay (``_crop_for_viewport``).
 
 
+# HARD physical page ceiling, inches per axis. The PDF format caps a page at
+# 14 400 × 14 400 user units = 200 × 200 in — Acrobat refuses to open anything
+# larger ('Page dimensions exceed limits', field-confirmed), and Matplotlib's
+# Agg canvas separately caps each axis at 2^16 px. An unbounded 'Auto' page
+# (long line × generous in/km) can exceed both. When the finished page is
+# over the ceiling it is scaled UNIFORMLY (both axes by the same factor —
+# aspect and VE untouched) and the DPI is raised by the inverse factor, so
+# the PIXEL COUNT IS PRESERVED exactly: this is a print-scale reduction, not
+# a quality cap (uncompromising-quality directive intact). 199 leaves margin
+# under the 200 limit.
+MAX_PAGE_IN = 199.0
+
+
 # Reference page for decoration sizing: the renderers' own default figsize
 # (12 × 7 in), where every historical point size (7 pt axes, 10 pt title, 8 pt
 # colorbar label…) is proportionate by construction. deco_scale == 1.0 there.
@@ -355,6 +368,22 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
                     fig.tight_layout(pad=1.2)
                 except Exception:
                     pass
+    # Physical page ceiling (PDF 200 in limit / Agg 2^16 px — see MAX_PAGE_IN).
+    # Applied to the FINISHED page (after the data-box growth), scaled
+    # uniformly with inverse-DPI compensation: proportions, VE and the total
+    # pixel count are all preserved exactly.
+    fw, fh = fig.get_size_inches()
+    over = max(float(fw), float(fh)) / MAX_PAGE_IN
+    if over > 1.0:
+        s = 1.0 / over
+        fig.set_size_inches(fw * s, fh * s)
+        new_dpi = max(1, int(round(render_dpi / s)))
+        _LOG.warning(
+            "export page %.0f×%.0f in exceeds the %.0f in PDF/renderer ceiling"
+            " — uniformly print-scaled to %.1f×%.1f in; DPI %d→%d (pixel "
+            "count preserved).", fw, fh, MAX_PAGE_IN, fw * s, fh * s,
+            render_dpi, new_dpi)
+        render_dpi = new_dpi
     return fig, render_dpi
 
 
