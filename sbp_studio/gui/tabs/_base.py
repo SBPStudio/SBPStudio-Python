@@ -238,7 +238,8 @@ def _crop_for_viewport(obj, proc, t0_full, x_range, y_range):
 
 
 def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
-                          handler, cancel, picks=None, view_scale=None):
+                          handler, cancel, picks=None, view_scale=None,
+                          user_scaled=False):
     """Delegates to the extracted Qt-free engine — see
     ``gui.export_headless.render_export_figure`` (the former body of this
     function, moved VERBATIM: same DSP pass, same RAM-capped DPI, same WYSIWYG
@@ -253,7 +254,8 @@ def _render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     kind = getattr(handler, "render_kind", "profile")
     return render_export_figure(obj, cfg, params, node_cfg, scale_cfg,
                                 align_enabled, kind, cancel, picks=picks,
-                                view_scale=view_scale)
+                                view_scale=view_scale,
+                                user_scaled=user_scaled)
 
 
 class SubTabbedTab(QWidget):
@@ -773,6 +775,10 @@ class SubTabbedTab(QWidget):
         # live view) → the formula figsize.
         _has_view = self._seismic is not None and self._seismic.has_image()
         view_scale = self._seismic.current_view_scale() if _has_view else None
+        # Stretch-vs-letterbox discriminator for fixed paper sizes: only a
+        # view the user ACTIVELY re-proportioned (wheel zoom / scale preset)
+        # letterboxes; a default auto-fitted view fills the sheet.
+        user_scaled = self._seismic.view_is_user_scaled() if _has_view else False
 
         def job(progress, cancel) -> str:
             from sbp_studio.viz.render import save_figure
@@ -787,7 +793,7 @@ class SubTabbedTab(QWidget):
             # + decimation-free DPI floor + WYSIWYG aspect fit.
             fig, render_dpi = _render_export_figure(
                 _obj, cfg, params, node_cfg, scale_cfg, align_enabled, handler, cancel,
-                picks=picks, view_scale=view_scale)
+                picks=picks, view_scale=view_scale, user_scaled=user_scaled)
             try:
                 save_figure(fig, out, dpi=render_dpi, fmt=fmt, pdf_page=cfg["pdf_page"])
             except OSError as exc:
@@ -947,6 +953,9 @@ class SubTabbedTab(QWidget):
         view_scale = (self._seismic.current_view_scale()
                       if self._seismic is not None and self._seismic.has_image()
                       else None)
+        user_scaled = (self._seismic.view_is_user_scaled()
+                       if self._seismic is not None and self._seismic.has_image()
+                       else False)
 
         valid = [o for o in items
                  if o is not None and not getattr(o, "error", None)]
@@ -972,7 +981,8 @@ class SubTabbedTab(QWidget):
                 try:
                     fig, render_dpi = _render_export_figure(
                         render_obj, cfg, params, node_cfg, scale_cfg,
-                        align_enabled, handler, cancel, view_scale=view_scale)
+                        align_enabled, handler, cancel, view_scale=view_scale,
+                        user_scaled=user_scaled)
                     save_figure(fig, str(out), dpi=render_dpi, fmt=fmt,
                                 pdf_page=cfg["pdf_page"])
                 finally:
@@ -1009,7 +1019,7 @@ class SubTabbedTab(QWidget):
                         fmt=fmt, pdf_page=cfg["pdf_page"],
                         cfg=per_worker_cfg, params=params, node_cfg=node_cfg,
                         scale_cfg=scale_cfg, align_enabled=align_enabled,
-                        view_scale=view_scale,
+                        view_scale=view_scale, user_scaled=user_scaled,
                     ) for obj in valid]
                     return run_batch_export_pool(
                         payloads, n_workers, progress=_report, cancel=cancel)

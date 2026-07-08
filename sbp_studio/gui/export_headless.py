@@ -220,7 +220,8 @@ def _page_from_scale(obj, data, cfg, view_scale):
 # ── Export figure render (moved verbatim from gui.tabs._base) ──────────────────
 
 def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
-                         kind, cancel, picks=None, view_scale=None):
+                         kind, cancel, picks=None, view_scale=None,
+                         user_scaled=False):
     """Shared per-item export render — used by the single export, the
     sequential batch AND the process-pool batch, so their quality can never
     drift.
@@ -268,21 +269,25 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     paper_key = cfg.get("paper_size", "")
     scaled = (_page_from_scale(obj, data, cfg, view_scale)
               if view_scale is not None else None)
-    # Fixed paper + a live custom scale → LETTERBOX (non-negotiable field
-    # rule): the data box keeps the PROPORTIONS of the user's on-screen scale
-    # (the same bounding box the Auto page would produce) and is fitted
-    # inside the sheet with empty margins — never stretched to fill it.
+    # Fixed paper: stretch vs letterbox is decided by ``user_scaled`` (field
+    # rule). A DEFAULT auto-fitted view (the user just clicked the file) fills
+    # the whole sheet in both axes — the historical fixed-paper behaviour,
+    # vertical deformation and all: that is the point of a fixed sheet. Only
+    # when the user ACTIVELY changed the visual proportion (wheel zoom /
+    # scale-mode preset — SeismicView.view_is_user_scaled) is the data box
+    # LETTERBOXED to that proportion (the same bounding box the Auto page
+    # would produce), fitted inside the sheet with empty margins.
     box_aspect = None
     if paper_key in PAPER_SIZES:
         figsize = PAPER_SIZES[paper_key]
-        if scaled is not None and scaled[0] > 0:
+        if user_scaled and scaled is not None and scaled[0] > 0:
             box_aspect = float(scaled[1]) / float(scaled[0])   # h/w ratio
             _LOG.info("export sizing: fixed paper %s, letterboxed to the "
-                      "on-screen proportion (data box h/w=%.4f).",
+                      "USER-set proportion (data box h/w=%.4f).",
                       paper_key, box_aspect)
         else:
-            _LOG.info("export sizing: fixed paper %s (no live scale — "
-                      "historical fill).", paper_key)
+            _LOG.info("export sizing: fixed paper %s, filled (default "
+                      "auto-fit view — historical stretch).", paper_key)
     elif scaled is not None:
         figsize = scaled
         _LOG.info("export sizing: FULL line at the on-screen scale "
@@ -428,7 +433,8 @@ def render_batch_item(payload: dict) -> tuple:
         fig, render_dpi = render_export_figure(
             prof, payload["cfg"], payload["params"], payload["node_cfg"],
             payload["scale_cfg"], payload["align_enabled"], "profile",
-            _NoOpCancel(), view_scale=payload.get("view_scale"))
+            _NoOpCancel(), view_scale=payload.get("view_scale"),
+            user_scaled=bool(payload.get("user_scaled", False)))
         save_figure(fig, out, dpi=render_dpi, fmt=payload["fmt"],
                     pdf_page=payload["pdf_page"])
         return (out, True, "")

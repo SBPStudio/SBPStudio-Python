@@ -222,3 +222,55 @@ class TestExportDialogPaperOrder:
         assert dlg.cb_papersize.currentText() == "A4"
         assert dlg.config()["paper_size"] == "A4"
         dlg.deleteLater()
+
+
+# ── 8. SeismicView 'user-modified scale' tracker (stretch-vs-letterbox) ──
+
+class TestUserScaledTracker:
+    def test_tracker_state_machine(self):
+        pytest.importorskip("PyQt6")
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance() or QApplication([])
+        # Known pytest/PyQt isolation artifact (see TestTracesPerCmControl's
+        # docstring): earlier Qt-widget tests in this process can leave the
+        # app-wide language_manager singleton's C++ object deleted, which
+        # fails ANY later widget construction. Skip in that case — this test
+        # is fully exercised when run in isolation / its own process.
+        from sbp_studio.gui.i18n import language_manager
+        try:
+            language_manager.objectName()
+        except RuntimeError:
+            pytest.skip("language_manager C++ object deleted by an earlier "
+                        "Qt test in this process (known isolation artifact)")
+        from sbp_studio.gui.components.seismic_view import SeismicView
+
+        view = SeismicView()
+        # Fresh view: default (unmodified) state.
+        assert view.view_is_user_scaled() is False
+
+        # Applying a scale-mode preset is a deliberate proportion choice.
+        view.set_aspect(2.0)
+        assert view.view_is_user_scaled() is True
+
+        # Libre (None) auto-fits → back to the default state.
+        view.set_aspect(None)
+        assert view.view_is_user_scaled() is False
+
+        # Manual interaction that changes the EXTENTS → user-scaled…
+        vb = view.plot.getViewBox()
+        (x0, x1), (y0, y1) = vb.viewRange()
+        view._fit_extents = (abs(x1 - x0), abs(y1 - y0))
+        vb.setXRange(x0, x0 + (x1 - x0) * 2.0, padding=0)   # zoomed out 2x
+        view._on_manual_range_change()
+        assert view.view_is_user_scaled() is True
+
+        # …but a pure PAN (same extents, shifted centre) stays default.
+        view.set_aspect(None)                                # reset
+        assert view.view_is_user_scaled() is False
+        (x0, x1), (y0, y1) = vb.viewRange()
+        view._fit_extents = (abs(x1 - x0), abs(y1 - y0))
+        span = x1 - x0
+        vb.setXRange(x0 + span * 0.3, x1 + span * 0.3, padding=0)
+        view._on_manual_range_change()
+        assert view.view_is_user_scaled() is False
+        view.deleteLater()

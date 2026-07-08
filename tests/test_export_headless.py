@@ -644,14 +644,14 @@ class TestPaperLetterbox:
     and be fitted inside the sheet with empty margins — never stretched to
     fill the paper width."""
 
-    def _boxes(self, path, view_scale):
+    def _boxes(self, path, view_scale, user_scaled=True):
         from sbp_studio.core import load_profile
         from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
         prof = load_profile(path, load_traces=True)
         cfg = dict(_cfg(), paper_size="A4")
         fig, _ = render_export_figure(
             prof, cfg, _params(), [], _scale_cfg(), False, "profile",
-            _NoOpCancel(), view_scale=view_scale)
+            _NoOpCancel(), view_scale=view_scale, user_scaled=user_scaled)
         out = _measure(fig)
         fig.clear()
         return out          # (page_w, page_h, data_w, data_h)
@@ -681,6 +681,25 @@ class TestPaperLetterbox:
         assert (page_w, page_h) == (pytest.approx(11.69), pytest.approx(8.27))
         # Filled: landscape-ish data box (h/w well below the 1.5 letterbox).
         assert data_h / data_w < 1.0
+
+    def test_default_autofit_view_fills_the_sheet(self, tmp_path):
+        """THE FIELD RULE: an unmodified (default auto-fit) view + A4 must
+        STRETCH to fill the sheet in both axes — historical behaviour, even
+        if it vertically deforms the profile. The letterbox engages ONLY for
+        a user-manipulated proportion (user_scaled=True)."""
+        import numpy as np
+        from sbp_studio.core import load_profile
+        big = str(tmp_path / "def.sgy")
+        make_synthetic_segy(big, n_traces=600, ns=256)
+        prof = load_profile(big)
+        cfg = dict(_cfg(), paper_size="A4")
+        vs = _scale_for_page(prof, cfg, 4.0, 6.0)   # a tall/narrow proportion
+        # Same scale snapshot, DEFAULT state → filled, not letterboxed.
+        _pw, _ph, dw_fill, dh_fill = self._boxes(big, vs, user_scaled=False)
+        assert dh_fill / dw_fill < 1.0               # sheet-filling landscape
+        # Same scale snapshot, USER state → letterboxed to the 1.5 ratio.
+        _pw2, _ph2, dw_lb, dh_lb = self._boxes(big, vs, user_scaled=True)
+        assert dh_lb / dw_lb == pytest.approx(1.5, rel=0.02)
 
     def test_direct_renderer_default_has_no_box_aspect(self, profile_file):
         """CLI zero-regression: no box_aspect → the axes box is NOT ratio-

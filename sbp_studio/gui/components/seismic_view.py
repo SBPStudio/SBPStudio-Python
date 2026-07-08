@@ -435,6 +435,15 @@ class SeismicView(QWidget):
 
         # Connect dynamic-zoom handler.
         self.plot.getViewBox().sigRangeChanged.connect(self._on_range_changed)
+        # 'User-modified scale' tracker (export stretch-vs-letterbox rule): a
+        # fresh selection fit is the DEFAULT state; only a USER interaction
+        # that changes the view EXTENTS (wheel zoom — sigRangeChangedManually
+        # never fires for programmatic setRange/autoRange) marks the view as
+        # custom-scaled. Panning keeps the extents → stays default.
+        self._user_scaled: bool = False
+        self._fit_extents: Optional[Tuple[float, float]] = None
+        self.plot.getViewBox().sigRangeChangedManually.connect(
+            self._on_manual_range_change)
         # Single-click (non-drag) → emit the trace index under the cursor.
         self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
         # Live hover → cursor_trace_changed (cross-module navigation cursor).
@@ -542,6 +551,11 @@ class SeismicView(QWidget):
         self._aspect = aspect
         vb = self.plot.getViewBox()
         vb.setAspectLocked(False)
+        # Applying a preset is a deliberate proportion choice → the view is
+        # 'user-scaled' (fixed-paper exports letterbox it). A selection fit
+        # arriving afterwards resets this to the default state; Libre (None)
+        # auto-fits below and is itself the default.
+        self._user_scaled = bool(aspect)
         d0, d1, t0, t1 = self._rect
         x_ext, y_ext = (d1 - d0), (t1 - t0)
         if aspect and x_ext > 0 and y_ext > 0:
@@ -563,6 +577,9 @@ class SeismicView(QWidget):
                          padding=0)
         else:
             self.plot.autoRange()
+            # Libre's auto-fit is a fresh default state — rebase the tracker.
+            (fx0, fx1), (fy0, fy1) = vb.viewRange()
+            self._fit_extents = (abs(fx1 - fx0), abs(fy1 - fy0))
 
     def has_image(self) -> bool:
         # True for both paths: the static display buffer (_arr) and the
@@ -1367,6 +1384,11 @@ class SeismicView(QWidget):
             # its value (_on_scale_changed); a fresh selection always fits.
             vb = self.plot.getViewBox()
             vb.autoRange(items=[self.img], padding=0.02)
+            # A fresh fit is the DEFAULT (unmodified) state: record its
+            # extents as the baseline the manual-change tracker compares to.
+            (fx0, fx1), (fy0, fy1) = vb.viewRange()
+            self._fit_extents = (abs(fx1 - fx0), abs(fy1 - fy0))
+            self._user_scaled = False
         if self._picks:
             self._redraw_picks()
         self._reposition_boundaries()
@@ -1523,6 +1545,32 @@ class SeismicView(QWidget):
             return
         self._vt_last_value = val
         self.visible_traces_changed.emit(*val)
+
+    def _on_manual_range_change(self, *_args) -> None:
+        """A USER interaction (wheel/drag — pyqtgraph emits
+        sigRangeChangedManually only for those, never for programmatic
+        setRange/autoRange) changed the view. Mark the view as custom-scaled
+        ONLY if the EXTENTS moved beyond noise vs the last fit baseline — a
+        pan changes the centre, not the scale, and stays 'default'. Sticky
+        until the next selection fit resets it."""
+        if self._user_scaled:
+            return
+        (x0, x1), (y0, y1) = self.plot.getViewBox().viewRange()
+        ex, ey = abs(x1 - x0), abs(y1 - y0)
+        base = self._fit_extents
+        if base is None or base[0] <= 0 or base[1] <= 0:
+            self._user_scaled = True
+            return
+        if abs(ex - base[0]) / base[0] > 0.02 or \
+                abs(ey - base[1]) / base[1] > 0.02:
+            self._user_scaled = True
+
+    def view_is_user_scaled(self) -> bool:
+        """True when the user has actively changed the visual proportion
+        (wheel zoom, or applying a scale-mode preset) since the last
+        selection fit — the export's stretch-vs-letterbox discriminator for
+        fixed paper sizes (see export_headless.render_export_figure)."""
+        return self._user_scaled
 
     def _on_range_changed(self, _vb, ranges) -> None:
         """Schedule a display-buffer re-slice (or a preview refresh) on pan/zoom."""
