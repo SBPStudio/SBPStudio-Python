@@ -181,3 +181,26 @@ class TestTracesPerCmControl:
         assert pc.sld_ve.isEnabled()
         assert pc.sld_maxasp.isEnabled()
         assert not pc.sld_deform.isEnabled()
+
+
+# ── 6. Preview refresh coalescing: a deferred fit is STICKY, never dropped ──
+
+class TestPendingCoalesce:
+    """The 'fit lost' field regression: selecting a new file queued
+    _refresh(fit=True) while the OLD file's render was in flight; a pan-settle
+    tick then overwrote the pending tuple with fit=False and the replayed
+    frame kept the previous zoom. The coalesce must OR the flags."""
+
+    def test_fit_survives_later_non_fit_tick(self):
+        from sbp_studio.gui.dsp.preview import _coalesce_pending
+        pending = _coalesce_pending(None, (True, True))     # queued selection fit
+        pending = _coalesce_pending(pending, (False, False))  # pan settle tick
+        assert pending == (True, True)
+
+    def test_overlays_sticky_too(self):
+        from sbp_studio.gui.dsp.preview import _coalesce_pending
+        assert _coalesce_pending((False, True), (False, False)) == (False, True)
+
+    def test_plain_replacement_when_nothing_pending(self):
+        from sbp_studio.gui.dsp.preview import _coalesce_pending
+        assert _coalesce_pending(None, (False, True)) == (False, True)

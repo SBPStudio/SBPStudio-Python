@@ -179,6 +179,15 @@ VA_MAX_ROWS        = 600
 VA_TRACE_THRESHOLD = 600
 
 
+def _coalesce_pending(prev, new):
+    """Merge a deferred refresh request with a newer one: ``fit`` and
+    ``overlays`` are STICKY (OR-ed), so a queued fit-to-window can be delayed
+    by later ticks but never silently dropped. Pure — unit-tested directly."""
+    if prev is None:
+        return new
+    return (bool(prev[0]) or bool(new[0]), bool(prev[1]) or bool(new[1]))
+
+
 class PreviewController(QObject):
     """Drives a :class:`SeismicView` from a :class:`PipelinePanel`, live.
 
@@ -825,10 +834,16 @@ class PreviewController(QObject):
         if self._worker is not None and self._worker.isRunning():
             if self._cancel_token is not None:
                 self._cancel_token.cancel()
-            self._pending = (fit, overlays)
+            # STICKY coalesce: a deferred fit/overlays request must never be
+            # clobbered by a later fit=False tick (e.g. a pan-settle refresh
+            # arriving right after a file selection queued fit=True while the
+            # OLD file's render was still in flight — the replayed frame then
+            # rendered at the previous zoom: the field 'fit lost' regression).
+            self._pending = _coalesce_pending(self._pending, (fit, overlays))
             return
         if self._base_worker is not None and self._base_worker.isRunning():
-            self._pending_base_ctx = (fit, overlays)
+            self._pending_base_ctx = _coalesce_pending(
+                self._pending_base_ctx, (fit, overlays))
             return
         obj = self._get_source()
         if obj is None or getattr(obj, "data", None) is None:
@@ -1341,7 +1356,9 @@ class PreviewController(QObject):
         ``_prepared_base`` via the ``_align`` kwarg so the worker never touches
         Qt widget state.  On success, ``_on_base_prep_ready`` replays _refresh
         which now finds ``_pc_array`` warm and dispatches PipelineWorker."""
-        self._pending_base_ctx = (fit, overlays)
+        # Sticky-coalesced (see _coalesce_pending): never drop a queued fit.
+        self._pending_base_ctx = _coalesce_pending(
+            self._pending_base_ctx, (fit, overlays))
         token = (self._data_version, "base_prep", c0, c1)
 
         def prep_fn(_obj=obj, _c0=c0, _c1=c1, _align=align):

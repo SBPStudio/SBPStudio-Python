@@ -1351,21 +1351,21 @@ class SeismicView(QWidget):
             self._img_trace_lo = int(c0)
             self._img_trace_hi = int(c1)
         if fit:
-            # Deterministic fit to THE NEW SECTION'S OWN BOUNDS (the fit frame
-            # always carries the full extent — see PreviewController._refresh).
-            # Never plot.autoRange(): that fits the union of ALL scene items,
-            # and at this instant overlays from the PREVIOUS file (FIX marks,
-            # boundaries, ruler — repositioned only after this) can still sit
-            # in the old file's coordinate domain, dragging the union range off
-            # the new data ('lost in space' on selecting a distant file).
-            lo_t, hi_t = (t0, t1) if t1 >= t0 else (t1, t0)
+            # Native auto-fit, SCOPED TO THE IMAGE ITEM ONLY: pyqtgraph's
+            # autoRange adapts the ranges to the live widget geometry exactly
+            # like the historical fit did (small sections fill the window,
+            # large ones are fully framed), while the ``items=[self.img]``
+            # restriction keeps stale overlays from the PREVIOUS file (FIX
+            # marks, boundaries, ruler — repositioned only after this) out of
+            # the fit — the 'lost in space' immunity. An explicit
+            # setXRange/setYRange fit was tried here and REVERTED: it centred
+            # correctly but did not reliably adapt the zoom to the window.
             vb = self.plot.getViewBox()
-            vb.setXRange(float(dist0), float(dist1), padding=0.02)
-            vb.setYRange(float(lo_t), float(hi_t), padding=0.02)
+            vb.autoRange(items=[self.img], padding=0.02)
             if self._aspect:
                 # Re-apply the scale-mode preset on the now-fresh _rect (the
-                # explicit ranges above just centred the view on the data, so
-                # the preset's pan-preservation keeps it there).
+                # auto-fit just centred the view on the data, so the preset's
+                # pan-preservation keeps it there).
                 self.set_aspect(self._aspect)
         if self._picks:
             self._redraw_picks()
