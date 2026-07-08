@@ -634,3 +634,58 @@ class TestPageCeiling:
             fw, fh, _dpi = self._render(profile_file, (2.0, 0.5), cfg_dpi=300)
         assert max(fw, fh) < 199.0
         assert not any("ceiling" in r.getMessage() for r in caplog.records)
+
+
+# ── Fixed paper honours the custom scale: letterbox, never stretch ─────────────
+
+class TestPaperLetterbox:
+    """Non-negotiable field rule: with a fixed sheet (A4/A3/A0) selected AND a
+    custom on-screen proportion active, the data box must keep THAT proportion
+    and be fitted inside the sheet with empty margins — never stretched to
+    fill the paper width."""
+
+    def _boxes(self, path, view_scale):
+        from sbp_studio.core import load_profile
+        from sbp_studio.gui.export_headless import render_export_figure, _NoOpCancel
+        prof = load_profile(path, load_traces=True)
+        cfg = dict(_cfg(), paper_size="A4")
+        fig, _ = render_export_figure(
+            prof, cfg, _params(), [], _scale_cfg(), False, "profile",
+            _NoOpCancel(), view_scale=view_scale)
+        out = _measure(fig)
+        fig.clear()
+        return out          # (page_w, page_h, data_w, data_h)
+
+    def test_a4_letterboxes_a_compressed_scale(self, tmp_path):
+        """A tall/narrow custom proportion on an A4 landscape sheet: the page
+        stays exactly A4, the data box keeps the CUSTOM h/w ratio (letterbox
+        margins absorb the difference)."""
+        import numpy as np
+        from sbp_studio.core import load_profile
+        big = str(tmp_path / "lb.sgy")
+        make_synthetic_segy(big, n_traces=600, ns=256)
+        prof = load_profile(big)
+        cfg = dict(_cfg(), paper_size="A4")
+        vs = _scale_for_page(prof, cfg, 4.0, 6.0)   # narrow+tall: h/w = 1.5
+        page_w, page_h, data_w, data_h = self._boxes(big, vs)
+        assert (page_w, page_h) == (pytest.approx(11.69), pytest.approx(8.27))
+        assert data_h / data_w == pytest.approx(1.5, rel=0.02)
+        assert data_w < page_w and data_h < page_h  # strictly inside the sheet
+
+    def test_a4_without_scale_keeps_historical_fill(self, tmp_path):
+        """No live view → no letterbox: the sheet is filled as before (the
+        data box takes the sheet's own usable proportion, not a forced one)."""
+        big = str(tmp_path / "fill.sgy")
+        make_synthetic_segy(big, n_traces=600, ns=256)
+        page_w, page_h, data_w, data_h = self._boxes(big, None)
+        assert (page_w, page_h) == (pytest.approx(11.69), pytest.approx(8.27))
+        # Filled: landscape-ish data box (h/w well below the 1.5 letterbox).
+        assert data_h / data_w < 1.0
+
+    def test_direct_renderer_default_has_no_box_aspect(self, profile_file):
+        """CLI zero-regression: no box_aspect → the axes box is NOT ratio-
+        pinned (matplotlib default box aspect follows the layout)."""
+        import inspect
+        from sbp_studio.viz.render import render_profile_figure
+        sig = inspect.signature(render_profile_figure)
+        assert sig.parameters["box_aspect"].default is None

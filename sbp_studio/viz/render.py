@@ -929,6 +929,7 @@ def render_profile_figure(
     max_abs_pool: bool = False,
     picks: Optional[list] = None,
     deco_scale: float = 1.0,
+    box_aspect: Optional[float] = None,
 ) -> Figure:
     """
     Render a seismic profile as a headless Matplotlib figure.
@@ -937,6 +938,13 @@ def render_profile_figure(
     (title, colorbar text; the caller-supplied font sizes arrive pre-scaled),
     so a dynamically-sized WYSIWYG page keeps proportionate text. Default 1.0
     = the historical fixed sizes (CLI path unchanged).
+
+    ``box_aspect`` — PHYSICAL height/width ratio to enforce on the AXES BOX
+    (``ax.set_box_aspect``): the data area is letterboxed inside the page at
+    exactly this proportion, with empty margins as needed — used by fixed
+    paper-size exports to honour the user's custom on-screen scale instead of
+    stretching the data to fill the sheet. Default ``None`` = historical fill
+    (CLI path unchanged).
 
     Layered rendering
     -----------------
@@ -993,6 +1001,12 @@ def render_profile_figure(
     ax.tick_params(colors=C["text"], labelsize=8)
     for sp in ax.spines.values():
         sp.set_edgecolor(C["accent"])
+    if box_aspect:
+        # Letterbox: pin the PHYSICAL axes-box proportion (never stretch the
+        # user's custom scale to fill a fixed sheet). The two-pass raster
+        # sizing below measures the axes box AFTER layout, so it colorizes to
+        # the letterboxed box automatically.
+        ax.set_box_aspect(box_aspect)
 
     x_lo, x_hi = _x_axis_extent(x_axis, sd.dist_km[0], sd.dist_km[-1], d.shape[1])
     # Layered: raster base (density) + optional wiggle/VA overlay. Density always
@@ -1135,12 +1149,14 @@ def render_chain_figure(
     max_abs_pool: bool = False,
     picks: Optional[list] = None,
     deco_scale: float = 1.0,
+    box_aspect: Optional[float] = None,
 ) -> Figure:
     """
     Render a ProfileChain as a headless Matplotlib figure.
 
     ``deco_scale`` — internal-decoration multiplier (title, colorbar text);
-    see :func:`render_profile_figure`. Default 1.0 = historical sizes.
+    ``box_aspect`` — physical axes-box h/w letterbox for fixed paper sizes;
+    see :func:`render_profile_figure`. Defaults = historical behaviour.
 
     Global vmax normalisation (max across segments), boundary vlines, colorbar
     shares the same global vmax — avoids brightness seams at file joins (#15).
@@ -1209,6 +1225,9 @@ def render_chain_figure(
     ax.tick_params(colors=C["text"], labelsize=8)
     for sp in ax.spines.values():
         sp.set_edgecolor(C["accent"])
+    if box_aspect:
+        # Letterbox for fixed paper sizes — see render_profile_figure.
+        ax.set_box_aspect(box_aspect)
 
     # Trace-axis extent uses the NATIVE trace count, not the (yet-to-be-sized) pixel width.
     x_lo, x_hi = _x_axis_extent(x_axis, ch.dist_km[0], ch.dist_km[-1], n_traces_native)

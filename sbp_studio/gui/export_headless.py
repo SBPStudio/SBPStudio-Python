@@ -268,9 +268,21 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
     paper_key = cfg.get("paper_size", "")
     scaled = (_page_from_scale(obj, data, cfg, view_scale)
               if view_scale is not None else None)
+    # Fixed paper + a live custom scale → LETTERBOX (non-negotiable field
+    # rule): the data box keeps the PROPORTIONS of the user's on-screen scale
+    # (the same bounding box the Auto page would produce) and is fitted
+    # inside the sheet with empty margins — never stretched to fill it.
+    box_aspect = None
     if paper_key in PAPER_SIZES:
         figsize = PAPER_SIZES[paper_key]
-        _LOG.info("export sizing: fixed paper %s.", paper_key)
+        if scaled is not None and scaled[0] > 0:
+            box_aspect = float(scaled[1]) / float(scaled[0])   # h/w ratio
+            _LOG.info("export sizing: fixed paper %s, letterboxed to the "
+                      "on-screen proportion (data box h/w=%.4f).",
+                      paper_key, box_aspect)
+        else:
+            _LOG.info("export sizing: fixed paper %s (no live scale — "
+                      "historical fill).", paper_key)
     elif scaled is not None:
         figsize = scaled
         _LOG.info("export sizing: FULL line at the on-screen scale "
@@ -333,6 +345,7 @@ def render_export_figure(obj, cfg, params, node_cfg, scale_cfg, align_enabled,
         # (RAM-capped DPI), pool by max-|amplitude| instead of bilinear so thin
         # high-amplitude reflectors are preserved. Default on.
         max_abs_pool=bool(cfg.get("max_abs_pool", True)),
+        box_aspect=box_aspect,
         picks=picks)
     render_fn = render_chain_figure if kind == "chain" else render_profile_figure
     fig = render_fn(obj, data, params, figsize=figsize, dpi=render_dpi,
