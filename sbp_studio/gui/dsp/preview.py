@@ -1399,20 +1399,35 @@ class PreviewController(QObject):
         """Replay the most recent trigger that arrived while the worker was busy.
         Priority: structural (pipeline_changed) > param-only (params_changed) >
         plain refresh (pan/zoom). A structural change subsumes any pending param
-        change (the full _on_pipeline_changed rebuild handles both)."""
+        change (the full _on_pipeline_changed rebuild handles both) — but it
+        must NOT swallow a queued fit/overlays request: both replays re-render
+        with fit=False, and discarding ``_pending`` here was the field
+        'auto-fit fails when filters are active' race (a selection's fit=True
+        worker overlaps the pipeline/param signals the active filters emit;
+        the structural replay then won and the final frame kept the previous
+        zoom). A pending fit/overlays is RE-QUEUED after the replay — the
+        sticky coalesce merges it into the worker the replay just dispatched,
+        so it renders as soon as that worker finishes."""
+        pend = self._pending
+        self._pending = None
         if self._pending_sync:
             self._pending_sync = False
             self._pending_params = False  # subsumed by structural rebuild
-            self._pending = None
             self._on_pipeline_changed()
         elif self._pending_params:
             self._pending_params = False
-            self._pending = None
             self._on_params_changed()
-        elif self._pending is not None:
-            fit, overlays = self._pending
-            self._pending = None
+        elif pend is not None:
+            fit, overlays = pend
             self._refresh(fit=fit, overlays=overlays)
+            return
+        else:
+            return
+        # Structural/param replay ran with fit=False — re-queue the swallowed
+        # fit/overlays so the section still lands framed (and with fresh
+        # overlays) once the replay's worker completes.
+        if pend is not None and (pend[0] or pend[1]):
+            self._refresh(fit=bool(pend[0]), overlays=bool(pend[1]))
 
     def _ensure_idle(self) -> None:
         """Block until any in-flight preview worker finishes. Used by callers

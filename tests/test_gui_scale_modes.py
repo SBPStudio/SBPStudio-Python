@@ -274,3 +274,56 @@ class TestUserScaledTracker:
         view._on_manual_range_change()
         assert view.view_is_user_scaled() is False
         view.deleteLater()
+
+
+# ── 9. _dispatch_pending must never swallow a queued fit (filters race) ──
+
+class TestDispatchPendingFitCarryover:
+    """The 'auto-fit fails when filters are active' race: a selection's
+    fit=True request queued behind a busy worker was DISCARDED whenever a
+    structural/param pipeline event was also pending (active filters emit
+    those during a selection), and the replay re-rendered with fit=False at
+    the previous zoom. The pending fit must be re-queued after the replay."""
+
+    class _Fake:
+        def __init__(self, pending, sync=False, params=False):
+            self._pending = pending
+            self._pending_sync = sync
+            self._pending_params = params
+            self.calls = []
+
+        def _on_pipeline_changed(self):
+            self.calls.append("pipeline")
+
+        def _on_params_changed(self):
+            self.calls.append("params")
+
+        def _refresh(self, *, fit, overlays):
+            self.calls.append(("refresh", fit, overlays))
+
+    def _run(self, fake):
+        from sbp_studio.gui.dsp.preview import PreviewController
+        PreviewController._dispatch_pending(fake)
+        return fake.calls
+
+    def test_structural_replay_requeues_the_fit(self):
+        calls = self._run(self._Fake((True, True), sync=True))
+        assert calls == ["pipeline", ("refresh", True, True)]
+
+    def test_param_replay_requeues_the_fit(self):
+        calls = self._run(self._Fake((True, True), params=True))
+        assert calls == ["params", ("refresh", True, True)]
+
+    def test_plain_pending_unchanged(self):
+        calls = self._run(self._Fake((True, False)))
+        assert calls == [("refresh", True, False)]
+
+    def test_structural_without_pending_stays_lean(self):
+        calls = self._run(self._Fake(None, sync=True))
+        assert calls == ["pipeline"]
+
+    def test_pending_fitless_refresh_not_duplicated(self):
+        # A queued plain pan refresh (no fit, no overlays) need not replay
+        # after a structural rebuild — the rebuild's own render covers it.
+        calls = self._run(self._Fake((False, False), sync=True))
+        assert calls == ["pipeline"]
