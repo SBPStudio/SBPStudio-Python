@@ -204,3 +204,21 @@ class TestPendingCoalesce:
     def test_plain_replacement_when_nothing_pending(self):
         from sbp_studio.gui.dsp.preview import _coalesce_pending
         assert _coalesce_pending(None, (False, True)) == (False, True)
+
+
+# ── 7. Export dialog: paper order + default (A4 first/default, Auto last) ──
+
+class TestExportDialogPaperOrder:
+    def test_a4_default_auto_last(self):
+        pytest.importorskip("PyQt6")
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance() or QApplication([])
+        from sbp_studio.gui.components.export_dialog import ExportDialog
+
+        dlg = ExportDialog()
+        items = [dlg.cb_papersize.itemText(i)
+                 for i in range(dlg.cb_papersize.count())]
+        assert items == ["A4", "A3", "A0", "Auto"]
+        assert dlg.cb_papersize.currentText() == "A4"
+        assert dlg.config()["paper_size"] == "A4"
+        dlg.deleteLater()

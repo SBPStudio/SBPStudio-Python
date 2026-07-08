@@ -69,17 +69,19 @@ class ExportDialog(QDialog):
         for label, ext in (("PDF (vector)", "pdf"), ("PNG", "png"),
                             ("TIFF", "tiff"), ("SVG (vector)", "svg")):
             self.cb_format.addItem(label, ext)
-        # Paper size: 'Auto' (dynamic page — matches the on-screen view for a
-        # single export, the scale formula for a batch) is FIRST and the
-        # DEFAULT. Fixed sheets (A4/A3/A0) remain as explicit choices. 'Auto'
-        # was previously missing entirely and the default was A4 — the 'A4
-        # trap': every export was squeezed onto a fixed sheet and the scale
-        # mode / zoom never reached the page geometry.
+        # Paper size: fixed sheets first with 'A4' as the DEFAULT (field
+        # directive), 'Auto' (dynamic page = full line at the on-screen scale)
+        # LAST. Defaulting to A4 is safe again because fixed sheets now
+        # LETTERBOX the user's custom on-screen proportion instead of
+        # stretching the data to fill the width (the original 'A4 trap' was
+        # 'fixed sheet AND ignored proportions'; the proportion now always
+        # wins — see export_headless box_aspect) — and A4 can never hit the
+        # PDF 200-inch page limit the unbounded Auto page could.
         self.cb_papersize = QComboBox()
-        self.cb_papersize.addItem("Auto")
         for key in PAPER_SIZES:
             self.cb_papersize.addItem(key)
-        self.cb_papersize.setCurrentText("Auto")
+        self.cb_papersize.addItem("Auto")
+        self.cb_papersize.setCurrentText("A4")
         self.cb_papersize.currentTextChanged.connect(lambda *_: self._update_budget_status())
         self.cb_dpi = QComboBox()
         self.cb_dpi.setEditable(True)
