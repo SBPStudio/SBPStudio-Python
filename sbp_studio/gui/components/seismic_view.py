@@ -1351,22 +1351,22 @@ class SeismicView(QWidget):
             self._img_trace_lo = int(c0)
             self._img_trace_hi = int(c1)
         if fit:
-            # Native auto-fit, SCOPED TO THE IMAGE ITEM ONLY: pyqtgraph's
-            # autoRange adapts the ranges to the live widget geometry exactly
-            # like the historical fit did (small sections fill the window,
-            # large ones are fully framed), while the ``items=[self.img]``
-            # restriction keeps stale overlays from the PREVIOUS file (FIX
-            # marks, boundaries, ruler — repositioned only after this) out of
-            # the fit — the 'lost in space' immunity. An explicit
-            # setXRange/setYRange fit was tried here and REVERTED: it centred
-            # correctly but did not reliably adapt the zoom to the window.
+            # UNCONDITIONAL native auto-fit, SCOPED TO THE IMAGE ITEM ONLY
+            # (field directive): selecting a file/chain must always fill the
+            # viewport with the ENTIRE data extent in both X and Y, in EVERY
+            # scale mode. pyqtgraph's autoRange adapts the ranges to the live
+            # widget geometry exactly like the historical fit did, while the
+            # ``items=[self.img]`` restriction keeps stale overlays from the
+            # PREVIOUS file (FIX marks, boundaries, ruler — repositioned only
+            # after this) out of the fit — the 'lost in space' immunity.
+            #
+            # Deliberately NO scale-mode preset re-apply here: doing so (an
+            # earlier iteration) overrode the fill — in VE/Aspect/Hybrid the
+            # preset's x-window formula left small files tiny and long chains
+            # clipped. The preset applies when the USER picks a mode or edits
+            # its value (_on_scale_changed); a fresh selection always fits.
             vb = self.plot.getViewBox()
             vb.autoRange(items=[self.img], padding=0.02)
-            if self._aspect:
-                # Re-apply the scale-mode preset on the now-fresh _rect (the
-                # auto-fit just centred the view on the data, so the preset's
-                # pan-preservation keeps it there).
-                self.set_aspect(self._aspect)
         if self._picks:
             self._redraw_picks()
         self._reposition_boundaries()
